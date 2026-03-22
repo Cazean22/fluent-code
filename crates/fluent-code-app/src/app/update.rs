@@ -9,6 +9,8 @@ use crate::session::model::{
 };
 use crate::tool::built_in_tools;
 
+const READ_TOOL_NAME: &str = "read";
+
 pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
     match msg {
         Msg::InputChanged(input) => {
@@ -384,22 +386,34 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                     invocation.execution_state = ToolExecutionState::Failed;
                     invocation.error = Some(error.clone());
                     let tool_name = invocation.tool_name.clone();
-                    state.status = AppStatus::Error(error);
-                    state.session.updated_at = Utc::now();
-                    state.session.upsert_run(run_id, RunStatus::Failed);
-                    state.active_run_id = None;
-                    state.pending_resume_request = None;
-                    if let AppStatus::Error(message) = &state.status {
-                        warn!(
+                    if should_resume_after_tool_failure(&tool_name, &error) {
+                        state.status = AppStatus::Generating;
+                        info!(
                             session_id = %session_id,
                             run_id = %run_id,
                             invocation_id = %invocation_id,
                             tool_name = %tool_name,
-                            error = %message,
-                            "tool execution failed and ended the run"
+                            error = %error,
+                            "tool execution failed but assistant will resume"
                         );
+                    } else {
+                        state.status = AppStatus::Error(error);
+                        state.session.updated_at = Utc::now();
+                        state.session.upsert_run(run_id, RunStatus::Failed);
+                        state.active_run_id = None;
+                        state.pending_resume_request = None;
+                        if let AppStatus::Error(message) = &state.status {
+                            warn!(
+                                session_id = %session_id,
+                                run_id = %run_id,
+                                invocation_id = %invocation_id,
+                                tool_name = %tool_name,
+                                error = %message,
+                                "tool execution failed and ended the run"
+                            );
+                        }
+                        return vec![Effect::PersistSession];
                     }
-                    return vec![Effect::PersistSession];
                 }
             }
 
@@ -439,6 +453,10 @@ fn build_provider_request(state: &AppState, run_id: Uuid) -> ProviderRequest {
     ProviderRequest::new(messages, built_in_tools())
 }
 
+fn should_resume_after_tool_failure(tool_name: &str, error: &str) -> bool {
+    tool_name == READ_TOOL_NAME && error.contains("is not accessible")
+}
+
 fn append_tool_messages_after_turn(
     messages: &mut Vec<ProviderMessage>,
     state: &AppState,
@@ -456,6 +474,16 @@ fn append_tool_messages_after_turn(
     invocations.sort_by_key(|invocation| invocation.requested_at);
 
     for invocation in invocations {
+        if invocation.tool_call_id.trim().is_empty() {
+            warn!(
+                run_id = %run_id,
+                invocation_id = %invocation.id,
+                tool_name = %invocation.tool_name,
+                "skipping tool invocation replay because tool_call_id is empty"
+            );
+            continue;
+        }
+
         messages.push(ProviderMessage::AssistantToolCall {
             id: invocation.tool_call_id.clone(),
             name: invocation.tool_name.clone(),
@@ -643,6 +671,170 @@ mod tests {
             Some(Effect::StartAssistant { request, .. })
                 if request.messages.iter().any(|message| matches!(message, fluent_code_provider::ProviderMessage::ToolResult { content, .. } if content == "Tool execution denied by user"))
         ));
+    }
+
+    #[test]
+    fn failed_read_missing_path_resumes_with_tool_error_result() {
+        let mut state = AppState::new(Session::new("failed read flow"));
+        state.draft_input = "inspect missing file".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "tool-call-read-1".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({ "path": "missing.txt" }),
+                },
+            },
+        );
+
+        let effects = update(&mut state, Msg::ApprovePendingTool);
+        assert!(matches!(state.status, AppStatus::RunningTool));
+        assert!(matches!(
+            effects.last(),
+            Some(Effect::ExecuteTool { tool_call, .. }) if tool_call.name == "read"
+        ));
+
+        let invocation_id = state.session.tool_invocations[0].id;
+        let tool_error =
+            "provider error: path '/tmp/fluent-code-test/missing.txt' is not accessible: No such file or directory (os error 2)".to_string();
+        let effects = update(
+            &mut state,
+            Msg::ToolExecutionFinished {
+                run_id,
+                invocation_id,
+                result: Err(tool_error.clone()),
+            },
+        );
+
+        assert!(matches!(state.status, AppStatus::Generating));
+        assert_eq!(state.active_run_id, Some(run_id));
+        assert_eq!(
+            state.session.tool_invocations[0].execution_state,
+            ToolExecutionState::Failed
+        );
+        assert_eq!(
+            state.session.tool_invocations[0].error.as_deref(),
+            Some(tool_error.as_str())
+        );
+        assert!(matches!(
+            state.session.latest_run_status(),
+            Some(RunStatus::InProgress)
+        ));
+        assert!(matches!(
+            effects.last(),
+            Some(Effect::StartAssistant { request, .. })
+                if request.messages.iter().any(|message| matches!(message, fluent_code_provider::ProviderMessage::ToolResult { content, .. } if content == &tool_error))
+        ));
+    }
+
+    #[test]
+    fn failed_non_read_tool_still_ends_run() {
+        let mut state = AppState::new(Session::new("failed non-read flow"));
+        state.draft_input = "use uppercase_text".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "tool-call-upper-1".to_string(),
+                    name: "uppercase_text".to_string(),
+                    arguments: serde_json::json!({ "text": "hello" }),
+                },
+            },
+        );
+
+        update(&mut state, Msg::ApprovePendingTool);
+
+        let invocation_id = state.session.tool_invocations[0].id;
+        let effects = update(
+            &mut state,
+            Msg::ToolExecutionFinished {
+                run_id,
+                invocation_id,
+                result: Err("provider error: uppercase_text exploded".to_string()),
+            },
+        );
+
+        assert!(matches!(state.status, AppStatus::Error(_)));
+        assert!(state.active_run_id.is_none());
+        assert!(matches!(
+            state.session.latest_run_status(),
+            Some(RunStatus::Failed)
+        ));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::StartAssistant { .. }))
+        );
+    }
+
+    #[test]
+    fn resume_request_skips_tool_replay_when_tool_call_id_is_empty() {
+        let mut state = AppState::new(Session::new("empty tool call id flow"));
+        state.draft_input = "inspect repo".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({ "path": "missing.txt" }),
+                },
+            },
+        );
+
+        update(&mut state, Msg::ApprovePendingTool);
+
+        let invocation_id = state.session.tool_invocations[0].id;
+        let effects = update(
+            &mut state,
+            Msg::ToolExecutionFinished {
+                run_id,
+                invocation_id,
+                result: Err(
+                    "provider error: path '/tmp/fluent-code-test/missing.txt' is not accessible: No such file or directory (os error 2)"
+                        .to_string(),
+                ),
+            },
+        );
+
+        let request = match effects.last() {
+            Some(Effect::StartAssistant { request, .. }) => request,
+            _ => panic!("expected assistant resume effect"),
+        };
+
+        assert!(matches!(state.status, AppStatus::Generating));
+        assert_eq!(request.messages.len(), 1);
+        assert!(matches!(
+            request.messages.first(),
+            Some(fluent_code_provider::ProviderMessage::UserText { text }) if text == "inspect repo"
+        ));
+        assert!(!request.messages.iter().any(|message| matches!(
+            message,
+            fluent_code_provider::ProviderMessage::AssistantToolCall { .. }
+                | fluent_code_provider::ProviderMessage::ToolResult { .. }
+        )));
     }
 
     #[test]

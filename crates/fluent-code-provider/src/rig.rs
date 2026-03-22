@@ -1,11 +1,12 @@
 use futures::StreamExt;
 use rig::{
     OneOrMany,
+    client::CompletionClient,
     completion::{
         AssistantContent, CompletionModel as RigCompletionModel, Message, ToolDefinition,
     },
     providers::openai,
-    streaming::StreamingChoice,
+    streaming::StreamedAssistantContent,
 };
 use tracing::{debug, info, warn};
 
@@ -62,7 +63,11 @@ impl RigOpenAiProvider {
             .base_url
             .as_deref()
             .unwrap_or(DEFAULT_OPENAI_BASE_URL);
-        let client = openai::Client::from_url(&api_key, base_url);
+        let client = openai::CompletionsClient::builder()
+            .api_key(&api_key)
+            .base_url(base_url)
+            .build()
+            .map_err(|error| ProviderError::Message(error.to_string()))?;
         let model = client.completion_model(&self.model);
         let tool_definitions = request
             .tools
@@ -86,22 +91,27 @@ impl RigOpenAiProvider {
 
         while let Some(chunk) = stream.next().await {
             match chunk {
-                Ok(StreamingChoice::Message(text)) => {
+                Ok(StreamedAssistantContent::Text(text)) => {
                     debug!(
                         provider = "openai",
-                        chunk_bytes = text.len(),
+                        chunk_bytes = text.text.len(),
                         "openai provider emitted text delta"
                     );
-                    on_event(ProviderEvent::TextDelta(text))
+                    on_event(ProviderEvent::TextDelta(text.text))
                 }
-                Ok(StreamingChoice::ToolCall(name, id, arguments)) => {
-                    info!(provider = "openai", tool_name = %name, tool_call_id = %id, "openai provider emitted tool call");
+                Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
+                    validate_openai_tool_call_id(&tool_call.function.name, &tool_call.id)?;
+                    info!(provider = "openai", tool_name = %tool_call.function.name, tool_call_id = %tool_call.id, "openai provider emitted tool call");
                     on_event(ProviderEvent::ToolCall(ProviderToolCall {
-                        id,
-                        name,
-                        arguments,
+                        id: tool_call.id,
+                        name: tool_call.function.name,
+                        arguments: tool_call.function.arguments,
                     }));
                 }
+                Ok(StreamedAssistantContent::ToolCallDelta { .. })
+                | Ok(StreamedAssistantContent::Reasoning(_))
+                | Ok(StreamedAssistantContent::ReasoningDelta { .. })
+                | Ok(StreamedAssistantContent::Final(_)) => {}
                 Err(error) => {
                     warn!(provider = "openai", error = %error, "openai provider stream failed");
                     return Err(ProviderError::Message(error.to_string()));
@@ -114,6 +124,21 @@ impl RigOpenAiProvider {
     }
 }
 
+fn validate_openai_tool_call_id(tool_name: &str, id: &str) -> Result<()> {
+    if id.trim().is_empty() {
+        warn!(
+            provider = "openai",
+            tool_name = %tool_name,
+            "openai stream emitted tool call with empty id"
+        );
+        return Err(ProviderError::Message(format!(
+            "openai stream emitted tool call '{tool_name}' with empty id"
+        )));
+    }
+
+    Ok(())
+}
+
 fn to_rig_message(message: &ProviderMessage) -> Message {
     match message {
         ProviderMessage::UserText { text } => Message::user(text.clone()),
@@ -123,6 +148,7 @@ fn to_rig_message(message: &ProviderMessage) -> Message {
             name,
             arguments,
         } => Message::Assistant {
+            id: None,
             content: OneOrMany::one(AssistantContent::tool_call(
                 id.clone(),
                 name.clone(),
@@ -155,4 +181,39 @@ fn resolve_api_key(provider_config: &ProviderConfig) -> Result<String> {
     Err(ProviderError::MissingApiKey(
         provider_config.api_key_envs.join(", "),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_openai_tool_call_id;
+    use crate::ProviderError;
+
+    #[test]
+    fn validate_openai_tool_call_id_accepts_non_empty_id() {
+        assert!(validate_openai_tool_call_id("read", "call_123").is_ok());
+    }
+
+    #[test]
+    fn validate_openai_tool_call_id_rejects_empty_id() {
+        let error = validate_openai_tool_call_id("read", "")
+            .expect_err("empty tool call id should be rejected");
+
+        assert!(matches!(
+            error,
+            ProviderError::Message(message)
+                if message == "openai stream emitted tool call 'read' with empty id"
+        ));
+    }
+
+    #[test]
+    fn validate_openai_tool_call_id_rejects_whitespace_only_id() {
+        let error = validate_openai_tool_call_id("glob", "   ")
+            .expect_err("whitespace-only tool call id should be rejected");
+
+        assert!(matches!(
+            error,
+            ProviderError::Message(message)
+                if message == "openai stream emitted tool call 'glob' with empty id"
+        ));
+    }
 }

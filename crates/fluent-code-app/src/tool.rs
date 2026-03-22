@@ -543,6 +543,29 @@ mod tests {
     }
 
     #[test]
+    fn read_missing_path_reports_not_accessible() {
+        let _guard = current_dir_lock().lock().expect("lock current dir");
+        let workspace = unique_test_dir();
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let original_dir = std::env::current_dir().expect("get current dir");
+        std::env::set_current_dir(&workspace).expect("set current dir");
+
+        let error = execute_built_in_tool(&ProviderToolCall {
+            id: "call-missing-read".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({ "path": "missing.txt" }),
+        })
+        .expect_err("read should fail for missing path");
+
+        std::env::set_current_dir(&original_dir).expect("restore current dir");
+
+        assert!(error.to_string().contains("is not accessible"));
+
+        cleanup(workspace);
+    }
+
+    #[test]
     fn glob_returns_matching_relative_paths() {
         let _guard = current_dir_lock().lock().expect("lock current dir");
         let workspace = unique_test_dir();

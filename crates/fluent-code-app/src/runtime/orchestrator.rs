@@ -320,6 +320,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_read_tool_missing_path_returns_error_message() {
+        let runtime = Runtime::new(ProviderClient::Mock(MockProvider::with_chunk_delay(
+            tokio::time::Duration::from_millis(5),
+        )));
+        let run_id = uuid::Uuid::new_v4();
+        let invocation_id = uuid::Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        runtime.spawn_effect(
+            Effect::ExecuteTool {
+                run_id,
+                invocation_id,
+                tool_call: ProviderToolCall {
+                    id: "tool-call-missing-read".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({ "path": "missing.txt" }),
+                },
+            },
+            tx,
+        );
+
+        let message = tokio::time::timeout(tokio::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("receive tool execution result")
+            .expect("tool execution message");
+
+        assert!(matches!(
+            message,
+            Msg::ToolExecutionFinished {
+                run_id: received_run_id,
+                invocation_id: received_invocation_id,
+                result: Err(ref error),
+            } if received_run_id == run_id
+                && received_invocation_id == invocation_id
+                && error.contains("is not accessible")
+        ));
+    }
+
+    #[tokio::test]
     async fn cancel_aborts_active_stream_task() {
         let runtime = Runtime::new(ProviderClient::Mock(MockProvider::with_chunk_delay(
             tokio::time::Duration::from_millis(100),
