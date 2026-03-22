@@ -3,15 +3,44 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use fluent_code_app::app::{AppStatus, Msg};
 
-pub fn next_message(current_input: &str, status: &AppStatus) -> std::io::Result<Option<Msg>> {
-    if !event::poll(Duration::from_millis(100))? {
+pub enum TuiAction {
+    Message(Msg),
+    ToggleToolDetails,
+    ToggleHelpOverlay,
+}
+
+pub fn next_action(current_input: &str, status: &AppStatus) -> std::io::Result<Option<TuiAction>> {
+    if !event::poll(Duration::from_millis(0))? {
         return Ok(None);
     }
 
     let event = event::read()?;
-    let msg = map_event_to_message(event, current_input, status);
 
-    Ok(msg)
+    if matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::F(2),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            ..
+        })
+    ) {
+        return Ok(Some(TuiAction::ToggleToolDetails));
+    }
+
+    if matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::F(1),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            ..
+        })
+    ) {
+        return Ok(Some(TuiAction::ToggleHelpOverlay));
+    }
+
+    Ok(map_event_to_message(event, current_input, status).map(TuiAction::Message))
 }
 
 pub fn map_event_to_message(event: Event, current_input: &str, status: &AppStatus) -> Option<Msg> {
@@ -128,5 +157,24 @@ mod tests {
             state: crossterm::event::KeyEventState::NONE,
         });
         assert!(map_event_to_message(ctrl_n, "draft", &AppStatus::Generating).is_none());
+    }
+
+    #[test]
+    fn f_keys_do_not_map_to_messages() {
+        let f1 = Event::Key(KeyEvent {
+            code: KeyCode::F(1),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        });
+        let f2 = Event::Key(KeyEvent {
+            code: KeyCode::F(2),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        });
+
+        assert!(map_event_to_message(f1, "draft", &AppStatus::Idle).is_none());
+        assert!(map_event_to_message(f2, "draft", &AppStatus::Idle).is_none());
     }
 }

@@ -85,28 +85,45 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 return Vec::new();
             };
 
-            let Some((invocation_id, tool_call)) =
-                state
-                    .session
-                    .pending_tool_invocation_mut()
-                    .map(|invocation| {
-                        invocation.approval_state = ToolApprovalState::Approved;
-                        invocation.execution_state = ToolExecutionState::Running;
-                        invocation.approved_at = Some(Utc::now());
-                        invocation.error = None;
-
-                        (
-                            invocation.id,
-                            ProviderToolCall {
-                                id: invocation.tool_call_id.clone(),
-                                name: invocation.tool_name.clone(),
-                                arguments: invocation.arguments.clone(),
-                            },
-                        )
-                    })
+            let Some(preceding_turn_id) = state
+                .session
+                .pending_tool_invocation()
+                .map(|invocation| invocation.preceding_turn_id)
             else {
                 return Vec::new();
             };
+
+            let approved_at = Utc::now();
+            let mut approved_tool_calls = Vec::new();
+
+            for invocation in state
+                .session
+                .tool_invocations
+                .iter_mut()
+                .filter(|invocation| {
+                    invocation.run_id == run_id
+                        && invocation.preceding_turn_id == preceding_turn_id
+                        && invocation.approval_state == ToolApprovalState::Pending
+                })
+            {
+                invocation.approval_state = ToolApprovalState::Approved;
+                invocation.execution_state = ToolExecutionState::Running;
+                invocation.approved_at = Some(approved_at);
+                invocation.error = None;
+
+                approved_tool_calls.push((
+                    invocation.id,
+                    ProviderToolCall {
+                        id: invocation.tool_call_id.clone(),
+                        name: invocation.tool_name.clone(),
+                        arguments: invocation.arguments.clone(),
+                    },
+                ));
+            }
+
+            if approved_tool_calls.is_empty() {
+                return Vec::new();
+            }
 
             state.status = AppStatus::RunningTool;
             state.pending_resume_request = None;
@@ -115,19 +132,21 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             info!(
                 session_id = %state.session.id,
                 run_id = %run_id,
-                invocation_id = %invocation_id,
-                tool_name = %tool_call.name,
-                "approved pending tool invocation"
+                approved_count = approved_tool_calls.len(),
+                "approved pending tool invocation batch"
             );
 
-            vec![
-                Effect::PersistSession,
-                Effect::ExecuteTool {
-                    run_id,
-                    invocation_id,
-                    tool_call,
-                },
-            ]
+            let mut effects = vec![Effect::PersistSession];
+            effects.extend(
+                approved_tool_calls
+                    .into_iter()
+                    .map(|(invocation_id, tool_call)| Effect::ExecuteTool {
+                        run_id,
+                        invocation_id,
+                        tool_call,
+                    }),
+            );
+            effects
         }
         Msg::DenyPendingTool => {
             let Some(run_id) = state.active_run_id else {
@@ -786,28 +805,39 @@ mod tests {
 
         let effects = update(&mut state, Msg::ApprovePendingTool);
         assert!(matches!(state.status, AppStatus::RunningTool));
-        let approved_invocation_id = match effects.last() {
-            Some(Effect::ExecuteTool { invocation_id, .. }) => *invocation_id,
-            _ => panic!("expected execute tool effect"),
-        };
+        let approved_invocation_ids = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::ExecuteTool { invocation_id, .. } => Some(*invocation_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(approved_invocation_ids.len(), 2);
 
         let effects = update(
             &mut state,
             Msg::ToolExecutionFinished {
                 run_id,
-                invocation_id: approved_invocation_id,
+                invocation_id: approved_invocation_ids[0],
                 result: Ok("[\"src/main.rs\"]".to_string()),
             },
         );
 
-        assert!(matches!(state.status, AppStatus::AwaitingToolApproval));
+        assert!(matches!(state.status, AppStatus::RunningTool));
         assert!(
             !effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::StartAssistant { .. }))
         );
 
-        let effects = update(&mut state, Msg::DenyPendingTool);
+        let effects = update(
+            &mut state,
+            Msg::ToolExecutionFinished {
+                run_id,
+                invocation_id: approved_invocation_ids[1],
+                result: Ok("[\"src/lib.rs\"]".to_string()),
+            },
+        );
 
         assert!(matches!(state.status, AppStatus::Generating));
         assert!(matches!(
@@ -815,8 +845,71 @@ mod tests {
             Some(Effect::StartAssistant { request, .. })
                 if request.messages.iter().filter(|message| matches!(message, fluent_code_provider::ProviderMessage::ToolResult { .. })).count() == 2
                     && request.messages.iter().any(|message| matches!(message, fluent_code_provider::ProviderMessage::ToolResult { content, .. } if content == "[\"src/main.rs\"]"))
-                    && request.messages.iter().any(|message| matches!(message, fluent_code_provider::ProviderMessage::ToolResult { content, .. } if content == "Tool execution denied by user"))
+                    && request.messages.iter().any(|message| matches!(message, fluent_code_provider::ProviderMessage::ToolResult { content, .. } if content == "[\"src/lib.rs\"]"))
         ));
+    }
+
+    #[test]
+    fn approve_pending_tool_approves_all_pending_calls_in_batch() {
+        let mut state = AppState::new(Session::new("batch approval flow"));
+        state.draft_input = "run multiple tools".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "tool-call-read-1".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({ "path": "Cargo.toml" }),
+                },
+            },
+        );
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "tool-call-glob-2".to_string(),
+                    name: "glob".to_string(),
+                    arguments: serde_json::json!({ "pattern": "**/*.rs" }),
+                },
+            },
+        );
+
+        let effects = update(&mut state, Msg::ApprovePendingTool);
+
+        assert!(matches!(state.status, AppStatus::RunningTool));
+        assert_eq!(
+            state
+                .session
+                .tool_invocations
+                .iter()
+                .filter(|invocation| invocation.approval_state == ToolApprovalState::Approved)
+                .count(),
+            2
+        );
+        assert_eq!(
+            state
+                .session
+                .tool_invocations
+                .iter()
+                .filter(|invocation| invocation.execution_state == ToolExecutionState::Running)
+                .count(),
+            2
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::ExecuteTool { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]

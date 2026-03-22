@@ -1,5 +1,7 @@
 pub mod events;
 pub mod terminal;
+pub mod theme;
+pub mod ui_state;
 pub mod view;
 
 use fluent_code_app::app::{AppState, Effect, update};
@@ -9,15 +11,20 @@ use fluent_code_app::session::model::Session;
 use fluent_code_app::session::store::{FsSessionStore, SessionStore};
 use tracing::{debug, info};
 
+use crate::events::TuiAction;
+use crate::ui_state::UiState;
+
 pub async fn run_app(session: Session, store: FsSessionStore, runtime: Runtime) -> Result<()> {
     info!(session_id = %session.id, "starting tui application");
     let mut terminal = terminal::init()?;
     let mut state = AppState::new(session);
+    let mut ui_state = UiState::default();
     let (runtime_sender, mut runtime_receiver) = tokio::sync::mpsc::unbounded_channel();
 
     let app_result = run_loop(
         &mut terminal,
         &mut state,
+        &mut ui_state,
         &store,
         &runtime,
         runtime_sender,
@@ -34,6 +41,7 @@ pub async fn run_app(session: Session, store: FsSessionStore, runtime: Runtime) 
 async fn run_loop(
     terminal: &mut terminal::AppTerminal,
     state: &mut AppState,
+    ui_state: &mut UiState,
     store: &FsSessionStore,
     runtime: &Runtime,
     runtime_sender: tokio::sync::mpsc::UnboundedSender<fluent_code_app::app::Msg>,
@@ -49,14 +57,24 @@ async fn run_loop(
             runtime_receiver,
         )
         .await?;
-        terminal.draw(|frame| view::render(frame, state))?;
+        terminal.draw(|frame| view::render(frame, state, ui_state))?;
 
         if state.should_quit {
             break;
         }
 
-        if let Some(msg) = events::next_message(&state.draft_input, &state.status)? {
-            handle_message(state, store, runtime, runtime_sender.clone(), msg).await?;
+        if let Some(action) = events::next_action(&state.draft_input, &state.status)? {
+            match action {
+                TuiAction::Message(msg) => {
+                    handle_message(state, store, runtime, runtime_sender.clone(), msg).await?;
+                }
+                TuiAction::ToggleToolDetails => {
+                    ui_state.show_tool_details = !ui_state.show_tool_details;
+                }
+                TuiAction::ToggleHelpOverlay => {
+                    ui_state.show_help_overlay = !ui_state.show_help_overlay;
+                }
+            }
         }
     }
 

@@ -1,89 +1,85 @@
 # AGENTS.md
 
-This file is for coding agents working in `/Users/yangtingmei/Documents/codes/rust/fluent-code`.
-It reflects the current repository state, the actual Cargo workspace layout, and the commands verified in this repo.
+This file is for coding agents working in `/Users/ytm-pc/Documents/codes/rust/fluent-code`.
+It reflects the current Cargo workspace, repository layout, and commands verified in this repo.
 
 ## 1. Repository overview
 
 - This repo is a Rust Cargo workspace.
-- Root package: `fluent-code` (thin binary crate in `src/main.rs`).
-- Workspace member crates:
+- Workspace members:
+  - `.` → `fluent-code` (root binary crate)
   - `crates/fluent-code-app`
   - `crates/fluent-code-provider`
   - `crates/fluent-code-tui`
-- The root crate wires config, session store, provider, runtime, and TUI together.
-- The root crate is intentionally thin; do not move business logic into `src/main.rs` unless the user explicitly wants wiring changed.
+- Workspace edition: `2024`
+- Shared foundations include Tokio, Ratatui, Crossterm, Tracing, Serde, and `rig-core = 0.33.0`.
 
 ## 2. Crate responsibilities
 
 ### `fluent-code`
-- Composition root only.
-- Loads config.
-- Constructs the session store.
-- Constructs the provider.
-- Constructs the runtime.
-- Launches the TUI.
+- Thin composition root in `src/main.rs`
+- Loads config, builds session store/provider/runtime, launches the TUI
+
+Keep this crate thin. Do not move domain logic here unless the user explicitly asks.
 
 ### `fluent-code-app`
-- Application logic and durable state.
-- Owns:
-  - `app/` reducer-style state transitions
-  - `runtime/` orchestration and task cancellation
-  - `session/` models and file-backed persistence
-  - `config.rs`
-  - `error.rs`
-- This crate currently contains the main operational invariants of the app.
+- Owns application logic and durable state
+- Main areas:
+  - `app/` → reducer-style state transitions
+  - `runtime/` → orchestration and cancellation
+  - `session/` → models and persistence
+  - `tool.rs` → built-in tool execution
+  - `config.rs`, `error.rs`
+
+This crate is the source of truth for operational invariants.
 
 ### `fluent-code-provider`
-- Provider-facing logic only.
-- Owns mock provider behavior and `rig-core` integration.
-- Keep provider-specific request/response mapping here.
-- Do not leak `rig-core` details into `fluent-code-tui`.
+- Owns provider-facing logic only
+- Contains mock provider behavior and `rig-core` integration
+- Converts between local provider types and upstream APIs
+
+Do not leak provider-specific concepts into `fluent-code-tui`.
 
 ### `fluent-code-tui`
-- Ratatui/crossterm frontend.
-- Owns event handling, rendering, terminal lifecycle, and the UI loop.
-- It may coordinate effect execution, but it should not become the home for core domain rules.
+- Owns Ratatui/Crossterm rendering, event handling, terminal lifecycle, and local UI state
+- May coordinate effects, but should not become the home for business rules
+
+Keep TUI-only presentation state here, not in `fluent-code-app`.
 
 ## 3. Local instruction files
 
 Current repo state:
-- No `.cursorrules` file exists.
-- No `.cursor/rules/` directory exists.
-- No `.github/copilot-instructions.md` file exists.
+- Root `AGENTS.md` exists
+- No `.cursorrules`
+- No `.cursor/rules/`
+- No `.github/copilot-instructions.md`
 
-Do not assume hidden policy files exist elsewhere in the repo.
+Do not assume hidden Cursor or Copilot rule files exist elsewhere in the repo.
 
 ## 4. Verified commands
 
 Run commands from the repository root unless there is a strong reason not to.
 
-### Build
-
-- Build the whole workspace:
-  - `cargo build --workspace`
-- Build only the root binary package:
-  - `cargo build -p fluent-code`
+### Build / check
+- `cargo build --workspace`
+- `cargo build -p fluent-code`
+- `cargo check --workspace`
 
 ### Run
-
-- Run the app:
-  - `cargo run -p fluent-code`
+- `cargo run -p fluent-code`
 
 ### Test
-
-- Run all tests in the workspace:
+- Whole workspace:
   - `cargo test --workspace`
-- Run tests for one crate:
+- Single crate:
   - `cargo test -p fluent-code-app`
   - `cargo test -p fluent-code-provider`
   - `cargo test -p fluent-code-tui`
 
 ### Run a single test
+Use the package name and test name.
 
-Use the package name and the exact test name.
-
-Examples verified from current source files:
+Verified examples:
 - `cargo test -p fluent-code-app creates_and_loads_latest_session`
 - `cargo test -p fluent-code-app saves_and_restores_turns`
 - `cargo test -p fluent-code-app mock_provider_streams_assistant_messages`
@@ -91,151 +87,124 @@ Examples verified from current source files:
 - `cargo test -p fluent-code-tui persists_partial_assistant_content_before_completion`
 - `cargo test -p fluent-code-tui cancel_stops_persisted_assistant_growth`
 
-If you need exact matching for an ambiguous name, add `-- --exact`.
+If the test name is ambiguous, add `-- --exact`.
 
-### Formatting
-
-- Format the whole workspace:
-  - `cargo fmt --all`
-- Verify formatting without changing files:
-  - `cargo fmt --all -- --check`
-
-### Linting
-
-- Run clippy across the whole workspace:
-  - `cargo clippy --workspace --all-targets -- -D warnings`
-
-This command is valid in the current repo and should be treated as the main lint gate.
+### Format / lint
+- `cargo fmt --all`
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- Faster crate-local loop:
+  - `cargo clippy -p fluent-code-app --all-targets -- -D warnings`
+  - `cargo clippy -p fluent-code-provider --all-targets -- -D warnings`
+  - `cargo clippy -p fluent-code-tui --all-targets -- -D warnings`
 
 ## 5. Test layout and expectations
 
-- Tests are inline unit tests under `#[cfg(test)]` in source files.
-- There is no top-level `tests/` directory right now.
-- There is no `benches/` directory right now.
-- Async behavior uses `#[tokio::test]`.
-- Sync file-store tests use plain `#[test]`.
-- Test helpers are usually private functions at the bottom of the same module.
+- Tests are inline `#[cfg(test)]` unit tests in source files.
+- There is no top-level `tests/` directory.
+- There is no `benches/` directory.
+- Async tests use `#[tokio::test]`.
+- Sync tests use plain `#[test]`.
 
-Existing test-heavy files:
-- `crates/fluent-code-app/src/session/store.rs`
+Test-heavy files include:
+- `crates/fluent-code-app/src/app/update.rs`
 - `crates/fluent-code-app/src/runtime/orchestrator.rs`
+- `crates/fluent-code-app/src/session/store.rs`
+- `crates/fluent-code-app/src/tool.rs`
 - `crates/fluent-code-tui/src/lib.rs`
+- `crates/fluent-code-tui/src/view.rs`
+- `crates/fluent-code-provider/src/rig.rs`
 
-When adding tests, prefer colocated tests unless there is a strong reason to introduce integration tests.
+Prefer colocated tests unless there is a strong reason to introduce integration tests.
 
 ## 6. Code style guidelines
 
 These are repo-observed conventions, not generic Rust theory.
 
 ### Imports
-
 - Keep imports explicit.
-- Prefer grouping standard library imports first, then third-party imports, then local crate imports.
-- If `rustfmt` reorders imports, follow the formatter.
-- Use crate paths that reflect ownership boundaries:
-  - `fluent_code_app::...`
-  - `fluent_code_provider::...`
-  - `fluent_code_tui::...`
+- Group standard library, then third-party crates, then local crate imports.
+- Let `rustfmt` reorder imports if it wants to.
+- Use ownership-reflecting crate paths like `fluent_code_app::...`, `fluent_code_provider::...`, and `fluent_code_tui::...`.
 
 ### Formatting
-
 - Use `cargo fmt --all`.
-- Do not hand-format in ways that fight rustfmt.
-- Before finishing a change, prefer `cargo fmt --all -- --check`.
+- Do not hand-format against `rustfmt`.
+- Before finishing, prefer `cargo fmt --all -- --check`.
 
 ### Naming
-
-- Types and enums: `PascalCase`
-- Functions, modules, files, and tests: `snake_case`
+- Types/enums/traits: `PascalCase`
+- Functions/modules/files/tests: `snake_case`
 - Constants: `SCREAMING_SNAKE_CASE`
-- Prefer behavior-oriented test names like:
-  - `creates_and_loads_latest_session`
-  - `cancel_stops_persisted_assistant_growth`
+- Prefer behavior-oriented test names such as `approve_tool_executes_and_resumes_run`.
 
 ### Types and modeling
-
-- Prefer concrete enums for state transitions and lifecycle states.
-- This repo already uses message/effect/state patterns; follow them instead of bypassing them.
-- Preserve lightweight domain modeling:
-  - `Msg`
-  - `Effect`
-  - `Session`
-  - `Turn`
-  - `RunRecord`
-  - `RunStatus`
-- Avoid introducing loosely typed stringly-typed state if an enum is more appropriate.
+- Prefer concrete enums for state and lifecycle modeling.
+- Follow the existing reducer/message/effect structure instead of bypassing it.
+- Preserve existing domain models like `Msg`, `Effect`, `Session`, `Turn`, `RunRecord`, `RunStatus`, `ProviderMessage`, and `ProviderToolCall`.
+- Avoid stringly-typed state when an enum or struct fits.
 
 ### Error handling
-
 - Use crate-local `Result<T>` aliases and `thiserror` enums.
-- Propagate errors with `?` in production code.
-- Use `map_err` when crossing subsystem boundaries and you need to translate errors.
+- Propagate errors with `?`.
+- Use `map_err` when translating errors across subsystem boundaries.
 - Avoid panics in production logic.
-- `expect(...)` is acceptable in tests and for truly internal invariants, but keep messages specific.
+- `expect(...)` is acceptable in tests and tight internal invariants, but keep messages specific.
 
-### Control flow
-
-- Prefer early returns for invalid or no-op paths.
-- Use `match` and `if let` to make message/state transitions explicit.
-- Follow clippy-friendly patterns; this repo currently passes:
-  - `cargo clippy --workspace --all-targets -- -D warnings`
-- If clippy suggests collapsing nested `if` statements, do it rather than suppressing the lint.
-
-### Concurrency and async
-
-- Runtime work is background-driven with Tokio tasks.
-- Preserve the existing split:
+### Control flow and boundaries
+- Prefer early returns for invalid, stale, or no-op paths.
+- Use `match` / `if let` to keep transitions explicit.
+- Write code that stays clippy-clean without suppressing lints.
+- Preserve the current split:
   - app reducer mutates state
   - runtime performs async work
   - provider streams model output
   - TUI drains messages and renders
-- Do not move provider calls directly into the reducer.
-- Do not bypass runtime cancellation/task tracking.
+- Do not call providers directly from the reducer.
+- Do not bypass runtime task tracking or cancellation.
 
-### Persistence
-
-- Session data is file-backed and currently snapshot-based.
-- Session persistence lives in `fluent-code-app::session::store`.
-- Checkpointing is throttled; do not turn it into save-on-every-chunk unless intentionally redesigning that behavior.
-- Keep session and run metadata consistent when changing streaming, cancellation, or persistence behavior.
+### Persistence and invariants
+- Session data is file-backed and snapshot-based.
+- Persistence lives in `fluent-code-app::session::store`.
+- Checkpointing is intentionally throttled.
+- Keep session metadata, run outcomes, tool invocation state, and replay semantics consistent.
 
 ## 7. Architecture-specific guidance
 
 - Keep `src/main.rs` thin.
-- Keep `fluent-code-provider` independent of app-owned business logic.
-- Keep `fluent-code-tui` focused on UI concerns and effect execution, not domain modeling.
-- Keep `fluent-code-app` as the home of reducer logic, session invariants, and runtime state transitions.
-- Avoid creating micro-crates for `config`, `error`, `store`, or `checkpoint` unless the user explicitly wants another split.
+- Keep `fluent-code-provider` independent from app-owned business rules.
+- Keep `fluent-code-app` as the home of operational invariants.
+- Keep `fluent-code-tui` focused on presentation and local UI state.
+- When touching cross-crate APIs, update all dependent crates in the same pass.
 
-## 8. What to preserve when editing
+## 8. Current behavior to preserve
 
-- Streaming updates arrive incrementally through runtime/provider boundaries.
-- Cancellation is enforced both by task abort and stale-message gating.
-- Checkpoint persistence is intentionally throttled.
-- Run outcomes are persisted in session metadata.
-- The workspace currently passes build, test, fmt, and clippy from the repo root.
+- Streaming assistant output arrives incrementally.
+- Cancellation is enforced by both task abort and stale-message gating.
+- Checkpoint persistence is throttled, not save-on-every-chunk.
+- A multi-tool assistant turn should only resume after the full batch is terminal.
+- Missing-file `read` failures are recoverable tool results, not immediate run killers.
+- OpenAI provider integration currently relies on latest `rig-core` with the local provider adapter.
+- The TUI currently has a structured shell, compact/expanded tool detail modes, and local help/detail overlay state.
 
-If your change breaks one of those properties, either fix it or document the change clearly.
+## 9. Suggested validation sequence
 
-## 9. Suggested validation sequence for most code changes
-
-For local changes in one crate:
+For single-crate changes:
 1. `cargo fmt --all`
 2. `cargo test -p <affected-crate>`
-3. `cargo clippy -p <affected-crate> --all-targets -- -D warnings` if you want a faster local loop
+3. `cargo clippy -p <affected-crate> --all-targets -- -D warnings`
 
-Before finishing broader or cross-crate work:
+For broader or cross-crate work:
 1. `cargo fmt --all -- --check`
 2. `cargo check --workspace`
 3. `cargo test --workspace`
 4. `cargo clippy --workspace --all-targets -- -D warnings`
 
-## 10. Practical agent guidance
+## 10. Practical guidance for coding agents
 
-- Read the crate boundaries before editing imports.
-- Prefer small, behavior-preserving changes.
-- When touching cross-crate APIs, update all dependent crates in the same pass.
-- If you add a new test, make it runnable with a simple `cargo test -p <crate> <name>` command.
-- If you introduce a new operational invariant, place it in `fluent-code-app`, not in the root binary.
-
-This file should be kept current as the workspace grows.
+- Read crate boundaries before editing imports or moving logic.
+- Prefer small, behavior-preserving changes unless the user asks for a redesign.
+- Add tests when touching reducer logic, replay behavior, tool execution, provider mapping, or TUI event handling.
+- If you introduce a new invariant, put it in `fluent-code-app`, not the root crate.
+- If you add TUI-only state, keep it in `fluent-code-tui` and do not persist it unless explicitly required.
+- Keep this file current when workspace structure, commands, or major interaction patterns change.
