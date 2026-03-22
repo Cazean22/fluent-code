@@ -26,7 +26,7 @@ pub async fn run_app(session: Session, store: FsSessionStore, runtime: Runtime) 
     .await;
     let restore_result = terminal::restore(terminal);
 
-    info!("tui application finished");
+    info!(session_id = %state.session.id, "tui application finished");
     app_result?;
     restore_result
 }
@@ -71,7 +71,11 @@ async fn drain_runtime_messages(
     runtime_receiver: &mut tokio::sync::mpsc::UnboundedReceiver<fluent_code_app::app::Msg>,
 ) -> Result<()> {
     while let Ok(message) = runtime_receiver.try_recv() {
-        debug!("draining queued runtime message into tui state");
+        log_tui_message(
+            "draining queued runtime message into tui state",
+            state,
+            &message,
+        );
         handle_message(state, store, runtime, runtime_sender.clone(), message).await?;
     }
 
@@ -90,6 +94,8 @@ async fn handle_message(
         create_and_swap_session(state, store)?;
         return Ok(());
     }
+
+    log_tui_message("handling tui message", state, &msg);
 
     let mut pending_messages = std::collections::VecDeque::from([msg]);
 
@@ -131,7 +137,11 @@ async fn apply_effects(
             Effect::StartAssistant { .. }
             | Effect::ExecuteTool { .. }
             | Effect::CancelAssistant { .. } => {
-                debug!("forwarding async effect from tui to runtime");
+                log_tui_effect(
+                    "forwarding async effect from tui to runtime",
+                    state,
+                    &effect,
+                );
                 runtime.spawn_effect(effect, runtime_sender.clone());
             }
         }
@@ -146,7 +156,11 @@ async fn apply_effects(
                 Effect::StartAssistant { .. }
                 | Effect::ExecuteTool { .. }
                 | Effect::CancelAssistant { .. } => {
-                    debug!("forwarding queued async effect from tui to runtime");
+                    log_tui_effect(
+                        "forwarding queued async effect from tui to runtime",
+                        state,
+                        &effect,
+                    );
                     runtime.spawn_effect(effect, runtime_sender.clone())
                 }
             }
@@ -170,6 +184,130 @@ fn persist_session_if_due(state: &mut AppState, store: &FsSessionStore) -> Resul
     }
 
     Ok(())
+}
+
+fn log_tui_message(context: &str, state: &AppState, message: &fluent_code_app::app::Msg) {
+    match message {
+        fluent_code_app::app::Msg::InputChanged(input) => debug!(
+            session_id = %state.session.id,
+            message_kind = "input_changed",
+            input_bytes = input.len(),
+            "{context}"
+        ),
+        fluent_code_app::app::Msg::SubmitPrompt => debug!(
+            session_id = %state.session.id,
+            message_kind = "submit_prompt",
+            "{context}"
+        ),
+        fluent_code_app::app::Msg::NewSession => debug!(
+            session_id = %state.session.id,
+            message_kind = "new_session",
+            "{context}"
+        ),
+        fluent_code_app::app::Msg::ApprovePendingTool => debug!(
+            session_id = %state.session.id,
+            message_kind = "approve_pending_tool",
+            "{context}"
+        ),
+        fluent_code_app::app::Msg::DenyPendingTool => debug!(
+            session_id = %state.session.id,
+            message_kind = "deny_pending_tool",
+            "{context}"
+        ),
+        fluent_code_app::app::Msg::CancelActiveRun => debug!(
+            session_id = %state.session.id,
+            message_kind = "cancel_active_run",
+            active_run_id = ?state.active_run_id,
+            "{context}"
+        ),
+        fluent_code_app::app::Msg::AssistantChunk { run_id, delta } => debug!(
+            session_id = %state.session.id,
+            message_kind = "assistant_chunk",
+            run_id = %run_id,
+            chunk_bytes = delta.len(),
+            "{context}"
+        ),
+        fluent_code_app::app::Msg::AssistantToolCall { run_id, tool_call } => debug!(
+            session_id = %state.session.id,
+            message_kind = "assistant_tool_call",
+            run_id = %run_id,
+            tool_name = %tool_call.name,
+            tool_call_id = %tool_call.id,
+            "{context}"
+        ),
+        fluent_code_app::app::Msg::AssistantDone { run_id } => debug!(
+            session_id = %state.session.id,
+            message_kind = "assistant_done",
+            run_id = %run_id,
+            "{context}"
+        ),
+        fluent_code_app::app::Msg::AssistantFailed { run_id, error } => debug!(
+            session_id = %state.session.id,
+            message_kind = "assistant_failed",
+            run_id = %run_id,
+            error = %error,
+            "{context}"
+        ),
+        fluent_code_app::app::Msg::ToolExecutionFinished {
+            run_id,
+            invocation_id,
+            result,
+        } => debug!(
+            session_id = %state.session.id,
+            message_kind = "tool_execution_finished",
+            run_id = %run_id,
+            invocation_id = %invocation_id,
+            result_status = if result.is_ok() { "ok" } else { "error" },
+            "{context}"
+        ),
+        fluent_code_app::app::Msg::Quit => debug!(
+            session_id = %state.session.id,
+            message_kind = "quit",
+            "{context}"
+        ),
+    }
+}
+
+fn log_tui_effect(context: &str, state: &AppState, effect: &Effect) {
+    match effect {
+        Effect::PersistSession => debug!(
+            session_id = %state.session.id,
+            effect_kind = "persist_session",
+            "{context}"
+        ),
+        Effect::PersistSessionIfDue => debug!(
+            session_id = %state.session.id,
+            effect_kind = "persist_session_if_due",
+            "{context}"
+        ),
+        Effect::StartAssistant { run_id, request } => debug!(
+            session_id = %state.session.id,
+            effect_kind = "start_assistant",
+            run_id = %run_id,
+            request_message_count = request.messages.len(),
+            request_tool_count = request.tools.len(),
+            "{context}"
+        ),
+        Effect::ExecuteTool {
+            run_id,
+            invocation_id,
+            tool_call,
+        } => debug!(
+            session_id = %state.session.id,
+            effect_kind = "execute_tool",
+            run_id = %run_id,
+            invocation_id = %invocation_id,
+            tool_name = %tool_call.name,
+            tool_call_id = %tool_call.id,
+            "{context}"
+        ),
+        Effect::CancelAssistant { run_id } => debug!(
+            session_id = %state.session.id,
+            effect_kind = "cancel_assistant",
+            run_id = %run_id,
+            "{context}"
+        ),
+    }
 }
 
 #[cfg(test)]

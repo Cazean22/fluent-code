@@ -31,11 +31,19 @@ impl FsSessionStore {
 
         match self.read_latest_session_id()? {
             Some(id) => {
-                info!(session_id = %id, "loading latest persisted session");
+                info!(
+                    session_id = %id,
+                    store_root = %path_for_log(&self.root),
+                    "loading latest persisted session"
+                );
                 self.load(&id)
             }
             None => {
-                info!("no persisted latest session found; creating a new session");
+                info!(
+                    store_root = %path_for_log(&self.root),
+                    latest_session_path = %path_for_log(&self.latest_session_path()),
+                    "no persisted latest session found; creating a new session"
+                );
                 self.create_new_session()
             }
         }
@@ -46,7 +54,12 @@ impl FsSessionStore {
 
         let session = Session::new("New Session");
         self.create(&session)?;
-        info!(session_id = %session.id, "created new session");
+        info!(
+            session_id = %session.id,
+            session_title = %session.title,
+            session_dir = %path_for_log(&self.session_dir(&session.id)),
+            "created new session"
+        );
         Ok(session)
     }
 
@@ -78,7 +91,11 @@ impl FsSessionStore {
 
     fn write_latest_session_id(&self, id: &SessionId) -> Result<()> {
         fs::write(self.latest_session_path(), id.to_string())?;
-        debug!(session_id = %id, "updated latest session pointer");
+        debug!(
+            session_id = %id,
+            latest_session_path = %path_for_log(&self.latest_session_path()),
+            "updated latest session pointer"
+        );
         Ok(())
     }
 
@@ -133,7 +150,11 @@ impl SessionStore for FsSessionStore {
     fn load(&self, id: &SessionId) -> Result<Session> {
         let meta_path = self.session_meta_path(id);
         if !meta_path.exists() {
-            warn!(session_id = %id, "session metadata file missing during load");
+            warn!(
+                session_id = %id,
+                session_meta_path = %path_for_log(&meta_path),
+                "session metadata file missing during load"
+            );
             return Err(FluentCodeError::Session(format!(
                 "session metadata not found for {id}"
             )));
@@ -154,6 +175,7 @@ impl SessionStore for FsSessionStore {
 
         info!(
             session_id = %session.id,
+            session_title = %session.title,
             turn_count = session.turns.len(),
             run_count = session.runs.len(),
             tool_invocation_count = session.tool_invocations.len(),
@@ -180,6 +202,7 @@ impl SessionStore for FsSessionStore {
 
         info!(
             session_id = %session.id,
+            session_title = %session.title,
             turn_count = session.turns.len(),
             run_count = session.runs.len(),
             tool_invocation_count = session.tool_invocations.len(),
@@ -198,7 +221,13 @@ impl SessionStore for FsSessionStore {
             .append(true)
             .open(self.turns_path(session_id))?;
         writeln!(file, "{}", serde_json::to_string(turn)?)?;
-        debug!(session_id = %session_id, turn_id = %turn.id, "appended session turn");
+        debug!(
+            session_id = %session_id,
+            turn_id = %turn.id,
+            run_id = %turn.run_id,
+            role = ?turn.role,
+            "appended session turn"
+        );
         Ok(())
     }
 }

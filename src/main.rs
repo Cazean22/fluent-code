@@ -21,7 +21,9 @@ async fn main() -> Result<()> {
         model = %config.model.model,
         file_logging = config.logging.file.enabled,
         file_log_path = %path_for_log(&config.logging.file.path),
+        file_log_level = %config.logging.file.level,
         stderr_logging = config.logging.stderr.enabled,
+        stderr_log_level = %config.logging.stderr.level,
         "application startup configuration loaded"
     );
 

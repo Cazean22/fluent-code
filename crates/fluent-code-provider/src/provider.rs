@@ -76,8 +76,8 @@ impl ProviderClient {
         F: FnMut(ProviderEvent) + Send,
     {
         debug!(
-            message_count = request.messages.len(),
-            tool_count = request.tools.len(),
+            request_message_count = request.messages.len(),
+            request_tool_count = request.tools.len(),
             "provider stream requested"
         );
         match self {
@@ -165,8 +165,9 @@ impl MockProvider {
         F: FnMut(ProviderEvent) + Send,
     {
         info!(
-            message_count = request.messages.len(),
-            tool_count = request.tools.len(),
+            provider = "mock",
+            request_message_count = request.messages.len(),
+            request_tool_count = request.tools.len(),
             "mock provider stream started"
         );
         let Some(message) = request.messages.last() else {
@@ -190,7 +191,12 @@ impl MockProvider {
                         arguments: json!({ "text": tool_input }),
                     }));
 
-                    info!("mock provider stream finished with tool call");
+                    info!(
+                        provider = "mock",
+                        tool_name = "uppercase_text",
+                        tool_call_id = "mock-tool-call-1",
+                        "mock provider stream finished with tool call"
+                    );
                     Ok(())
                 } else {
                     let response = format!("Mock assistant response: {text}");
@@ -200,7 +206,11 @@ impl MockProvider {
                         tokio::time::sleep(self.chunk_delay).await;
                     }
 
-                    info!("mock provider stream finished successfully");
+                    info!(
+                        provider = "mock",
+                        response_bytes = response.len(),
+                        "mock provider stream finished successfully"
+                    );
                     Ok(())
                 }
             }
@@ -212,7 +222,11 @@ impl MockProvider {
                     tokio::time::sleep(self.chunk_delay).await;
                 }
 
-                info!("mock provider resumed after tool result and finished successfully");
+                info!(
+                    provider = "mock",
+                    response_bytes = response.len(),
+                    "mock provider resumed after tool result and finished successfully"
+                );
                 Ok(())
             }
             ProviderMessage::AssistantText { .. } | ProviderMessage::AssistantToolCall { .. } => {

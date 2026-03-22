@@ -42,6 +42,8 @@ pub fn init_logging(config: &Config) -> Result<LoggingGuard> {
     let file_layer = file_writer.zip(file_filter).map(|(writer, filter)| {
         tracing_subscriber::fmt::layer()
             .json()
+            .with_current_span(true)
+            .with_span_list(true)
             .with_ansi(false)
             .with_writer(writer)
             .with_filter(filter)

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use fluent_code_provider::{ProviderClient, ProviderEvent};
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 use uuid::Uuid;
 
 use crate::app::{Effect, Msg};
@@ -16,7 +16,7 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(provider: ProviderClient) -> Self {
-        info!("runtime orchestrator created");
+        info!(component = "runtime", "runtime orchestrator created");
         Self {
             provider,
             tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -26,10 +26,16 @@ impl Runtime {
     pub fn spawn_effect(&self, effect: Effect, sender: tokio::sync::mpsc::UnboundedSender<Msg>) {
         match effect {
             Effect::PersistSession => {
-                debug!("runtime received persistence effect for tui handling");
+                debug!(
+                    effect_kind = "persist_session",
+                    "runtime received persistence effect for tui handling"
+                );
             }
             Effect::PersistSessionIfDue => {
-                debug!("runtime received checkpoint persistence effect for tui handling");
+                debug!(
+                    effect_kind = "persist_session_if_due",
+                    "runtime received checkpoint persistence effect for tui handling"
+                );
             }
             Effect::CancelAssistant { run_id } => {
                 info!(run_id = %run_id, "cancel requested for assistant run");
@@ -46,65 +52,85 @@ impl Runtime {
                 }
             }
             Effect::StartAssistant { run_id, request } => {
+                let request_message_count = request.messages.len();
+                let request_tool_count = request.tools.len();
                 info!(
                     run_id = %run_id,
-                    message_count = request.messages.len(),
-                    tool_count = request.tools.len(),
+                    request_message_count,
+                    request_tool_count,
                     "spawning assistant stream task"
                 );
                 let provider = self.provider.clone();
                 let tasks = Arc::clone(&self.tasks);
+                let assistant_span = info_span!(
+                    "assistant_run",
+                    run_id = %run_id,
+                    request_message_count,
+                    request_tool_count
+                );
 
-                let handle = tokio::spawn(async move {
-                    let mut saw_tool_call = false;
-                    debug!(run_id = %run_id, "assistant stream task started");
-                    let result = provider
-                        .stream(&request, |event| match event {
-                            ProviderEvent::TextDelta(delta) => {
-                                debug!(run_id = %run_id, chunk_bytes = delta.len(), "assistant chunk received");
-                                let _ = sender.send(Msg::AssistantChunk { run_id, delta });
-                            }
-                            ProviderEvent::ToolCall(tool_call) => {
-                                saw_tool_call = true;
-                                info!(
-                                    run_id = %run_id,
-                                    tool_name = %tool_call.name,
-                                    tool_call_id = %tool_call.id,
-                                    "assistant requested tool execution"
-                                );
-                                let _ = sender.send(Msg::AssistantToolCall { run_id, tool_call });
-                            }
-                        })
-                        .await;
-
-                    let message = match result {
-                        Ok(()) if saw_tool_call => {
-                            info!(run_id = %run_id, "assistant stream paused after tool call");
-                            None
-                        }
-                        Ok(()) => {
-                            info!(run_id = %run_id, "assistant stream finished successfully");
-                            Some(Msg::AssistantDone { run_id })
-                        }
-                        Err(error) => {
-                            warn!(run_id = %run_id, error = %error, "assistant stream failed");
-                            Some(Msg::AssistantFailed {
-                                run_id,
-                                error: error.to_string(),
+                let handle = tokio::spawn(
+                    async move {
+                        let mut saw_tool_call = false;
+                        debug!(task_event = "started", "assistant stream task started");
+                        let result = provider
+                            .stream(&request, |event| match event {
+                                ProviderEvent::TextDelta(delta) => {
+                                    debug!(chunk_bytes = delta.len(), "assistant chunk received");
+                                    let _ = sender.send(Msg::AssistantChunk { run_id, delta });
+                                }
+                                ProviderEvent::ToolCall(tool_call) => {
+                                    saw_tool_call = true;
+                                    info!(
+                                        tool_name = %tool_call.name,
+                                        tool_call_id = %tool_call.id,
+                                        "assistant requested tool execution"
+                                    );
+                                    let _ =
+                                        sender.send(Msg::AssistantToolCall { run_id, tool_call });
+                                }
                             })
+                            .await;
+
+                        let message = match result {
+                            Ok(()) if saw_tool_call => {
+                                info!(
+                                    task_event = "paused_for_tool_call",
+                                    "assistant stream paused after tool call"
+                                );
+                                None
+                            }
+                            Ok(()) => {
+                                info!(
+                                    task_event = "completed",
+                                    "assistant stream finished successfully"
+                                );
+                                Some(Msg::AssistantDone { run_id })
+                            }
+                            Err(error) => {
+                                warn!(error = %error, "assistant stream failed");
+                                Some(Msg::AssistantFailed {
+                                    run_id,
+                                    error: error.to_string(),
+                                })
+                            }
+                        };
+
+                        if let Some(message) = message {
+                            let _ = sender.send(message);
                         }
-                    };
 
-                    if let Some(message) = message {
-                        let _ = sender.send(message);
+                        tasks
+                            .lock()
+                            .expect("runtime task registry lock")
+                            .remove(&run_id);
+                        debug!(
+                            task_event = "removed_from_registry",
+                            "assistant task removed from registry"
+                        );
                     }
-
-                    tasks
-                        .lock()
-                        .expect("runtime task registry lock")
-                        .remove(&run_id);
-                    debug!(run_id = %run_id, "assistant task removed from registry");
-                });
+                    .instrument(assistant_span.or_current()),
+                );
 
                 self.tasks
                     .lock()
@@ -124,37 +150,32 @@ impl Runtime {
                     tool_call_id = %tool_call.id,
                     "spawning built-in tool execution"
                 );
-                tokio::spawn(async move {
-                    debug!(
-                        run_id = %run_id,
-                        invocation_id = %invocation_id,
-                        tool_name = %tool_call.name,
-                        "tool execution task started"
-                    );
-                    let result =
-                        execute_built_in_tool(&tool_call).map_err(|error| error.to_string());
-                    match &result {
-                        Ok(output) => info!(
-                            run_id = %run_id,
-                            invocation_id = %invocation_id,
-                            tool_name = %tool_call.name,
-                            output_bytes = output.len(),
-                            "tool execution completed"
-                        ),
-                        Err(error) => warn!(
-                            run_id = %run_id,
-                            invocation_id = %invocation_id,
-                            tool_name = %tool_call.name,
-                            error = %error,
-                            "tool execution failed"
-                        ),
+                let tool_execution_span = info_span!(
+                    "tool_execution",
+                    run_id = %run_id,
+                    invocation_id = %invocation_id,
+                    tool_name = %tool_call.name,
+                    tool_call_id = %tool_call.id
+                );
+                tokio::spawn(
+                    async move {
+                        debug!(task_event = "started", "tool execution task started");
+                        let result =
+                            execute_built_in_tool(&tool_call).map_err(|error| error.to_string());
+                        match &result {
+                            Ok(output) => {
+                                info!(output_bytes = output.len(), "tool execution completed")
+                            }
+                            Err(error) => warn!(error = %error, "tool execution failed"),
+                        }
+                        let _ = sender.send(Msg::ToolExecutionFinished {
+                            run_id,
+                            invocation_id,
+                            result,
+                        });
                     }
-                    let _ = sender.send(Msg::ToolExecutionFinished {
-                        run_id,
-                        invocation_id,
-                        result,
-                    });
-                });
+                    .instrument(tool_execution_span.or_current()),
+                );
             }
         }
     }

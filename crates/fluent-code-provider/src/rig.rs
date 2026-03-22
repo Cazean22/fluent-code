@@ -44,9 +44,10 @@ impl RigOpenAiProvider {
         F: FnMut(ProviderEvent) + Send,
     {
         info!(
+            provider = "openai",
             model = %self.model,
-            message_count = request.messages.len(),
-            tool_count = request.tools.len(),
+            request_message_count = request.messages.len(),
+            request_tool_count = request.tools.len(),
             "openai provider stream started"
         );
         let Some((prompt, history)) = request.messages.split_last() else {
@@ -87,13 +88,14 @@ impl RigOpenAiProvider {
             match chunk {
                 Ok(StreamingChoice::Message(text)) => {
                     debug!(
+                        provider = "openai",
                         chunk_bytes = text.len(),
                         "openai provider emitted text delta"
                     );
                     on_event(ProviderEvent::TextDelta(text))
                 }
                 Ok(StreamingChoice::ToolCall(name, id, arguments)) => {
-                    info!(tool_name = %name, tool_call_id = %id, "openai provider emitted tool call");
+                    info!(provider = "openai", tool_name = %name, tool_call_id = %id, "openai provider emitted tool call");
                     on_event(ProviderEvent::ToolCall(ProviderToolCall {
                         id,
                         name,
@@ -101,13 +103,13 @@ impl RigOpenAiProvider {
                     }));
                 }
                 Err(error) => {
-                    warn!(error = %error, "openai provider stream failed");
+                    warn!(provider = "openai", error = %error, "openai provider stream failed");
                     return Err(ProviderError::Message(error.to_string()));
                 }
             }
         }
 
-        info!(model = %self.model, "openai provider stream finished successfully");
+        info!(provider = "openai", model = %self.model, "openai provider stream finished successfully");
         Ok(())
     }
 }

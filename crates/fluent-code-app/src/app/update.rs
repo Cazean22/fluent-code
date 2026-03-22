@@ -17,13 +17,22 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
         }
         Msg::SubmitPrompt => {
             if !matches!(state.status, AppStatus::Idle | AppStatus::Error(_)) {
-                debug!(status = ?state.status, "ignored prompt submission because app is busy");
+                debug!(
+                    session_id = %state.session.id,
+                    status = ?state.status,
+                    active_run_id = ?state.active_run_id,
+                    "ignored prompt submission because app is busy"
+                );
                 return Vec::new();
             }
 
             let prompt = state.draft_input.trim().to_owned();
             if prompt.is_empty() {
-                debug!("ignored empty prompt submission");
+                debug!(
+                    session_id = %state.session.id,
+                    draft_input_bytes = state.draft_input.len(),
+                    "ignored empty prompt submission"
+                );
                 return Vec::new();
             }
 
@@ -60,7 +69,10 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
         Msg::NewSession => Vec::new(),
         Msg::ApprovePendingTool => {
             let Some(run_id) = state.active_run_id else {
-                debug!("ignored tool approval because no run is active");
+                debug!(
+                    session_id = %state.session.id,
+                    "ignored tool approval because no run is active"
+                );
                 return Vec::new();
             };
 
@@ -110,7 +122,10 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
         }
         Msg::DenyPendingTool => {
             let Some(run_id) = state.active_run_id else {
-                debug!("ignored tool denial because no run is active");
+                debug!(
+                    session_id = %state.session.id,
+                    "ignored tool denial because no run is active"
+                );
                 return Vec::new();
             };
             let session_id = state.session.id;
@@ -158,7 +173,10 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
         }
         Msg::CancelActiveRun => {
             let Some(run_id) = state.active_run_id.take() else {
-                debug!("ignored cancel because no run is active");
+                debug!(
+                    session_id = %state.session.id,
+                    "ignored cancel because no run is active"
+                );
                 return Vec::new();
             };
 
@@ -177,7 +195,12 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
         }
         Msg::AssistantChunk { run_id, delta } => {
             if state.active_run_id != Some(run_id) {
-                debug!(run_id = %run_id, "ignored stale assistant chunk");
+                debug!(
+                    session_id = %state.session.id,
+                    run_id = %run_id,
+                    active_run_id = ?state.active_run_id,
+                    "ignored stale assistant chunk"
+                );
                 return Vec::new();
             }
 
@@ -218,7 +241,13 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
         }
         Msg::AssistantToolCall { run_id, tool_call } => {
             if state.active_run_id != Some(run_id) {
-                debug!(run_id = %run_id, tool_name = %tool_call.name, "ignored stale tool call");
+                debug!(
+                    session_id = %state.session.id,
+                    run_id = %run_id,
+                    active_run_id = ?state.active_run_id,
+                    tool_name = %tool_call.name,
+                    "ignored stale tool call"
+                );
                 return Vec::new();
             }
 
@@ -261,7 +290,12 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
         }
         Msg::AssistantDone { run_id } => {
             if state.active_run_id != Some(run_id) {
-                debug!(run_id = %run_id, "ignored stale assistant completion");
+                debug!(
+                    session_id = %state.session.id,
+                    run_id = %run_id,
+                    active_run_id = ?state.active_run_id,
+                    "ignored stale assistant completion"
+                );
                 return Vec::new();
             }
 
@@ -281,7 +315,13 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
         }
         Msg::AssistantFailed { run_id, error } => {
             if state.active_run_id != Some(run_id) {
-                debug!(run_id = %run_id, "ignored stale assistant failure");
+                debug!(
+                    session_id = %state.session.id,
+                    run_id = %run_id,
+                    active_run_id = ?state.active_run_id,
+                    error = %error,
+                    "ignored stale assistant failure"
+                );
                 return Vec::new();
             }
 
@@ -308,7 +348,13 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             result,
         } => {
             if state.active_run_id != Some(run_id) {
-                debug!(run_id = %run_id, invocation_id = %invocation_id, "ignored stale tool result");
+                debug!(
+                    session_id = %state.session.id,
+                    run_id = %run_id,
+                    invocation_id = %invocation_id,
+                    active_run_id = ?state.active_run_id,
+                    "ignored stale tool result"
+                );
                 return Vec::new();
             }
             let session_id = state.session.id;
