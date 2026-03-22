@@ -7,6 +7,12 @@ pub enum TuiAction {
     Message(Msg),
     ToggleToolDetails,
     ToggleHelpOverlay,
+    ScrollUp,
+    ScrollDown,
+    PageUp,
+    PageDown,
+    JumpTop,
+    JumpBottom,
 }
 
 pub fn next_action(current_input: &str, status: &AppStatus) -> std::io::Result<Option<TuiAction>> {
@@ -16,6 +22,14 @@ pub fn next_action(current_input: &str, status: &AppStatus) -> std::io::Result<O
 
     let event = event::read()?;
 
+    Ok(next_action_from_event(event, current_input, status))
+}
+
+pub fn next_action_from_event(
+    event: Event,
+    current_input: &str,
+    status: &AppStatus,
+) -> Option<TuiAction> {
     if matches!(
         event,
         Event::Key(KeyEvent {
@@ -25,7 +39,7 @@ pub fn next_action(current_input: &str, status: &AppStatus) -> std::io::Result<O
             ..
         })
     ) {
-        return Ok(Some(TuiAction::ToggleToolDetails));
+        return Some(TuiAction::ToggleToolDetails);
     }
 
     if matches!(
@@ -37,10 +51,82 @@ pub fn next_action(current_input: &str, status: &AppStatus) -> std::io::Result<O
             ..
         })
     ) {
-        return Ok(Some(TuiAction::ToggleHelpOverlay));
+        return Some(TuiAction::ToggleHelpOverlay);
     }
 
-    Ok(map_event_to_message(event, current_input, status).map(TuiAction::Message))
+    if matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            ..
+        })
+    ) {
+        return Some(TuiAction::ScrollUp);
+    }
+
+    if matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            ..
+        })
+    ) {
+        return Some(TuiAction::ScrollDown);
+    }
+
+    if matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::PageUp,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            ..
+        })
+    ) {
+        return Some(TuiAction::PageUp);
+    }
+
+    if matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::PageDown,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            ..
+        })
+    ) {
+        return Some(TuiAction::PageDown);
+    }
+
+    if matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Home,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            ..
+        })
+    ) {
+        return Some(TuiAction::JumpTop);
+    }
+
+    if matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::End,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            ..
+        })
+    ) {
+        return Some(TuiAction::JumpBottom);
+    }
+
+    map_event_to_message(event, current_input, status).map(TuiAction::Message)
 }
 
 pub fn map_event_to_message(event: Event, current_input: &str, status: &AppStatus) -> Option<Msg> {
@@ -123,7 +209,7 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use fluent_code_app::app::{AppStatus, Msg};
 
-    use super::map_event_to_message;
+    use super::{TuiAction, map_event_to_message, next_action_from_event};
 
     #[test]
     fn ctrl_n_starts_new_session_only_when_idle_or_error() {
@@ -176,5 +262,41 @@ mod tests {
 
         assert!(map_event_to_message(f1, "draft", &AppStatus::Idle).is_none());
         assert!(map_event_to_message(f2, "draft", &AppStatus::Idle).is_none());
+    }
+
+    #[test]
+    fn navigation_keys_map_to_transcript_actions() {
+        let cases = [
+            (KeyCode::Up, TuiAction::ScrollUp),
+            (KeyCode::Down, TuiAction::ScrollDown),
+            (KeyCode::PageUp, TuiAction::PageUp),
+            (KeyCode::PageDown, TuiAction::PageDown),
+            (KeyCode::Home, TuiAction::JumpTop),
+            (KeyCode::End, TuiAction::JumpBottom),
+        ];
+
+        for (code, expected) in cases {
+            let event = Event::Key(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::NONE,
+            });
+
+            let action = next_action_from_event(event, "draft", &AppStatus::Idle);
+            assert!(matches!(action, Some(actual) if same_action_variant(&actual, &expected)));
+        }
+    }
+
+    fn same_action_variant(actual: &TuiAction, expected: &TuiAction) -> bool {
+        matches!(
+            (actual, expected),
+            (TuiAction::ScrollUp, TuiAction::ScrollUp)
+                | (TuiAction::ScrollDown, TuiAction::ScrollDown)
+                | (TuiAction::PageUp, TuiAction::PageUp)
+                | (TuiAction::PageDown, TuiAction::PageDown)
+                | (TuiAction::JumpTop, TuiAction::JumpTop)
+                | (TuiAction::JumpBottom, TuiAction::JumpBottom)
+        )
     }
 }

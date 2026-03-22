@@ -1,4 +1,6 @@
+pub mod conversation;
 pub mod events;
+pub mod markdown_render;
 pub mod terminal;
 pub mod theme;
 pub mod ui_state;
@@ -9,6 +11,7 @@ use fluent_code_app::error::Result;
 use fluent_code_app::runtime::Runtime;
 use fluent_code_app::session::model::Session;
 use fluent_code_app::session::store::{FsSessionStore, SessionStore};
+use ratatui::layout::Rect;
 use tracing::{debug, info};
 
 use crate::events::TuiAction;
@@ -53,6 +56,7 @@ async fn run_loop(
             state,
             store,
             runtime,
+            ui_state,
             runtime_sender.clone(),
             runtime_receiver,
         )
@@ -66,7 +70,8 @@ async fn run_loop(
         if let Some(action) = events::next_action(&state.draft_input, &state.status)? {
             match action {
                 TuiAction::Message(msg) => {
-                    handle_message(state, store, runtime, runtime_sender.clone(), msg).await?;
+                    handle_message(state, store, runtime, ui_state, runtime_sender.clone(), msg)
+                        .await?;
                 }
                 TuiAction::ToggleToolDetails => {
                     ui_state.show_tool_details = !ui_state.show_tool_details;
@@ -74,6 +79,15 @@ async fn run_loop(
                 TuiAction::ToggleHelpOverlay => {
                     ui_state.show_help_overlay = !ui_state.show_help_overlay;
                 }
+                TuiAction::ScrollUp => adjust_transcript_scroll(terminal, state, ui_state, -1)?,
+                TuiAction::ScrollDown => adjust_transcript_scroll(terminal, state, ui_state, 1)?,
+                TuiAction::PageUp => adjust_transcript_scroll(terminal, state, ui_state, -10)?,
+                TuiAction::PageDown => adjust_transcript_scroll(terminal, state, ui_state, 10)?,
+                TuiAction::JumpTop => {
+                    ui_state.transcript_scroll_top = 0;
+                    ui_state.transcript_follow_tail = false;
+                }
+                TuiAction::JumpBottom => ui_state.reset_transcript_navigation(),
             }
         }
     }
@@ -85,6 +99,7 @@ async fn drain_runtime_messages(
     state: &mut AppState,
     store: &FsSessionStore,
     runtime: &Runtime,
+    ui_state: &mut UiState,
     runtime_sender: tokio::sync::mpsc::UnboundedSender<fluent_code_app::app::Msg>,
     runtime_receiver: &mut tokio::sync::mpsc::UnboundedReceiver<fluent_code_app::app::Msg>,
 ) -> Result<()> {
@@ -94,7 +109,15 @@ async fn drain_runtime_messages(
             state,
             &message,
         );
-        handle_message(state, store, runtime, runtime_sender.clone(), message).await?;
+        handle_message(
+            state,
+            store,
+            runtime,
+            ui_state,
+            runtime_sender.clone(),
+            message,
+        )
+        .await?;
     }
 
     Ok(())
@@ -104,12 +127,13 @@ async fn handle_message(
     state: &mut AppState,
     store: &FsSessionStore,
     runtime: &Runtime,
+    ui_state: &mut UiState,
     runtime_sender: tokio::sync::mpsc::UnboundedSender<fluent_code_app::app::Msg>,
     msg: fluent_code_app::app::Msg,
 ) -> Result<()> {
     if matches!(msg, fluent_code_app::app::Msg::NewSession) {
         info!(session_id = %state.session.id, "creating new session from tui command");
-        create_and_swap_session(state, store)?;
+        create_and_swap_session(state, ui_state, store)?;
         return Ok(());
     }
 
@@ -133,10 +157,47 @@ async fn handle_message(
     Ok(())
 }
 
-fn create_and_swap_session(state: &mut AppState, store: &FsSessionStore) -> Result<()> {
+fn create_and_swap_session(
+    state: &mut AppState,
+    ui_state: &mut UiState,
+    store: &FsSessionStore,
+) -> Result<()> {
     let session = store.create_new_session()?;
     info!(session_id = %session.id, "swapped tui state to new session");
     state.replace_session(session);
+    ui_state.reset_transcript_navigation();
+    Ok(())
+}
+
+fn adjust_transcript_scroll(
+    terminal: &terminal::AppTerminal,
+    state: &AppState,
+    ui_state: &mut UiState,
+    delta: i16,
+) -> Result<()> {
+    let area = terminal.size()?;
+    let transcript_area = view::transcript_area(Rect::new(0, 0, area.width, area.height));
+    let max_scroll = view::transcript_max_scroll(
+        &view::conversation_lines(state, ui_state.show_tool_details),
+        transcript_area.width,
+        transcript_area.height,
+    );
+
+    let base = if ui_state.transcript_follow_tail {
+        max_scroll
+    } else {
+        ui_state.transcript_scroll_top
+    };
+
+    let next = if delta.is_negative() {
+        base.saturating_sub(delta.unsigned_abs())
+    } else {
+        base.saturating_add(delta as u16)
+    }
+    .min(max_scroll);
+
+    ui_state.transcript_scroll_top = next;
+    ui_state.transcript_follow_tail = next >= max_scroll;
     Ok(())
 }
 
@@ -342,6 +403,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::{drain_runtime_messages, handle_message};
+    use crate::ui_state::UiState;
 
     #[tokio::test]
     async fn new_session_swaps_app_state_and_updates_latest_pointer() {
@@ -356,10 +418,18 @@ mod tests {
 
         let runtime = Runtime::new(ProviderClient::Mock(MockProvider::new(None)));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ui_state = UiState::default();
 
-        handle_message(&mut state, &store, &runtime, tx, Msg::NewSession)
-            .await
-            .expect("create new session from tui");
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx,
+            Msg::NewSession,
+        )
+        .await
+        .expect("create new session from tui");
 
         assert_ne!(state.session.id, initial_session_id);
         assert_eq!(state.session.title, "New Session");
@@ -373,6 +443,8 @@ mod tests {
         ));
         assert!(state.active_run_id.is_none());
         assert!(state.pending_resume_request.is_none());
+        assert!(ui_state.transcript_follow_tail);
+        assert_eq!(ui_state.transcript_scroll_top, 0);
 
         let latest = store
             .load_or_create_latest()
@@ -399,20 +471,35 @@ mod tests {
             Duration::from_millis(180),
         )));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ui_state = UiState::default();
         let expected_final = "Mock assistant response: checkpoint proof";
 
-        handle_message(&mut state, &store, &runtime, tx.clone(), Msg::SubmitPrompt)
-            .await
-            .expect("submit prompt");
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx.clone(),
+            Msg::SubmitPrompt,
+        )
+        .await
+        .expect("submit prompt");
 
         let start = tokio::time::Instant::now();
         let mut saw_partial = false;
 
         while start.elapsed() < Duration::from_secs(2) {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            drain_runtime_messages(&mut state, &store, &runtime, tx.clone(), &mut rx)
-                .await
-                .expect("drain runtime messages");
+            drain_runtime_messages(
+                &mut state,
+                &store,
+                &runtime,
+                &mut ui_state,
+                tx.clone(),
+                &mut rx,
+            )
+            .await
+            .expect("drain runtime messages");
 
             let persisted = store
                 .load(&state.session.id)
@@ -437,9 +524,16 @@ mod tests {
         let finish_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while tokio::time::Instant::now() < finish_deadline {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            drain_runtime_messages(&mut state, &store, &runtime, tx.clone(), &mut rx)
-                .await
-                .expect("drain runtime messages to completion");
+            drain_runtime_messages(
+                &mut state,
+                &store,
+                &runtime,
+                &mut ui_state,
+                tx.clone(),
+                &mut rx,
+            )
+            .await
+            .expect("drain runtime messages to completion");
 
             if !matches!(state.status, fluent_code_app::app::AppStatus::Generating) {
                 break;
@@ -472,10 +566,18 @@ mod tests {
             Duration::from_millis(120),
         )));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ui_state = UiState::default();
 
-        handle_message(&mut state, &store, &runtime, tx.clone(), Msg::SubmitPrompt)
-            .await
-            .expect("submit prompt");
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx.clone(),
+            Msg::SubmitPrompt,
+        )
+        .await
+        .expect("submit prompt");
 
         let start = tokio::time::Instant::now();
         let partial_before_cancel = loop {
@@ -485,9 +587,16 @@ mod tests {
             );
 
             tokio::time::sleep(Duration::from_millis(30)).await;
-            drain_runtime_messages(&mut state, &store, &runtime, tx.clone(), &mut rx)
-                .await
-                .expect("drain runtime messages before cancel");
+            drain_runtime_messages(
+                &mut state,
+                &store,
+                &runtime,
+                &mut ui_state,
+                tx.clone(),
+                &mut rx,
+            )
+            .await
+            .expect("drain runtime messages before cancel");
 
             let persisted = store
                 .load(&state.session.id)
@@ -506,6 +615,7 @@ mod tests {
             &mut state,
             &store,
             &runtime,
+            &mut ui_state,
             tx.clone(),
             Msg::CancelActiveRun,
         )
@@ -515,9 +625,16 @@ mod tests {
         let cancel_deadline = tokio::time::Instant::now() + Duration::from_millis(600);
         while tokio::time::Instant::now() < cancel_deadline {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            drain_runtime_messages(&mut state, &store, &runtime, tx.clone(), &mut rx)
-                .await
-                .expect("drain runtime messages after cancel");
+            drain_runtime_messages(
+                &mut state,
+                &store,
+                &runtime,
+                &mut ui_state,
+                tx.clone(),
+                &mut rx,
+            )
+            .await
+            .expect("drain runtime messages after cancel");
         }
 
         assert!(matches!(
@@ -552,17 +669,32 @@ mod tests {
             Duration::from_millis(10),
         )));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ui_state = UiState::default();
 
-        handle_message(&mut state, &store, &runtime, tx.clone(), Msg::SubmitPrompt)
-            .await
-            .expect("submit prompt");
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx.clone(),
+            Msg::SubmitPrompt,
+        )
+        .await
+        .expect("submit prompt");
 
         let approval_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while tokio::time::Instant::now() < approval_deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            drain_runtime_messages(&mut state, &store, &runtime, tx.clone(), &mut rx)
-                .await
-                .expect("drain runtime messages to approval");
+            drain_runtime_messages(
+                &mut state,
+                &store,
+                &runtime,
+                &mut ui_state,
+                tx.clone(),
+                &mut rx,
+            )
+            .await
+            .expect("drain runtime messages to approval");
 
             if matches!(
                 state.status,
@@ -582,6 +714,7 @@ mod tests {
             &mut state,
             &store,
             &runtime,
+            &mut ui_state,
             tx.clone(),
             Msg::ApprovePendingTool,
         )
@@ -591,9 +724,16 @@ mod tests {
         let completion_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while tokio::time::Instant::now() < completion_deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            drain_runtime_messages(&mut state, &store, &runtime, tx.clone(), &mut rx)
-                .await
-                .expect("drain runtime messages to completion");
+            drain_runtime_messages(
+                &mut state,
+                &store,
+                &runtime,
+                &mut ui_state,
+                tx.clone(),
+                &mut rx,
+            )
+            .await
+            .expect("drain runtime messages to completion");
 
             if matches!(state.status, fluent_code_app::app::AppStatus::Idle) {
                 break;

@@ -7,10 +7,22 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
+use crate::conversation::{
+    ConversationRow, RunMarkerKind, RunMarkerRow, ToolGroupKind, ToolGroupRow, ToolRow, TurnRow,
+    derive_conversation_rows,
+};
+use crate::markdown_render::{render_markdown_lines, render_streaming_markdown_lines};
 use crate::theme::TUI_THEME;
 use crate::ui_state::UiState;
 
 const SUMMARY_LIMIT: usize = 72;
+const TOOL_PREVIEW_LINE_LIMIT: usize = 3;
+const INLINE_TOOL_PREFIX: &str = "  ├─ tool ";
+const INLINE_TOOL_DETAIL_PREFIX: &str = "  │   ";
+const GROUP_PREFIX: &str = "  ├─ ";
+const GROUP_ITEM_PREFIX: &str = "  │   • ";
+const GROUP_DETAIL_PREFIX: &str = "  │     ";
+const RUN_MARKER_PREFIX: &str = "  · run ";
 
 pub fn render(frame: &mut Frame, state: &AppState, ui_state: &UiState) {
     let shell = Layout::default()
@@ -29,7 +41,7 @@ pub fn render(frame: &mut Frame, state: &AppState, ui_state: &UiState) {
         .split(shell[1]);
 
     render_header(frame, shell[0], state);
-    render_transcript(frame, body[0], state);
+    render_transcript(frame, body[0], state, ui_state);
     render_sidebar(frame, body[1], state, ui_state);
     render_input(frame, shell[2], state);
     render_footer(frame, shell[3], state, ui_state);
@@ -45,6 +57,23 @@ pub fn render(frame: &mut Frame, state: &AppState, ui_state: &UiState) {
         let cursor_y = shell[2].y.saturating_add(1);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+pub(crate) fn transcript_area(area: Rect) -> Rect {
+    let shell = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(34)])
+        .split(shell[1])[0]
 }
 
 fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -99,9 +128,15 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(run, header[1]);
 }
 
-fn render_transcript(frame: &mut Frame, area: Rect, state: &AppState) {
-    let lines = transcript_lines(state);
-    let transcript_scroll = transcript_scroll_offset(&lines, area.width, area.height);
+fn render_transcript(frame: &mut Frame, area: Rect, state: &AppState, ui_state: &UiState) {
+    let lines = conversation_lines(state, ui_state.show_tool_details);
+    let transcript_scroll = resolve_transcript_scroll(
+        &lines,
+        area.width,
+        area.height,
+        ui_state.transcript_follow_tail,
+        ui_state.transcript_scroll_top,
+    );
 
     let transcript = Paragraph::new(Text::from(lines))
         .block(
@@ -196,6 +231,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::default(),
         Line::from("F1  toggle help"),
         Line::from("F2  toggle tool detail density"),
+        Line::from("↑/↓/PgUp/PgDn/Home/End  transcript navigation"),
         Line::from("Enter  send prompt / approve tools"),
         Line::from("Y  approve pending tool batch"),
         Line::from("N  deny one pending tool"),
@@ -214,15 +250,28 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
     frame.render_widget(help, overlay);
 }
 
-fn transcript_lines(state: &AppState) -> Vec<Line<'static>> {
-    if state.session.turns.is_empty() {
+pub(crate) fn conversation_lines(state: &AppState, show_tool_details: bool) -> Vec<Line<'static>> {
+    let rows = derive_conversation_rows(state);
+
+    if rows.is_empty() {
         return vec![Line::styled(
             "No messages yet. Type and press Enter to chat.",
             TUI_THEME.text_muted,
         )];
     }
 
-    state.session.turns.iter().flat_map(render_turn).collect()
+    rows.iter()
+        .flat_map(|row| render_row(row, show_tool_details))
+        .collect()
+}
+
+fn render_row(row: &ConversationRow, show_tool_details: bool) -> Vec<Line<'static>> {
+    match row {
+        ConversationRow::Turn(turn) => render_turn_row(turn),
+        ConversationRow::Tool(tool) => render_tool_row(tool, show_tool_details),
+        ConversationRow::ToolGroup(group) => render_tool_group_row(group, show_tool_details),
+        ConversationRow::RunMarker(marker) => render_run_marker_row(marker),
+    }
 }
 
 fn sidebar_tool_lines(state: &AppState, show_tool_details: bool) -> Vec<Line<'static>> {
@@ -231,22 +280,115 @@ fn sidebar_tool_lines(state: &AppState, show_tool_details: bool) -> Vec<Line<'st
             Line::styled("No tool activity yet.", TUI_THEME.text_muted),
             Line::default(),
             Line::styled(
-                "When the assistant calls tools, they will appear here instead of breaking the main transcript flow.",
+                "Inline tool activity now appears in the main transcript. This panel stays as a compact overview.",
                 TUI_THEME.text_muted,
             ),
         ];
     }
 
-    state
+    let pending_count = state
         .session
         .tool_invocations
         .iter()
-        .rev()
-        .flat_map(|invocation| render_tool_summary(invocation, show_tool_details))
-        .collect()
+        .filter(|invocation| invocation.approval_state == ToolApprovalState::Pending)
+        .count();
+    let running_count = state
+        .session
+        .tool_invocations
+        .iter()
+        .filter(|invocation| {
+            invocation.approval_state == ToolApprovalState::Approved
+                && invocation.execution_state == ToolExecutionState::Running
+        })
+        .count();
+    let completed_count = state
+        .session
+        .tool_invocations
+        .iter()
+        .filter(|invocation| invocation.execution_state == ToolExecutionState::Completed)
+        .count();
+    let failed_count = state
+        .session
+        .tool_invocations
+        .iter()
+        .filter(|invocation| {
+            invocation.approval_state == ToolApprovalState::Denied
+                || invocation.execution_state == ToolExecutionState::Failed
+        })
+        .count();
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("pending ", TUI_THEME.label),
+            Span::styled(pending_count.to_string(), TUI_THEME.warning),
+        ]),
+        Line::from(vec![
+            Span::styled("running ", TUI_THEME.label),
+            Span::styled(running_count.to_string(), TUI_THEME.info),
+        ]),
+        Line::from(vec![
+            Span::styled("completed ", TUI_THEME.label),
+            Span::styled(completed_count.to_string(), TUI_THEME.success),
+        ]),
+        Line::from(vec![
+            Span::styled("attention ", TUI_THEME.label),
+            Span::styled(failed_count.to_string(), TUI_THEME.error),
+        ]),
+        Line::default(),
+    ];
+
+    if let Some(latest) = state
+        .session
+        .tool_invocations
+        .iter()
+        .max_by_key(|invocation| {
+            invocation
+                .completed_at
+                .or(invocation.approved_at)
+                .unwrap_or(invocation.requested_at)
+        })
+    {
+        let (approval_label, _) = approval_badge(latest.approval_state);
+        let (execution_label, _) = execution_badge(latest.execution_state);
+
+        lines.push(Line::from(vec![
+            Span::styled("latest ", TUI_THEME.label),
+            Span::styled(latest.tool_name.clone(), TUI_THEME.tool_accent),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("status ", TUI_THEME.label),
+            Span::styled(
+                format!("{} / {}", approval_label, execution_label),
+                TUI_THEME.text_muted,
+            ),
+        ]));
+
+        if show_tool_details {
+            lines.push(Line::from(vec![
+                Span::styled("args ", TUI_THEME.label),
+                Span::styled(summarize_json(&latest.arguments), TUI_THEME.text_muted),
+            ]));
+
+            if let Some(result) = &latest.result {
+                lines.push(Line::from(vec![
+                    Span::styled("result ", TUI_THEME.label),
+                    Span::styled(summarize_text(result), TUI_THEME.success),
+                ]));
+            }
+
+            if let Some(error) = &latest.error {
+                lines.push(Line::from(vec![
+                    Span::styled("note ", TUI_THEME.label),
+                    Span::styled(summarize_text(error), TUI_THEME.error),
+                ]));
+            }
+        }
+    }
+
+    lines
 }
 
-fn render_turn(turn: &fluent_code_app::session::model::Turn) -> Vec<Line<'static>> {
+fn render_turn_row(turn: &TurnRow) -> Vec<Line<'static>> {
     let (label, accent_style, content_style, meta_text) = match turn.role {
         Role::User => ("YOU", TUI_THEME.user_accent, TUI_THEME.text, "request"),
         Role::Assistant => (
@@ -275,21 +417,17 @@ fn render_turn(turn: &fluent_code_app::session::model::Turn) -> Vec<Line<'static
         turn.content.clone()
     };
 
-    let content_lines = content
-        .lines()
-        .map(|line| {
-            Line::from(vec![
-                Span::styled("│ ", TUI_THEME.card_prefix),
-                Span::styled(line.to_string(), content_style),
-            ])
-        })
-        .collect::<Vec<_>>();
+    let content_lines = if turn.is_streaming {
+        format_streaming_turn_content_lines(&content, content_style)
+    } else {
+        format_turn_content_lines(&content, content_style)
+    };
 
     let divider = match turn.role {
-        Role::User => "└─ user",
-        Role::Assistant => "└─ assistant",
-        Role::System => "└─ system",
-        Role::Tool => "└─ tool",
+        Role::User => "╰─ user",
+        Role::Assistant => "╰─ assistant",
+        Role::System => "╰─ system",
+        Role::Tool => "╰─ tool",
     };
 
     let mut lines = vec![
@@ -313,64 +451,154 @@ fn render_turn(turn: &fluent_code_app::session::model::Turn) -> Vec<Line<'static
     lines
 }
 
-fn render_tool_summary(
-    invocation: &fluent_code_app::session::model::ToolInvocationRecord,
-    show_tool_details: bool,
-) -> Vec<Line<'static>> {
-    let (approval_label, approval_style) = approval_badge(invocation.approval_state);
-    let (execution_label, execution_style) = execution_badge(invocation.execution_state);
+fn render_tool_row(tool: &ToolRow, show_tool_details: bool) -> Vec<Line<'static>> {
+    let (approval_label, approval_style) = approval_badge(tool.approval_state);
+    let (execution_label, execution_style) = execution_badge(tool.execution_state);
 
     let mut lines = vec![Line::from(vec![
-        Span::styled("● ", TUI_THEME.tool_accent),
-        Span::styled(invocation.tool_name.clone(), TUI_THEME.tool_accent),
+        Span::styled(INLINE_TOOL_PREFIX, TUI_THEME.operational_prefix),
+        Span::styled(tool.tool_name.clone(), TUI_THEME.operational_label),
         Span::raw(" "),
-        Span::styled(
-            format!("· {} / {}", approval_label, execution_label),
-            TUI_THEME.text_muted,
-        ),
+        Span::styled("· ", TUI_THEME.operational_prefix),
+        Span::styled(approval_label.to_string(), approval_style),
+        Span::styled(" / ", TUI_THEME.text_muted),
+        Span::styled(execution_label.to_string(), execution_style),
     ])];
+
+    lines.extend(format_preview_lines(
+        INLINE_TOOL_DETAIL_PREFIX,
+        None,
+        &tool.summary,
+        TUI_THEME.operational_text,
+        TUI_THEME.text_muted,
+        1,
+    ));
 
     if show_tool_details {
         lines.push(Line::from(vec![
-            Span::styled("  approval ", TUI_THEME.label),
+            Span::styled("  │   approval ", TUI_THEME.text_muted),
             Span::styled(approval_label.to_string(), approval_style),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("  execution ", TUI_THEME.label),
+            Span::styled("  │   execution ", TUI_THEME.text_muted),
             Span::styled(execution_label.to_string(), execution_style),
         ]));
-    }
-
-    if show_tool_details {
         lines.push(Line::from(vec![
-            Span::styled("  args ", TUI_THEME.label),
-            Span::styled(summarize_json(&invocation.arguments), TUI_THEME.text_muted),
+            Span::styled("  │   args ", TUI_THEME.text_muted),
+            Span::styled(tool.arguments_preview.clone(), TUI_THEME.operational_text),
         ]));
     }
 
-    if let Some(result) = &invocation.result {
-        lines.push(Line::from(vec![
-            Span::styled("  result ", TUI_THEME.label),
-            Span::styled(summarize_text(result), TUI_THEME.success),
-        ]));
+    if let Some(result) = &tool.result_preview
+        && show_tool_details
+    {
+        lines.extend(format_preview_lines(
+            INLINE_TOOL_DETAIL_PREFIX,
+            Some("result "),
+            result,
+            TUI_THEME.success,
+            TUI_THEME.text_muted,
+            TOOL_PREVIEW_LINE_LIMIT,
+        ));
     }
 
-    if let Some(error) = &invocation.error {
-        lines.push(Line::from(vec![
-            Span::styled("  note ", TUI_THEME.label),
-            Span::styled(summarize_text(error), TUI_THEME.error),
-        ]));
+    if let Some(error) = &tool.error_preview {
+        lines.extend(format_preview_lines(
+            INLINE_TOOL_DETAIL_PREFIX,
+            Some("note "),
+            error,
+            TUI_THEME.error,
+            TUI_THEME.text_muted,
+            if show_tool_details {
+                TOOL_PREVIEW_LINE_LIMIT
+            } else {
+                1
+            },
+        ));
     }
 
-    if invocation.approval_state == ToolApprovalState::Pending {
+    if tool.approval_state == ToolApprovalState::Pending {
         lines.push(Line::from(vec![
-            Span::styled("  action ", TUI_THEME.label),
+            Span::styled("  │   action ", TUI_THEME.text_muted),
             Span::styled("Enter/Y approve all • N deny one", TUI_THEME.warning),
         ]));
     }
 
     lines.push(Line::default());
     lines
+}
+
+fn render_tool_group_row(group: &ToolGroupRow, show_tool_details: bool) -> Vec<Line<'static>> {
+    let label = match group.kind {
+        ToolGroupKind::ReadLike => "read batch",
+        ToolGroupKind::SearchLike => "search batch",
+    };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(GROUP_PREFIX, TUI_THEME.operational_prefix),
+        Span::styled(label, TUI_THEME.operational_label),
+        Span::raw(" "),
+        Span::styled(format!("({})", group.items.len()), TUI_THEME.text_muted),
+    ])];
+
+    for item in &group.items {
+        let (approval_label, _) = approval_badge(item.approval_state);
+        let (execution_label, _) = execution_badge(item.execution_state);
+
+        lines.push(Line::from(vec![
+            Span::styled(GROUP_ITEM_PREFIX, TUI_THEME.operational_prefix),
+            Span::styled(item.summary.clone(), TUI_THEME.operational_text),
+            Span::raw(" "),
+            Span::styled("· ", TUI_THEME.operational_prefix),
+            Span::styled(approval_label.to_string(), TUI_THEME.text_muted),
+            Span::styled(" / ", TUI_THEME.text_muted),
+            Span::styled(execution_label.to_string(), TUI_THEME.text_muted),
+        ]));
+
+        if show_tool_details {
+            if let Some(result) = &item.result_preview {
+                lines.extend(format_preview_lines(
+                    GROUP_DETAIL_PREFIX,
+                    Some("result "),
+                    result,
+                    TUI_THEME.success,
+                    TUI_THEME.text_muted,
+                    TOOL_PREVIEW_LINE_LIMIT,
+                ));
+            }
+
+            if let Some(error) = &item.error_preview {
+                lines.extend(format_preview_lines(
+                    GROUP_DETAIL_PREFIX,
+                    Some("note "),
+                    error,
+                    TUI_THEME.error,
+                    TUI_THEME.text_muted,
+                    TOOL_PREVIEW_LINE_LIMIT,
+                ));
+            }
+        }
+    }
+
+    lines.push(Line::default());
+    lines
+}
+
+fn render_run_marker_row(marker: &RunMarkerRow) -> Vec<Line<'static>> {
+    let style = match marker.kind {
+        RunMarkerKind::AwaitingApproval => TUI_THEME.warning,
+        RunMarkerKind::Running => TUI_THEME.info,
+        RunMarkerKind::Completed => TUI_THEME.success,
+        RunMarkerKind::Failed | RunMarkerKind::Cancelled => TUI_THEME.error,
+    };
+
+    vec![
+        Line::from(vec![
+            Span::styled(RUN_MARKER_PREFIX, TUI_THEME.operational_prefix),
+            Span::styled(marker.label, style),
+        ]),
+        Line::default(),
+    ]
 }
 
 fn approval_badge(state: ToolApprovalState) -> (&'static str, ratatui::style::Style) {
@@ -424,7 +652,7 @@ fn run_status_label(state: &AppState) -> &'static str {
 fn footer_text_with_ui(state: &AppState, show_tool_details: bool) -> String {
     match &state.status {
         AppStatus::Idle => format!(
-            "Enter send • F1 help • F2 details {} • Ctrl-N new • Esc/Ctrl-C quit",
+            "Enter send • F1 help • F2 details {} • ↑↓/Pg keys scroll • End latest • Ctrl-N new • Esc/Ctrl-C quit",
             if show_tool_details {
                 "expanded"
             } else {
@@ -488,7 +716,242 @@ fn summarize_text(text: &str) -> String {
     }
 }
 
-fn transcript_scroll_offset(lines: &[Line<'_>], area_width: u16, area_height: u16) -> u16 {
+fn format_turn_content_lines(
+    content: &str,
+    content_style: ratatui::style::Style,
+) -> Vec<Line<'static>> {
+    render_markdown_lines(content, content_style)
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![Span::styled("│ ", TUI_THEME.card_prefix)];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        })
+        .collect()
+}
+
+fn format_streaming_turn_content_lines(
+    content: &str,
+    content_style: ratatui::style::Style,
+) -> Vec<Line<'static>> {
+    render_streaming_markdown_lines(content, content_style)
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![Span::styled("│ ", TUI_THEME.card_prefix)];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        })
+        .collect()
+}
+
+fn format_text_blocks(content: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut paragraph = String::new();
+    let mut in_code_block = false;
+
+    for raw_line in content.lines() {
+        let trimmed = raw_line.trim();
+
+        if trimmed.starts_with("```") {
+            if !paragraph.is_empty() {
+                lines.push(std::mem::take(&mut paragraph));
+            }
+            in_code_block = !in_code_block;
+            continue;
+        }
+
+        if in_code_block {
+            lines.push(format!("    {raw_line}"));
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            if !paragraph.is_empty() {
+                lines.push(std::mem::take(&mut paragraph));
+            }
+            if lines.last().is_none_or(|line| !line.is_empty()) {
+                lines.push(String::new());
+            }
+            continue;
+        }
+
+        if is_list_line(trimmed)
+            || trimmed.starts_with("> ")
+            || strip_heading_prefix(trimmed).is_some()
+        {
+            if !paragraph.is_empty() {
+                lines.push(std::mem::take(&mut paragraph));
+            }
+            lines.push(render_markdown_line(trimmed));
+            continue;
+        }
+
+        let rendered = render_markdown_line(trimmed);
+
+        if paragraph.is_empty() {
+            paragraph.push_str(&rendered);
+        } else {
+            paragraph.push(' ');
+            paragraph.push_str(&rendered);
+        }
+    }
+
+    if !paragraph.is_empty() {
+        lines.push(paragraph);
+    }
+
+    if lines.is_empty() {
+        vec!["(empty)".to_string()]
+    } else {
+        lines
+    }
+}
+
+fn is_list_line(line: &str) -> bool {
+    line.starts_with("- ")
+        || line.starts_with("* ")
+        || line.split_once(". ").is_some_and(|(prefix, _)| {
+            !prefix.is_empty() && prefix.chars().all(|ch| ch.is_ascii_digit())
+        })
+}
+
+fn render_markdown_line(line: &str) -> String {
+    let trimmed = line.trim();
+
+    if let Some(heading) = strip_heading_prefix(trimmed) {
+        return strip_inline_markdown(heading);
+    }
+
+    if let Some(quote) = trimmed.strip_prefix("> ") {
+        return format!("› {}", strip_inline_markdown(quote));
+    }
+
+    if let Some((prefix, body)) = split_list_prefix(trimmed) {
+        return format!("{prefix}{}", strip_inline_markdown(body));
+    }
+
+    strip_inline_markdown(trimmed)
+}
+
+fn strip_heading_prefix(line: &str) -> Option<&str> {
+    let hash_count = line.chars().take_while(|ch| *ch == '#').count();
+    if hash_count == 0 || hash_count > 6 {
+        return None;
+    }
+
+    let rest = &line[hash_count..];
+    rest.strip_prefix(' ').map(str::trim)
+}
+
+fn split_list_prefix(line: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = line.strip_prefix("- ") {
+        return Some(("- ", rest));
+    }
+
+    if let Some(rest) = line.strip_prefix("* ") {
+        return Some(("* ", rest));
+    }
+
+    line.split_once(". ").and_then(|(prefix, rest)| {
+        (!prefix.is_empty() && prefix.chars().all(|ch| ch.is_ascii_digit()))
+            .then_some((line.split_at(prefix.len() + 2).0, rest))
+    })
+}
+
+fn strip_inline_markdown(line: &str) -> String {
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut out = String::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '['
+            && let Some(close_label) = chars[i + 1..].iter().position(|ch| *ch == ']')
+        {
+            let label_end = i + 1 + close_label;
+            if chars.get(label_end + 1) == Some(&'(')
+                && let Some(close_url) = chars[label_end + 2..].iter().position(|ch| *ch == ')')
+            {
+                let label = chars[i + 1..label_end].iter().collect::<String>();
+                let url_end = label_end + 2 + close_url;
+                let url = chars[label_end + 2..url_end].iter().collect::<String>();
+                out.push_str(&label);
+                if !url.trim().is_empty() {
+                    out.push_str(" (");
+                    out.push_str(&url);
+                    out.push(')');
+                }
+                i = url_end + 1;
+                continue;
+            }
+        }
+
+        if i + 1 < chars.len()
+            && ((chars[i] == '*' && chars[i + 1] == '*')
+                || (chars[i] == '_' && chars[i + 1] == '_')
+                || (chars[i] == '~' && chars[i + 1] == '~'))
+        {
+            i += 2;
+            continue;
+        }
+
+        if chars[i] == '`' || chars[i] == '*' {
+            i += 1;
+            continue;
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
+fn format_preview_lines(
+    prefix: &'static str,
+    label: Option<&'static str>,
+    content: &str,
+    content_style: ratatui::style::Style,
+    label_style: ratatui::style::Style,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
+    let mut shaped_lines = format_text_blocks(content)
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    if shaped_lines.is_empty() {
+        shaped_lines.push("(empty)".to_string());
+    }
+
+    let truncated = shaped_lines.len() > max_lines;
+    shaped_lines.truncate(max_lines);
+
+    if truncated && let Some(last) = shaped_lines.last_mut() {
+        last.push_str(" ...");
+    }
+
+    shaped_lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let mut spans = vec![Span::styled(prefix, TUI_THEME.operational_prefix)];
+            let label_padding = label.map(|label| " ".repeat(label.chars().count()));
+
+            if index == 0 {
+                if let Some(label) = label {
+                    spans.push(Span::styled(label, label_style));
+                }
+            } else if let Some(padding) = &label_padding {
+                spans.push(Span::raw(padding.clone()));
+            }
+
+            spans.push(Span::styled(line, content_style));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+pub(crate) fn transcript_max_scroll(lines: &[Line<'_>], area_width: u16, area_height: u16) -> u16 {
     let inner_width = area_width.saturating_sub(2).max(1) as usize;
     let visible_height = area_height.saturating_sub(2) as usize;
 
@@ -510,6 +973,22 @@ fn transcript_scroll_offset(lines: &[Line<'_>], area_width: u16, area_height: u1
         .sum::<usize>();
 
     wrapped_line_count.saturating_sub(visible_height) as u16
+}
+
+fn resolve_transcript_scroll(
+    lines: &[Line<'_>],
+    area_width: u16,
+    area_height: u16,
+    follow_tail: bool,
+    manual_scroll_top: u16,
+) -> u16 {
+    let max_scroll = transcript_max_scroll(lines, area_width, area_height);
+
+    if follow_tail {
+        max_scroll
+    } else {
+        manual_scroll_top.min(max_scroll)
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -534,21 +1013,29 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use ratatui::text::Line;
+    use serde_json::json;
+    use uuid::Uuid;
 
-    use super::{footer_text_with_ui, transcript_scroll_offset};
+    use super::{
+        conversation_lines, footer_text_with_ui, resolve_transcript_scroll, sidebar_tool_lines,
+        transcript_max_scroll,
+    };
     use fluent_code_app::app::AppState;
-    use fluent_code_app::session::model::Session;
+    use fluent_code_app::session::model::{
+        Role, RunStatus, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, Turn,
+    };
 
     #[test]
-    fn transcript_scroll_offset_stays_at_top_when_content_fits() {
+    fn transcript_max_scroll_stays_at_top_when_content_fits() {
         let lines = vec![Line::from("short"), Line::from("content")];
 
-        assert_eq!(transcript_scroll_offset(&lines, 20, 8), 0);
+        assert_eq!(transcript_max_scroll(&lines, 20, 8), 0);
     }
 
     #[test]
-    fn transcript_scroll_offset_tracks_bottom_for_growing_content() {
+    fn transcript_max_scroll_tracks_bottom_for_growing_content() {
         let lines = vec![
             Line::from("12345678"),
             Line::from("12345678"),
@@ -556,7 +1043,38 @@ mod tests {
             Line::from("12345678"),
         ];
 
-        assert_eq!(transcript_scroll_offset(&lines, 10, 5), 1);
+        assert_eq!(transcript_max_scroll(&lines, 10, 5), 1);
+    }
+
+    #[test]
+    fn resolve_transcript_scroll_follows_tail_when_enabled() {
+        let lines = vec![
+            Line::from("12345678"),
+            Line::from("12345678"),
+            Line::from("12345678"),
+            Line::from("12345678"),
+        ];
+
+        assert_eq!(resolve_transcript_scroll(&lines, 10, 5, true, 0), 1);
+    }
+
+    #[test]
+    fn resolve_transcript_scroll_preserves_manual_position() {
+        let lines = vec![
+            Line::from("12345678"),
+            Line::from("12345678"),
+            Line::from("12345678"),
+            Line::from("12345678"),
+        ];
+
+        assert_eq!(resolve_transcript_scroll(&lines, 10, 5, false, 0), 0);
+    }
+
+    #[test]
+    fn resolve_transcript_scroll_clamps_manual_position_to_max() {
+        let lines = vec![Line::from("12345678"), Line::from("12345678")];
+
+        assert_eq!(resolve_transcript_scroll(&lines, 10, 5, false, 9), 0);
     }
 
     #[test]
@@ -565,5 +1083,696 @@ mod tests {
 
         assert!(footer_text_with_ui(&state, false).contains("compact"));
         assert!(footer_text_with_ui(&state, true).contains("expanded"));
+    }
+
+    #[test]
+    fn conversation_lines_shows_empty_state_when_no_rows_exist() {
+        let state = AppState::new(Session::new("empty"));
+
+        let lines = conversation_lines(&state, false);
+
+        assert_eq!(lines.len(), 1);
+        assert!(line_text(&lines[0]).contains("No messages yet"));
+    }
+
+    #[test]
+    fn conversation_lines_renders_tool_row_inline_after_turn() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("inline tools");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Investigating session storage.".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "crates/fluent-code-app/src/session/store.rs"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Pending,
+            execution_state: ToolExecutionState::NotStarted,
+            result: None,
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: None,
+            completed_at: None,
+        });
+
+        let state = AppState::new(session);
+        let lines = conversation_lines(&state, true);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(text.contains("ASSISTANT"));
+        assert!(text.contains("├─ tool read"));
+        assert!(text.contains("crates/fluent-code-app/src/session/store.rs"));
+    }
+
+    #[test]
+    fn sidebar_tool_lines_shows_overview_counts() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("tool overview");
+
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-pending".to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "README.md"}),
+            preceding_turn_id: None,
+            approval_state: ToolApprovalState::Pending,
+            execution_state: ToolExecutionState::NotStarted,
+            result: None,
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: None,
+            completed_at: None,
+        });
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-running".to_string(),
+            tool_name: "search".to_string(),
+            arguments: json!({"query": "PersistSession"}),
+            preceding_turn_id: None,
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Running,
+            result: None,
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: None,
+        });
+
+        let state = AppState::new(session);
+        let text = sidebar_tool_lines(&state, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("pending 1"));
+        assert!(text.contains("running 1"));
+        assert!(text.contains("completed 0"));
+        assert!(text.contains("attention 0"));
+        assert!(text.contains("latest search"));
+    }
+
+    #[test]
+    fn sidebar_tool_lines_empty_state_mentions_transcript_overview() {
+        let state = AppState::new(Session::new("empty tools"));
+        let text = sidebar_tool_lines(&state, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("No tool activity yet."));
+        assert!(text.contains("main transcript"));
+        assert!(text.contains("compact overview"));
+    }
+
+    #[test]
+    fn conversation_lines_renders_grouped_tool_batch() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("grouped transcript");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Reading project files.".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "src/main.rs"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("ok".to_string()),
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        });
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-2".to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "src/lib.rs"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("ok".to_string()),
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        });
+
+        let state = AppState::new(session);
+        let text = conversation_lines(&state, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("read batch (2)"));
+        assert!(text.contains("src/main.rs"));
+        assert!(text.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn conversation_lines_renders_approval_marker_inline() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("approval marker");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Waiting on tools.".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-approval".to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "src/main.rs"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Pending,
+            execution_state: ToolExecutionState::NotStarted,
+            result: None,
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: None,
+            completed_at: None,
+        });
+
+        let mut state = AppState::new(session);
+        state.active_run_id = Some(run_id);
+        state.status = fluent_code_app::app::AppStatus::AwaitingToolApproval;
+
+        let text = conversation_lines(&state, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("awaiting approval"));
+    }
+
+    #[test]
+    fn conversation_lines_renders_running_marker_inline() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("running marker");
+        session.turns.push(Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Still working.".to_string(),
+            timestamp: Utc::now(),
+        });
+
+        let mut state = AppState::new(session);
+        state.active_run_id = Some(run_id);
+        state.status = fluent_code_app::app::AppStatus::RunningTool;
+
+        let text = conversation_lines(&state, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("running"));
+    }
+
+    #[test]
+    fn conversation_lines_renders_completed_marker_inline() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("completed marker");
+        session.turns.push(Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Done.".to_string(),
+            timestamp: Utc::now(),
+        });
+        session.upsert_run(run_id, RunStatus::Completed);
+
+        let state = AppState::new(session);
+        let text = conversation_lines(&state, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("completed"));
+    }
+
+    #[test]
+    fn conversation_lines_renders_failed_marker_inline() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("failed marker");
+        session.turns.push(Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Oops.".to_string(),
+            timestamp: Utc::now(),
+        });
+        session.upsert_run(run_id, RunStatus::Failed);
+
+        let state = AppState::new(session);
+        let text = conversation_lines(&state, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("failed"));
+    }
+
+    #[test]
+    fn conversation_lines_collapses_paragraph_lines_but_preserves_blank_breaks() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("paragraph formatting");
+        session.turns.push(Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "first line\ncontinues here\n\nnext paragraph".to_string(),
+            timestamp: Utc::now(),
+        });
+
+        let text = conversation_lines(&AppState::new(session), false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("first line continues here"));
+        assert!(text.contains("\n│ \n│ next paragraph"));
+    }
+
+    #[test]
+    fn conversation_lines_preserves_lists_and_code_fences() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("structured formatting");
+        session.turns.push(Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "- first item\n2. second item\n```rust\nfn main() {}\n```".to_string(),
+            timestamp: Utc::now(),
+        });
+
+        let text = conversation_lines(&AppState::new(session), false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("│ - first item"));
+        assert!(text.contains("│ 2. second item"));
+        assert!(!text.contains("```rust"));
+        assert!(text.contains("│     fn main() {}"));
+    }
+
+    #[test]
+    fn conversation_lines_render_common_markdown_as_chat_text() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("markdown chat rendering");
+        session.turns.push(Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "# Heading\n> quoted text\nUse **bold** and `inline_code` plus [docs](https://example.com)."
+                .to_string(),
+            timestamp: Utc::now(),
+        });
+
+        let text = conversation_lines(&AppState::new(session), false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("│ # Heading"));
+        assert!(text.contains("│ › quoted text"));
+        assert!(text.contains("Use "));
+        assert!(text.contains("bold"));
+        assert!(text.contains("inline_code"));
+        assert!(text.contains("docs"));
+        assert!(text.contains("https://example.com"));
+        assert!(!text.contains("**bold**"));
+        assert!(!text.contains("`inline_code`"));
+        assert!(!text.contains("[docs](https://example.com)"));
+    }
+
+    #[test]
+    fn conversation_lines_bounds_multiline_tool_previews_in_expanded_mode() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("bounded previews");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Inspecting results.".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-preview".to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "src/main.rs"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("line one\nline two\nline three\nline four".to_string()),
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        });
+
+        let text = conversation_lines(&AppState::new(session), true)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("result line one line two line three line four"));
+        assert!(!text.contains("line four ..."));
+    }
+
+    #[test]
+    fn conversation_lines_hides_success_detail_in_compact_mode() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("compact success");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Inspecting results.".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-success".to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "src/main.rs"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("useful success payload".to_string()),
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        });
+
+        let text = conversation_lines(&AppState::new(session), false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("read src/main.rs"));
+        assert!(!text.contains("result useful success payload"));
+        assert!(!text.contains("approval approved"));
+        assert!(!text.contains("execution completed"));
+        assert!(!text.contains("args {"));
+    }
+
+    #[test]
+    fn conversation_lines_shows_success_detail_in_expanded_mode() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("expanded success");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Inspecting results.".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-success-expanded".to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "src/main.rs"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("useful success payload".to_string()),
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        });
+
+        let text = conversation_lines(&AppState::new(session), true)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("approval approved"));
+        assert!(text.contains("execution completed"));
+        assert!(text.contains("args {\"path\":\"src/main.rs\"}"));
+        assert!(text.contains("result useful success payload"));
+    }
+
+    #[test]
+    fn conversation_lines_hides_grouped_success_previews_in_compact_mode() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("compact grouped success");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Reading project files.".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        for (call_id, path, result) in [
+            ("call-1", "src/main.rs", "alpha output"),
+            ("call-2", "src/lib.rs", "beta output"),
+        ] {
+            session.tool_invocations.push(ToolInvocationRecord {
+                id: Uuid::new_v4(),
+                run_id,
+                tool_call_id: call_id.to_string(),
+                tool_name: "read".to_string(),
+                arguments: json!({"path": path}),
+                preceding_turn_id: Some(turn.id),
+                approval_state: ToolApprovalState::Approved,
+                execution_state: ToolExecutionState::Completed,
+                result: Some(result.to_string()),
+                error: None,
+                requested_at: Utc::now(),
+                approved_at: Some(Utc::now()),
+                completed_at: Some(Utc::now()),
+            });
+        }
+
+        let text = conversation_lines(&AppState::new(session), false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("read batch (2)"));
+        assert!(text.contains("read src/main.rs"));
+        assert!(text.contains("read src/lib.rs"));
+        assert!(!text.contains("result alpha output"));
+        assert!(!text.contains("result beta output"));
+    }
+
+    #[test]
+    fn conversation_lines_bounds_grouped_tool_preview_lines() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("grouped bounded previews");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Reading project files.".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "src/main.rs"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("alpha\nbeta\ngamma\ndelta".to_string()),
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        });
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-2".to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "src/lib.rs"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("one\ntwo\nthree\nfour".to_string()),
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        });
+
+        let text = conversation_lines(&AppState::new(session), true)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("read batch (2)"));
+        assert!(text.contains("result alpha beta gamma delta"));
+        assert!(text.contains("result one two three four"));
+    }
+
+    #[test]
+    fn conversation_lines_maintains_primary_turns_and_subordinate_operational_rail() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("hierarchy polish");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "I will inspect the files first.".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "src/main.rs"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Pending,
+            execution_state: ToolExecutionState::NotStarted,
+            result: None,
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: None,
+            completed_at: None,
+        });
+
+        let mut state = AppState::new(session);
+        state.active_run_id = Some(run_id);
+        state.status = fluent_code_app::app::AppStatus::AwaitingToolApproval;
+
+        let text = conversation_lines(&state, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("╭─ ASSISTANT response"));
+        assert!(text.contains("╰─ assistant"));
+        assert!(text.contains("  ├─ tool read"));
+        assert!(text.contains("  · run awaiting approval"));
+    }
+
+    #[test]
+    fn conversation_lines_aligns_wrapped_grouped_operational_details_under_labels() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("wrapped grouped details");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Inspecting grouped tool output.".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "src/main.rs"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("first line\nsecond line\nthird line\nfourth line".to_string()),
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        });
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-2".to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "src/lib.rs"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("alpha\nbeta\ngamma\ndelta".to_string()),
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        });
+
+        let text = conversation_lines(&AppState::new(session), true)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("  ├─ read batch (2)"));
+        assert!(text.contains("  │   • read src/main.rs"));
+        assert!(text.contains("  │     result first line second line third line fourth line"));
+        assert!(text.contains("  │   • read src/lib.rs"));
+        assert!(text.contains("  │     result alpha beta gamma delta"));
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
     }
 }

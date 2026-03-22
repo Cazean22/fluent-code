@@ -1,0 +1,586 @@
+use fluent_code_app::app::{AppState, AppStatus};
+use fluent_code_app::session::model::{
+    Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
+};
+
+const SUMMARY_LIMIT: usize = 72;
+
+#[derive(Debug, Clone)]
+pub(crate) enum ConversationRow {
+    Turn(TurnRow),
+    Tool(ToolRow),
+    ToolGroup(ToolGroupRow),
+    RunMarker(RunMarkerRow),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TurnRow {
+    pub(crate) role: Role,
+    pub(crate) content: String,
+    pub(crate) is_streaming: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolRow {
+    pub(crate) tool_name: String,
+    pub(crate) summary: String,
+    pub(crate) arguments_preview: String,
+    pub(crate) approval_state: ToolApprovalState,
+    pub(crate) execution_state: ToolExecutionState,
+    pub(crate) result_preview: Option<String>,
+    pub(crate) error_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolGroupKind {
+    ReadLike,
+    SearchLike,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolGroupRow {
+    pub(crate) kind: ToolGroupKind,
+    pub(crate) items: Vec<ToolRow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunMarkerKind {
+    AwaitingApproval,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RunMarkerRow {
+    pub(crate) kind: RunMarkerKind,
+    pub(crate) label: &'static str,
+}
+
+pub(crate) fn derive_conversation_rows(state: &AppState) -> Vec<ConversationRow> {
+    let mut rows = Vec::new();
+    let session = &state.session;
+
+    for turn in &session.turns {
+        rows.push(ConversationRow::Turn(TurnRow {
+            role: turn.role,
+            content: turn.content.clone(),
+            is_streaming: matches!(turn.role, Role::Assistant)
+                && state.active_run_id == Some(turn.run_id)
+                && matches!(state.status, AppStatus::Generating),
+        }));
+
+        let mut attached_tools = session
+            .tool_invocations
+            .iter()
+            .filter(|invocation| invocation.preceding_turn_id == Some(turn.id))
+            .collect::<Vec<_>>();
+        attached_tools.sort_by_key(|invocation| invocation.requested_at);
+
+        rows.extend(group_tool_rows(
+            attached_tools.into_iter().map(derive_tool_row).collect(),
+        ));
+    }
+
+    let mut orphan_tools = session
+        .tool_invocations
+        .iter()
+        .filter(|invocation| invocation.preceding_turn_id.is_none())
+        .collect::<Vec<_>>();
+    orphan_tools.sort_by_key(|invocation| invocation.requested_at);
+
+    rows.extend(group_tool_rows(
+        orphan_tools.into_iter().map(derive_tool_row).collect(),
+    ));
+
+    if let Some(marker) = derive_run_marker(state) {
+        rows.push(ConversationRow::RunMarker(marker));
+    }
+
+    rows
+}
+
+fn derive_run_marker(state: &AppState) -> Option<RunMarkerRow> {
+    if state.active_run_id.is_some() {
+        return match &state.status {
+            AppStatus::AwaitingToolApproval => Some(RunMarkerRow {
+                kind: RunMarkerKind::AwaitingApproval,
+                label: "awaiting approval",
+            }),
+            AppStatus::Generating | AppStatus::RunningTool => Some(RunMarkerRow {
+                kind: RunMarkerKind::Running,
+                label: "running",
+            }),
+            _ => None,
+        };
+    }
+
+    match state.session.latest_run_status() {
+        Some(RunStatus::Completed) => Some(RunMarkerRow {
+            kind: RunMarkerKind::Completed,
+            label: "completed",
+        }),
+        Some(RunStatus::Failed) => Some(RunMarkerRow {
+            kind: RunMarkerKind::Failed,
+            label: "failed",
+        }),
+        Some(RunStatus::Cancelled) => Some(RunMarkerRow {
+            kind: RunMarkerKind::Cancelled,
+            label: "cancelled",
+        }),
+        _ => None,
+    }
+}
+
+fn group_tool_rows(tool_rows: Vec<ToolRow>) -> Vec<ConversationRow> {
+    let mut grouped_rows = Vec::new();
+    let mut buffer = Vec::new();
+    let mut current_kind = None;
+
+    for tool_row in tool_rows {
+        let next_kind = classify_group_kind(&tool_row);
+
+        if buffer.is_empty() {
+            buffer.push(tool_row);
+            current_kind = next_kind;
+            continue;
+        }
+
+        if next_kind.is_some() && next_kind == current_kind {
+            buffer.push(tool_row);
+            continue;
+        }
+
+        flush_tool_buffer(&mut grouped_rows, &mut buffer, current_kind);
+        buffer.push(tool_row);
+        current_kind = next_kind;
+    }
+
+    flush_tool_buffer(&mut grouped_rows, &mut buffer, current_kind);
+    grouped_rows
+}
+
+fn flush_tool_buffer(
+    grouped_rows: &mut Vec<ConversationRow>,
+    buffer: &mut Vec<ToolRow>,
+    kind: Option<ToolGroupKind>,
+) {
+    if buffer.is_empty() {
+        return;
+    }
+
+    if let Some(kind) = kind
+        && buffer.len() > 1
+    {
+        grouped_rows.push(ConversationRow::ToolGroup(ToolGroupRow {
+            kind,
+            items: std::mem::take(buffer),
+        }));
+        return;
+    }
+
+    grouped_rows.extend(buffer.drain(..).map(ConversationRow::Tool));
+}
+
+fn classify_group_kind(tool: &ToolRow) -> Option<ToolGroupKind> {
+    let tool_name = tool.tool_name.to_ascii_lowercase();
+
+    if tool_name.contains("read") {
+        return Some(ToolGroupKind::ReadLike);
+    }
+
+    if tool_name.contains("search") || tool_name.contains("grep") {
+        return Some(ToolGroupKind::SearchLike);
+    }
+
+    None
+}
+
+fn derive_tool_row(invocation: &ToolInvocationRecord) -> ToolRow {
+    ToolRow {
+        tool_name: invocation.tool_name.clone(),
+        summary: summarize_tool(invocation),
+        arguments_preview: summarize_json(&invocation.arguments),
+        approval_state: invocation.approval_state,
+        execution_state: invocation.execution_state,
+        result_preview: invocation.result.as_deref().map(summarize_text),
+        error_preview: invocation.error.as_deref().map(summarize_text),
+    }
+}
+
+fn summarize_tool(invocation: &ToolInvocationRecord) -> String {
+    if let Some(path) = invocation
+        .arguments
+        .get("filePath")
+        .or_else(|| invocation.arguments.get("path"))
+        .and_then(serde_json::Value::as_str)
+        && !path.trim().is_empty()
+    {
+        return format!("{} {}", invocation.tool_name, path);
+    }
+
+    if let Some(query) = invocation
+        .arguments
+        .get("query")
+        .or_else(|| invocation.arguments.get("pattern"))
+        .and_then(serde_json::Value::as_str)
+        && !query.trim().is_empty()
+    {
+        return format!("{} {}", invocation.tool_name, query);
+    }
+
+    invocation.tool_name.clone()
+}
+
+fn summarize_json(value: &serde_json::Value) -> String {
+    summarize_text(&value.to_string())
+}
+
+fn summarize_text(text: &str) -> String {
+    let condensed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if condensed.is_empty() {
+        return "(empty)".to_string();
+    }
+
+    let mut chars = condensed.chars();
+    let summary: String = chars.by_ref().take(SUMMARY_LIMIT).collect();
+
+    if chars.next().is_some() {
+        format!("{summary}...")
+    } else {
+        summary
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, Utc};
+    use fluent_code_app::app::{AppState, AppStatus};
+    use fluent_code_app::session::model::{
+        Role, RunStatus, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, Turn,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::{ConversationRow, RunMarkerKind, ToolGroupKind, derive_conversation_rows};
+
+    #[test]
+    fn derive_conversation_rows_keeps_turn_order() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("ordered turns");
+        let first_turn = make_turn(run_id, Role::User, "first");
+        let second_turn = make_turn(run_id, Role::Assistant, "second");
+
+        session.turns = vec![first_turn.clone(), second_turn.clone()];
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            &rows[0],
+            ConversationRow::Turn(turn) if turn.content == first_turn.content
+        ));
+        assert!(matches!(
+            &rows[1],
+            ConversationRow::Turn(turn) if turn.content == second_turn.content
+        ));
+    }
+
+    #[test]
+    fn derive_conversation_rows_inlines_tools_after_preceding_turn() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("attached tools");
+        let first_turn = make_turn(run_id, Role::User, "inspect");
+        let second_turn = make_turn(run_id, Role::Assistant, "working");
+
+        let early = make_tool_invocation(
+            run_id,
+            Some(first_turn.id),
+            "search",
+            json!({"query": "PersistSession"}),
+            Utc::now(),
+        );
+        let later = make_tool_invocation(
+            run_id,
+            Some(first_turn.id),
+            "read",
+            json!({"path": "src/main.rs"}),
+            Utc::now() + Duration::seconds(1),
+        );
+
+        session.turns = vec![first_turn.clone(), second_turn.clone()];
+        session.tool_invocations = vec![later.clone(), early.clone()];
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(
+            &rows[0],
+            ConversationRow::Turn(turn) if turn.content == first_turn.content
+        ));
+        assert!(matches!(
+            &rows[1],
+            ConversationRow::Tool(tool) if tool.summary.contains("PersistSession")
+        ));
+        assert!(matches!(
+            &rows[2],
+            ConversationRow::Tool(tool) if tool.summary.contains("src/main.rs")
+        ));
+        assert!(matches!(
+            &rows[3],
+            ConversationRow::Turn(turn) if turn.content == second_turn.content
+        ));
+    }
+
+    #[test]
+    fn derive_conversation_rows_preserves_orphan_tools() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("orphan tools");
+        let turn = make_turn(run_id, Role::User, "hello");
+        let orphan = make_tool_invocation(
+            run_id,
+            None,
+            "read",
+            json!({"filePath": "README.md"}),
+            Utc::now(),
+        );
+
+        session.turns = vec![turn.clone()];
+        session.tool_invocations = vec![orphan.clone()];
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            &rows[0],
+            ConversationRow::Turn(turn_row) if turn_row.content == turn.content
+        ));
+        assert!(matches!(
+            &rows[1],
+            ConversationRow::Tool(tool) if tool.summary.contains("README.md")
+        ));
+    }
+
+    #[test]
+    fn derive_conversation_rows_groups_same_kind_tools_for_same_turn() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("grouped tools");
+        let turn = make_turn(run_id, Role::Assistant, "reading files");
+
+        session.turns = vec![turn.clone()];
+        session.tool_invocations = vec![
+            make_tool_invocation(
+                run_id,
+                Some(turn.id),
+                "read",
+                json!({"path": "src/main.rs"}),
+                Utc::now(),
+            ),
+            make_tool_invocation(
+                run_id,
+                Some(turn.id),
+                "read",
+                json!({"path": "src/lib.rs"}),
+                Utc::now() + Duration::seconds(1),
+            ),
+        ];
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(&rows[0], ConversationRow::Turn(_)));
+        assert!(matches!(
+            &rows[1],
+            ConversationRow::ToolGroup(group)
+                if group.kind == ToolGroupKind::ReadLike && group.items.len() == 2
+        ));
+    }
+
+    #[test]
+    fn derive_conversation_rows_does_not_group_mixed_tool_kinds() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("mixed tools");
+        let turn = make_turn(run_id, Role::Assistant, "mixed work");
+
+        session.turns = vec![turn.clone()];
+        session.tool_invocations = vec![
+            make_tool_invocation(
+                run_id,
+                Some(turn.id),
+                "read",
+                json!({"path": "src/main.rs"}),
+                Utc::now(),
+            ),
+            make_tool_invocation(
+                run_id,
+                Some(turn.id),
+                "search",
+                json!({"query": "main"}),
+                Utc::now() + Duration::seconds(1),
+            ),
+        ];
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(&rows[0], ConversationRow::Turn(_)));
+        assert!(matches!(&rows[1], ConversationRow::Tool(_)));
+        assert!(matches!(&rows[2], ConversationRow::Tool(_)));
+    }
+
+    #[test]
+    fn derive_conversation_rows_inserts_approval_marker_after_grouped_tool_batch() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("approval marker");
+        let turn = make_turn(run_id, Role::Assistant, "checking files");
+        session.turns = vec![turn.clone()];
+        session.tool_invocations = vec![
+            make_tool_invocation(
+                run_id,
+                Some(turn.id),
+                "read",
+                json!({"path": "src/main.rs"}),
+                Utc::now(),
+            ),
+            make_tool_invocation(
+                run_id,
+                Some(turn.id),
+                "read",
+                json!({"path": "src/lib.rs"}),
+                Utc::now() + Duration::seconds(1),
+            ),
+        ];
+
+        let mut state = AppState::new(session);
+        state.active_run_id = Some(run_id);
+        state.status = AppStatus::AwaitingToolApproval;
+
+        let rows = derive_conversation_rows(&state);
+
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(&rows[1], ConversationRow::ToolGroup(_)));
+        assert!(matches!(
+            &rows[2],
+            ConversationRow::RunMarker(marker)
+                if marker.kind == RunMarkerKind::AwaitingApproval
+        ));
+    }
+
+    #[test]
+    fn derive_conversation_rows_inserts_running_marker_for_active_run_tail() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("running marker");
+        session.turns = vec![make_turn(run_id, Role::Assistant, "working")];
+
+        let mut state = AppState::new(session);
+        state.active_run_id = Some(run_id);
+        state.status = AppStatus::RunningTool;
+
+        let rows = derive_conversation_rows(&state);
+
+        assert!(matches!(
+            rows.last(),
+            Some(ConversationRow::RunMarker(marker))
+                if marker.kind == RunMarkerKind::Running
+        ));
+    }
+
+    #[test]
+    fn derive_conversation_rows_inserts_completed_marker_for_terminal_run_tail() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("completed marker");
+        session.turns = vec![make_turn(run_id, Role::Assistant, "done")];
+        session.upsert_run(run_id, RunStatus::Completed);
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert!(matches!(
+            rows.last(),
+            Some(ConversationRow::RunMarker(marker))
+                if marker.kind == RunMarkerKind::Completed
+        ));
+    }
+
+    #[test]
+    fn derive_conversation_rows_inserts_failed_marker_for_terminal_run_tail() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("failed marker");
+        session.turns = vec![make_turn(run_id, Role::Assistant, "boom")];
+        session.upsert_run(run_id, RunStatus::Failed);
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert!(matches!(
+            rows.last(),
+            Some(ConversationRow::RunMarker(marker))
+                if marker.kind == RunMarkerKind::Failed
+        ));
+    }
+
+    #[test]
+    fn derive_conversation_rows_does_not_emit_markers_for_historical_inferred_states() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("no inferred marker");
+        let turn = make_turn(run_id, Role::Assistant, "pending tool snapshot");
+        session.turns = vec![turn.clone()];
+        session.tool_invocations = vec![make_tool_invocation(
+            run_id,
+            Some(turn.id),
+            "read",
+            json!({"path": "src/main.rs"}),
+            Utc::now(),
+        )];
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row, ConversationRow::RunMarker(_)))
+        );
+    }
+
+    fn make_turn(run_id: uuid::Uuid, role: Role, content: &str) -> Turn {
+        Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role,
+            content: content.to_string(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn make_tool_invocation(
+        run_id: uuid::Uuid,
+        preceding_turn_id: Option<uuid::Uuid>,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        requested_at: chrono::DateTime<Utc>,
+    ) -> ToolInvocationRecord {
+        ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: format!("call-{}", Uuid::new_v4()),
+            tool_name: tool_name.to_string(),
+            arguments,
+            preceding_turn_id,
+            approval_state: ToolApprovalState::Pending,
+            execution_state: ToolExecutionState::NotStarted,
+            result: None,
+            error: None,
+            requested_at,
+            approved_at: None,
+            completed_at: None,
+        }
+    }
+}
