@@ -5,11 +5,15 @@ edition.workspace = true
 
 [dependencies]
 fluent-code-app = { path = "../fluent-code-app" }
+chrono.workspace = true
 crossterm.workspace = true
+pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
+syntect.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 fluent-code-provider = { path = "../fluent-code-provider" }
