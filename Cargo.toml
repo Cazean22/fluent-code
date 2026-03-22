@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    ".",
+    "crates/fluent-code-app",
+    "crates/fluent-code-provider",
+    "crates/fluent-code-tui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+crossterm = "0.28"
+futures = "0.3"
+glob = "0.3"
+ratatui = "0.29"
+regex = "1"
+rig-core = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[package]
+name = "fluent-code"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fluent-code-app = { path = "crates/fluent-code-app" }
+fluent-code-provider = { path = "crates/fluent-code-provider" }
+fluent-code-tui = { path = "crates/fluent-code-tui" }
+tokio.workspace = true
+tracing.workspace = true

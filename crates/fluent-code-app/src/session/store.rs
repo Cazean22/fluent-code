@@ -1,0 +1,389 @@
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
+
+use crate::error::{FluentCodeError, Result};
+use crate::logging::path_for_log;
+use crate::session::model::{RunRecord, Session, SessionId, ToolInvocationRecord, Turn};
+
+pub trait SessionStore {
+    fn create(&self, session: &Session) -> Result<()>;
+    fn load(&self, id: &SessionId) -> Result<Session>;
+    fn save(&self, session: &Session) -> Result<()>;
+    fn append_turn(&self, session_id: &SessionId, turn: &Turn) -> Result<()>;
+}
+
+#[derive(Debug, Clone)]
+pub struct FsSessionStore {
+    root: PathBuf,
+}
+
+impl FsSessionStore {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub fn load_or_create_latest(&self) -> Result<Session> {
+        self.ensure_root()?;
+
+        match self.read_latest_session_id()? {
+            Some(id) => {
+                info!(session_id = %id, "loading latest persisted session");
+                self.load(&id)
+            }
+            None => {
+                info!("no persisted latest session found; creating a new session");
+                self.create_new_session()
+            }
+        }
+    }
+
+    pub fn create_new_session(&self) -> Result<Session> {
+        self.ensure_root()?;
+
+        let session = Session::new("New Session");
+        self.create(&session)?;
+        info!(session_id = %session.id, "created new session");
+        Ok(session)
+    }
+
+    fn ensure_root(&self) -> Result<()> {
+        fs::create_dir_all(self.sessions_root())?;
+        debug!(root = %path_for_log(&self.root), "ensured session store root exists");
+        Ok(())
+    }
+
+    fn sessions_root(&self) -> PathBuf {
+        self.root.join("sessions")
+    }
+
+    fn latest_session_path(&self) -> PathBuf {
+        self.root.join("latest_session")
+    }
+
+    fn session_dir(&self, id: &SessionId) -> PathBuf {
+        self.sessions_root().join(id.to_string())
+    }
+
+    fn session_meta_path(&self, id: &SessionId) -> PathBuf {
+        self.session_dir(id).join("session.json")
+    }
+
+    fn turns_path(&self, id: &SessionId) -> PathBuf {
+        self.session_dir(id).join("turns.jsonl")
+    }
+
+    fn write_latest_session_id(&self, id: &SessionId) -> Result<()> {
+        fs::write(self.latest_session_path(), id.to_string())?;
+        debug!(session_id = %id, "updated latest session pointer");
+        Ok(())
+    }
+
+    fn read_latest_session_id(&self) -> Result<Option<SessionId>> {
+        let path = self.latest_session_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let contents = fs::read_to_string(path)?;
+        let trimmed = contents.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let id = trimmed
+            .parse()
+            .map_err(|err| FluentCodeError::Session(format!("invalid latest session id: {err}")))?;
+        Ok(Some(id))
+    }
+
+    fn read_turns(&self, path: &Path) -> Result<Vec<Turn>> {
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let mut turns = Vec::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            turns.push(serde_json::from_str(&line)?);
+        }
+
+        Ok(turns)
+    }
+}
+
+impl SessionStore for FsSessionStore {
+    fn create(&self, session: &Session) -> Result<()> {
+        self.ensure_root()?;
+        fs::create_dir_all(self.session_dir(&session.id))?;
+        self.save(session)?;
+        self.write_latest_session_id(&session.id)
+    }
+
+    fn load(&self, id: &SessionId) -> Result<Session> {
+        let meta_path = self.session_meta_path(id);
+        if !meta_path.exists() {
+            warn!(session_id = %id, "session metadata file missing during load");
+            return Err(FluentCodeError::Session(format!(
+                "session metadata not found for {id}"
+            )));
+        }
+
+        let metadata: SessionMetadata = serde_json::from_str(&fs::read_to_string(meta_path)?)?;
+        let turns = self.read_turns(&self.turns_path(id))?;
+
+        let session = Session {
+            id: metadata.id,
+            title: metadata.title,
+            created_at: metadata.created_at,
+            updated_at: metadata.updated_at,
+            runs: metadata.runs,
+            turns,
+            tool_invocations: metadata.tool_invocations,
+        };
+
+        info!(
+            session_id = %session.id,
+            turn_count = session.turns.len(),
+            run_count = session.runs.len(),
+            tool_invocation_count = session.tool_invocations.len(),
+            "loaded session from disk"
+        );
+
+        Ok(session)
+    }
+
+    fn save(&self, session: &Session) -> Result<()> {
+        self.ensure_root()?;
+        fs::create_dir_all(self.session_dir(&session.id))?;
+
+        let metadata = SessionMetadata::from(session);
+        fs::write(
+            self.session_meta_path(&session.id),
+            serde_json::to_vec_pretty(&metadata)?,
+        )?;
+
+        let mut turns_file = File::create(self.turns_path(&session.id))?;
+        for turn in &session.turns {
+            writeln!(turns_file, "{}", serde_json::to_string(turn)?)?;
+        }
+
+        info!(
+            session_id = %session.id,
+            turn_count = session.turns.len(),
+            run_count = session.runs.len(),
+            tool_invocation_count = session.tool_invocations.len(),
+            "saved session snapshot"
+        );
+
+        self.write_latest_session_id(&session.id)
+    }
+
+    fn append_turn(&self, session_id: &SessionId, turn: &Turn) -> Result<()> {
+        self.ensure_root()?;
+        fs::create_dir_all(self.session_dir(session_id))?;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.turns_path(session_id))?;
+        writeln!(file, "{}", serde_json::to_string(turn)?)?;
+        debug!(session_id = %session_id, turn_id = %turn.id, "appended session turn");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionMetadata {
+    id: SessionId,
+    title: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    runs: Vec<RunRecord>,
+    #[serde(default)]
+    tool_invocations: Vec<ToolInvocationRecord>,
+}
+
+impl From<&Session> for SessionMetadata {
+    fn from(session: &Session) -> Self {
+        Self {
+            id: session.id,
+            title: session.title.clone(),
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            runs: session.runs.clone(),
+            tool_invocations: session.tool_invocations.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    use super::{FsSessionStore, SessionStore};
+    use crate::session::model::{
+        Role, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, Turn,
+    };
+
+    #[test]
+    fn creates_and_loads_latest_session() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+
+        let created = store
+            .load_or_create_latest()
+            .expect("create latest session");
+        let loaded = store.load_or_create_latest().expect("load latest session");
+
+        assert_eq!(created.id, loaded.id);
+        cleanup(root);
+    }
+
+    #[test]
+    fn create_new_session_persists_and_updates_latest_pointer() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+
+        let first = store.create_new_session().expect("create first session");
+        let second = store.create_new_session().expect("create second session");
+
+        assert_ne!(first.id, second.id);
+
+        let latest = store.load_or_create_latest().expect("load latest session");
+        assert_eq!(latest.id, second.id);
+        assert_eq!(latest.title, "New Session");
+        assert!(latest.turns.is_empty());
+        assert!(latest.runs.is_empty());
+        assert!(latest.tool_invocations.is_empty());
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn saves_and_restores_turns() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+
+        let mut session = Session::new("test session");
+        session.turns.push(Turn {
+            id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            role: Role::User,
+            content: "hello".to_string(),
+            timestamp: Utc::now(),
+        });
+
+        store.create(&session).expect("create session");
+        let loaded = store.load(&session.id).expect("load session");
+
+        assert_eq!(loaded.turns.len(), 1);
+        assert_eq!(loaded.turns[0].content, "hello");
+        cleanup(root);
+    }
+
+    #[test]
+    fn loads_legacy_session_metadata_without_runs() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+
+        let session = Session::new("legacy session");
+        let session_dir = root.join("sessions").join(session.id.to_string());
+        std::fs::create_dir_all(&session_dir).expect("create legacy session dir");
+
+        std::fs::write(root.join("latest_session"), session.id.to_string())
+            .expect("write latest session id");
+
+        std::fs::write(
+            session_dir.join("session.json"),
+            format!(
+                concat!(
+                    "{{\n",
+                    "  \"id\": \"{}\",\n",
+                    "  \"title\": \"{}\",\n",
+                    "  \"created_at\": \"{}\",\n",
+                    "  \"updated_at\": \"{}\"\n",
+                    "}}\n"
+                ),
+                session.id,
+                session.title,
+                session.created_at.to_rfc3339(),
+                session.updated_at.to_rfc3339(),
+            ),
+        )
+        .expect("write legacy session metadata");
+
+        std::fs::write(session_dir.join("turns.jsonl"), "").expect("write turns file");
+
+        let loaded = store.load(&session.id).expect("load legacy session");
+        assert!(loaded.runs.is_empty());
+        assert!(loaded.turns.is_empty());
+        assert!(loaded.tool_invocations.is_empty());
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn saves_and_restores_tool_invocations() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+
+        let mut session = Session::new("tool session");
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "uppercase_text".to_string(),
+            arguments: serde_json::json!({ "text": "hello" }),
+            preceding_turn_id: None,
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("HELLO".to_string()),
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        });
+
+        store
+            .create(&session)
+            .expect("create session with tool invocation");
+        let loaded = store
+            .load(&session.id)
+            .expect("load session with tool invocation");
+
+        assert_eq!(loaded.tool_invocations.len(), 1);
+        assert_eq!(loaded.tool_invocations[0].tool_name, "uppercase_text");
+        assert_eq!(loaded.tool_invocations[0].result.as_deref(), Some("HELLO"));
+
+        cleanup(root);
+    }
+
+    fn unique_test_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+
+        std::env::temp_dir().join(format!("fluent-code-test-{nanos}"))
+    }
+
+    fn cleanup(path: PathBuf) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "fluent-code-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fluent-code-app = { path = "../fluent-code-app" }
+crossterm.workspace = true
+ratatui.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+fluent-code-provider = { path = "../fluent-code-provider" }

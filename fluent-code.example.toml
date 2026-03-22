@@ -1,0 +1,28 @@
+data_dir = ".fluent-code"
+
+[logging.file]
+enabled = true
+path = "logs/fluent-code.log"
+level = "debug"
+
+[logging.stderr]
+enabled = true
+level = "warn"
+
+model_provider = "openai"
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+system_prompt = "You are a helpful coding assistant."
+
+[model_providers.openai]
+base_url = "https://api.openai.com/v1"
+wire_api = "responses"
+api_key_envs = ["OPENAI_API_KEY"]
+
+[model_providers.openai_compatible]
+base_url = "http://localhost:11434/v1"
+wire_api = "responses"
+api_keys = []
+
+[model_providers.mock]
+chunk_delay_ms = 25
