@@ -33,12 +33,15 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         lines.extend(render_tool_invocation(invocation));
     }
 
+    let transcript_scroll = transcript_scroll_offset(&lines, chunks[0].width, chunks[0].height);
+
     let transcript = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(state.session.title.as_str()),
         )
+        .scroll((transcript_scroll, 0))
         .wrap(Wrap { trim: false });
 
     let input = Paragraph::new(state.draft_input.as_str())
@@ -267,5 +270,55 @@ fn summarize_text(text: &str) -> String {
         format!("{summary}...")
     } else {
         summary
+    }
+}
+
+fn transcript_scroll_offset(lines: &[Line<'_>], area_width: u16, area_height: u16) -> u16 {
+    let inner_width = area_width.saturating_sub(2).max(1) as usize;
+    let visible_height = area_height.saturating_sub(2) as usize;
+
+    if visible_height == 0 {
+        return 0;
+    }
+
+    let wrapped_line_count = lines
+        .iter()
+        .map(|line| {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            let char_count = text.chars().count().max(1);
+            char_count.div_ceil(inner_width)
+        })
+        .sum::<usize>();
+
+    wrapped_line_count.saturating_sub(visible_height) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::text::Line;
+
+    use super::transcript_scroll_offset;
+
+    #[test]
+    fn transcript_scroll_offset_stays_at_top_when_content_fits() {
+        let lines = vec![Line::from("short"), Line::from("content")];
+
+        assert_eq!(transcript_scroll_offset(&lines, 20, 8), 0);
+    }
+
+    #[test]
+    fn transcript_scroll_offset_tracks_bottom_for_growing_content() {
+        let lines = vec![
+            Line::from("12345678"),
+            Line::from("12345678"),
+            Line::from("12345678"),
+            Line::from("12345678"),
+        ];
+
+        assert_eq!(transcript_scroll_offset(&lines, 10, 5), 1);
     }
 }

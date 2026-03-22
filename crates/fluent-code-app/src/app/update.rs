@@ -11,6 +11,13 @@ use crate::tool::built_in_tools;
 
 const READ_TOOL_NAME: &str = "read";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolBatchProgress {
+    AwaitingApproval,
+    Running,
+    ReadyToResume,
+}
+
 pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
     match msg {
         Msg::InputChanged(input) => {
@@ -132,7 +139,11 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             };
             let session_id = state.session.id;
 
-            let Some(invocation_id) = state.session.pending_tool_invocation().map(|i| i.id) else {
+            let Some((invocation_id, preceding_turn_id)) = state
+                .session
+                .pending_tool_invocation()
+                .map(|invocation| (invocation.id, invocation.preceding_turn_id))
+            else {
                 return Vec::new();
             };
 
@@ -143,9 +154,36 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 invocation.completed_at = Some(Utc::now());
             }
 
-            state.status = AppStatus::Generating;
-            state.pending_resume_request = Some(build_provider_request(state, run_id));
             state.session.updated_at = Utc::now();
+
+            match tool_batch_progress(state, run_id, preceding_turn_id) {
+                ToolBatchProgress::AwaitingApproval => {
+                    state.status = AppStatus::AwaitingToolApproval;
+                    state.pending_resume_request = None;
+                    info!(
+                        session_id = %session_id,
+                        run_id = %run_id,
+                        invocation_id = %invocation_id,
+                        "denied pending tool invocation and waiting for remaining tool decisions"
+                    );
+                    return vec![Effect::PersistSession];
+                }
+                ToolBatchProgress::Running => {
+                    state.status = AppStatus::RunningTool;
+                    state.pending_resume_request = None;
+                    info!(
+                        session_id = %session_id,
+                        run_id = %run_id,
+                        invocation_id = %invocation_id,
+                        "denied pending tool invocation while another tool is still running"
+                    );
+                    return vec![Effect::PersistSession];
+                }
+                ToolBatchProgress::ReadyToResume => {
+                    state.status = AppStatus::Generating;
+                    state.pending_resume_request = Some(build_provider_request(state, run_id));
+                }
+            }
 
             let request = state
                 .pending_resume_request
@@ -360,6 +398,15 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 return Vec::new();
             }
             let session_id = state.session.id;
+            let Some(preceding_turn_id) = state
+                .session
+                .tool_invocations
+                .iter()
+                .find(|invocation| invocation.id == invocation_id)
+                .map(|invocation| invocation.preceding_turn_id)
+            else {
+                return Vec::new();
+            };
 
             let Some(invocation) = state.session.find_tool_invocation_mut(invocation_id) else {
                 return Vec::new();
@@ -373,7 +420,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                     invocation.result = Some(output);
                     invocation.error = None;
                     let tool_name = invocation.tool_name.clone();
-                    state.status = AppStatus::Generating;
                     info!(
                         session_id = %session_id,
                         run_id = %run_id,
@@ -387,7 +433,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                     invocation.error = Some(error.clone());
                     let tool_name = invocation.tool_name.clone();
                     if should_resume_after_tool_failure(&tool_name, &error) {
-                        state.status = AppStatus::Generating;
                         info!(
                             session_id = %session_id,
                             run_id = %run_id,
@@ -417,8 +462,36 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 }
             }
 
-            state.pending_resume_request = Some(build_provider_request(state, run_id));
             state.session.updated_at = Utc::now();
+
+            match tool_batch_progress(state, run_id, preceding_turn_id) {
+                ToolBatchProgress::AwaitingApproval => {
+                    state.status = AppStatus::AwaitingToolApproval;
+                    state.pending_resume_request = None;
+                    info!(
+                        session_id = %session_id,
+                        run_id = %run_id,
+                        invocation_id = %invocation_id,
+                        "tool execution finished and waiting for remaining tool approvals"
+                    );
+                    return vec![Effect::PersistSession];
+                }
+                ToolBatchProgress::Running => {
+                    state.status = AppStatus::RunningTool;
+                    state.pending_resume_request = None;
+                    info!(
+                        session_id = %session_id,
+                        run_id = %run_id,
+                        invocation_id = %invocation_id,
+                        "tool execution finished and another tool is still running"
+                    );
+                    return vec![Effect::PersistSession];
+                }
+                ToolBatchProgress::ReadyToResume => {
+                    state.status = AppStatus::Generating;
+                    state.pending_resume_request = Some(build_provider_request(state, run_id));
+                }
+            }
 
             let request = state
                 .pending_resume_request
@@ -455,6 +528,44 @@ fn build_provider_request(state: &AppState, run_id: Uuid) -> ProviderRequest {
 
 fn should_resume_after_tool_failure(tool_name: &str, error: &str) -> bool {
     tool_name == READ_TOOL_NAME && error.contains("is not accessible")
+}
+
+fn tool_batch_progress(
+    state: &AppState,
+    run_id: Uuid,
+    preceding_turn_id: Option<Uuid>,
+) -> ToolBatchProgress {
+    let mut has_pending = false;
+    let mut has_running = false;
+
+    for invocation in &state.session.tool_invocations {
+        if invocation.run_id != run_id || invocation.preceding_turn_id != preceding_turn_id {
+            continue;
+        }
+
+        match invocation.approval_state {
+            ToolApprovalState::Pending => {
+                has_pending = true;
+            }
+            ToolApprovalState::Approved => {
+                if matches!(
+                    invocation.execution_state,
+                    ToolExecutionState::NotStarted | ToolExecutionState::Running
+                ) {
+                    has_running = true;
+                }
+            }
+            ToolApprovalState::Denied => {}
+        }
+    }
+
+    if has_pending {
+        ToolBatchProgress::AwaitingApproval
+    } else if has_running {
+        ToolBatchProgress::Running
+    } else {
+        ToolBatchProgress::ReadyToResume
+    }
 }
 
 fn append_tool_messages_after_turn(
@@ -634,6 +745,77 @@ mod tests {
             effects.last(),
             Some(Effect::StartAssistant { request, .. })
                 if request.messages.iter().any(|message| matches!(message, fluent_code_provider::ProviderMessage::ToolResult { content, .. } if content == "HELLO WORLD"))
+        ));
+    }
+
+    #[test]
+    fn multi_tool_batch_waits_for_all_terminal_results_before_resuming() {
+        let mut state = AppState::new(Session::new("multi tool flow"));
+        state.draft_input = "inspect repository with multiple tools".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "tool-call-read-1".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({ "path": "Cargo.toml" }),
+                },
+            },
+        );
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "tool-call-glob-2".to_string(),
+                    name: "glob".to_string(),
+                    arguments: serde_json::json!({ "pattern": "**/*.rs" }),
+                },
+            },
+        );
+
+        assert!(matches!(state.status, AppStatus::AwaitingToolApproval));
+        assert_eq!(state.session.tool_invocations.len(), 2);
+
+        let effects = update(&mut state, Msg::ApprovePendingTool);
+        assert!(matches!(state.status, AppStatus::RunningTool));
+        let approved_invocation_id = match effects.last() {
+            Some(Effect::ExecuteTool { invocation_id, .. }) => *invocation_id,
+            _ => panic!("expected execute tool effect"),
+        };
+
+        let effects = update(
+            &mut state,
+            Msg::ToolExecutionFinished {
+                run_id,
+                invocation_id: approved_invocation_id,
+                result: Ok("[\"src/main.rs\"]".to_string()),
+            },
+        );
+
+        assert!(matches!(state.status, AppStatus::AwaitingToolApproval));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::StartAssistant { .. }))
+        );
+
+        let effects = update(&mut state, Msg::DenyPendingTool);
+
+        assert!(matches!(state.status, AppStatus::Generating));
+        assert!(matches!(
+            effects.last(),
+            Some(Effect::StartAssistant { request, .. })
+                if request.messages.iter().filter(|message| matches!(message, fluent_code_provider::ProviderMessage::ToolResult { .. })).count() == 2
+                    && request.messages.iter().any(|message| matches!(message, fluent_code_provider::ProviderMessage::ToolResult { content, .. } if content == "[\"src/main.rs\"]"))
+                    && request.messages.iter().any(|message| matches!(message, fluent_code_provider::ProviderMessage::ToolResult { content, .. } if content == "Tool execution denied by user"))
         ));
     }
 
