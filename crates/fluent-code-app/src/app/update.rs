@@ -7,7 +7,6 @@ use crate::app::{AppState, AppStatus, Effect, Msg};
 use crate::session::model::{
     Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, Turn,
 };
-use crate::tool::built_in_tools;
 
 const READ_TOOL_NAME: &str = "read";
 
@@ -310,11 +309,15 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 return Vec::new();
             }
 
+            let tool_name = tool_call.name.clone();
+            let tool_source = state.tool_registry.tool_source(&tool_name);
+
             let invocation = ToolInvocationRecord {
                 id: Uuid::new_v4(),
                 run_id,
                 tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name,
+                tool_name,
+                tool_source,
                 arguments: tool_call.arguments,
                 preceding_turn_id: state.session.turns.last().map(|turn| turn.id),
                 approval_state: ToolApprovalState::Pending,
@@ -325,17 +328,51 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 approved_at: None,
                 completed_at: None,
             };
+            let auto_approve = state
+                .tool_registry
+                .plugin_registration(&invocation.tool_name)
+                .map(|registration| !registration.requires_approval)
+                .unwrap_or(false);
 
             state.session.tool_invocations.push(invocation);
-            state.status = AppStatus::AwaitingToolApproval;
             state.pending_resume_request = None;
             state.session.updated_at = Utc::now();
 
             let invocation = state
                 .session
                 .tool_invocations
-                .last()
+                .last_mut()
                 .expect("tool invocation just pushed");
+
+            if auto_approve {
+                invocation.approval_state = ToolApprovalState::Approved;
+                invocation.execution_state = ToolExecutionState::Running;
+                invocation.approved_at = Some(Utc::now());
+                state.status = AppStatus::RunningTool;
+                info!(
+                    session_id = %state.session.id,
+                    run_id = %run_id,
+                    invocation_id = %invocation.id,
+                    tool_name = %invocation.tool_name,
+                    tool_call_id = %invocation.tool_call_id,
+                    "assistant tool auto-approved by plugin policy"
+                );
+
+                return vec![
+                    Effect::PersistSession,
+                    Effect::ExecuteTool {
+                        run_id,
+                        invocation_id: invocation.id,
+                        tool_call: ProviderToolCall {
+                            id: invocation.tool_call_id.clone(),
+                            name: invocation.tool_name.clone(),
+                            arguments: invocation.arguments.clone(),
+                        },
+                    },
+                ];
+            }
+
+            state.status = AppStatus::AwaitingToolApproval;
             info!(
                 session_id = %state.session.id,
                 run_id = %run_id,
@@ -542,7 +579,7 @@ fn build_provider_request(state: &AppState, run_id: Uuid) -> ProviderRequest {
         })
         .collect();
 
-    ProviderRequest::new(messages, built_in_tools())
+    ProviderRequest::new(messages, state.tool_registry.provider_tools())
 }
 
 fn should_resume_after_tool_failure(tool_name: &str, error: &str) -> bool {
@@ -707,6 +744,34 @@ mod tests {
             Some(Effect::StartAssistant { request, .. })
                 if matches!(request.messages.first(), Some(fluent_code_provider::ProviderMessage::UserText { text }) if text == "hello")
         ));
+        assert!(request_contains_tool_name(
+            match effects.get(1) {
+                Some(Effect::StartAssistant { request, .. }) => request,
+                _ => panic!("expected assistant start effect"),
+            },
+            "read"
+        ));
+    }
+
+    #[test]
+    fn provider_request_uses_registry_tools() {
+        use std::sync::Arc;
+
+        use crate::plugin::ToolRegistry;
+
+        let session = Session::new("plugin request test");
+        let registry = Arc::new(ToolRegistry::built_in());
+        let mut state = AppState::new_with_tool_registry(session, registry);
+        state.draft_input = "hello".to_string();
+
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let request = match effects.get(1) {
+            Some(Effect::StartAssistant { request, .. }) => request,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        assert!(request_contains_tool_name(request, "uppercase_text"));
+        assert!(request_contains_tool_name(request, "read"));
     }
 
     #[test]
@@ -1141,5 +1206,60 @@ mod tests {
             state.session.turns.last().map(|turn| turn.role),
             Some(Role::Assistant)
         ));
+    }
+
+    #[test]
+    fn plugin_tool_call_records_plugin_tool_source() {
+        use std::sync::Arc;
+
+        use crate::plugin::ToolRegistry;
+        use crate::session::model::ToolSource;
+
+        let tool_registry = Arc::new(ToolRegistry::with_plugin_tool_source_for_tests(
+            "plugin_echo",
+            "project.echo",
+            "Project Echo",
+            "1.2.3",
+            crate::plugin::DiscoveryScope::Project,
+        ));
+
+        let mut state = AppState::new_with_tool_registry(Session::new("plugin source flow"), tool_registry);
+        state.draft_input = "run plugin tool".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "plugin-call-1".to_string(),
+                    name: "plugin_echo".to_string(),
+                    arguments: serde_json::json!({ "text": "hello" }),
+                },
+            },
+        );
+
+        assert!(matches!(
+            state.session.tool_invocations[0].tool_source,
+            ToolSource::Plugin {
+                ref plugin_id,
+                ref plugin_name,
+                ref plugin_version,
+                scope: crate::plugin::DiscoveryScope::Project,
+            } if plugin_id == "project.echo"
+                && plugin_name == "Project Echo"
+                && plugin_version == "1.2.3"
+        ));
+    }
+
+    fn request_contains_tool_name(
+        request: &fluent_code_provider::ProviderRequest,
+        name: &str,
+    ) -> bool {
+        request.tools.iter().any(|tool| tool.name == name)
     }
 }

@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::plugin::DiscoveryScope;
+
 pub type SessionId = Uuid;
 pub type TurnId = Uuid;
 pub type RunId = Uuid;
@@ -101,6 +103,8 @@ pub struct ToolInvocationRecord {
     pub run_id: RunId,
     pub tool_call_id: String,
     pub tool_name: String,
+    #[serde(default)]
+    pub tool_source: ToolSource,
     pub arguments: serde_json::Value,
     #[serde(default)]
     pub preceding_turn_id: Option<TurnId>,
@@ -117,6 +121,19 @@ pub struct ToolInvocationRecord {
     pub approved_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSource {
+    #[default]
+    BuiltIn,
+    Plugin {
+        plugin_id: String,
+        plugin_name: String,
+        plugin_version: String,
+        scope: DiscoveryScope,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

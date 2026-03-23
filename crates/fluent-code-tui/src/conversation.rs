@@ -1,6 +1,6 @@
 use fluent_code_app::app::{AppState, AppStatus};
 use fluent_code_app::session::model::{
-    Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
+    Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, ToolSource,
 };
 
 const SUMMARY_LIMIT: usize = 72;
@@ -24,6 +24,8 @@ pub(crate) struct TurnRow {
 pub(crate) struct ToolRow {
     pub(crate) tool_name: String,
     pub(crate) summary: String,
+    pub(crate) provenance_compact: Option<String>,
+    pub(crate) provenance_expanded: Option<String>,
     pub(crate) arguments_preview: String,
     pub(crate) approval_state: ToolApprovalState,
     pub(crate) execution_state: ToolExecutionState,
@@ -201,11 +203,42 @@ fn derive_tool_row(invocation: &ToolInvocationRecord) -> ToolRow {
     ToolRow {
         tool_name: invocation.tool_name.clone(),
         summary: summarize_tool(invocation),
+        provenance_compact: summarize_tool_provenance_compact(&invocation.tool_source),
+        provenance_expanded: summarize_tool_provenance_expanded(&invocation.tool_source),
         arguments_preview: summarize_json(&invocation.arguments),
         approval_state: invocation.approval_state,
         execution_state: invocation.execution_state,
         result_preview: invocation.result.as_deref().map(summarize_text),
         error_preview: invocation.error.as_deref().map(summarize_text),
+    }
+}
+
+fn summarize_tool_provenance_compact(tool_source: &ToolSource) -> Option<String> {
+    match tool_source {
+        ToolSource::BuiltIn => None,
+        ToolSource::Plugin { plugin_name, .. } => Some(format!("plugin {plugin_name}")),
+    }
+}
+
+fn summarize_tool_provenance_expanded(tool_source: &ToolSource) -> Option<String> {
+    match tool_source {
+        ToolSource::BuiltIn => None,
+        ToolSource::Plugin {
+            plugin_id,
+            plugin_name,
+            plugin_version,
+            scope,
+        } => Some(format!(
+            "plugin {plugin_name} v{plugin_version} · {} · {plugin_id}",
+            format_discovery_scope(*scope)
+        )),
+    }
+}
+
+fn format_discovery_scope(scope: fluent_code_app::plugin::DiscoveryScope) -> &'static str {
+    match scope {
+        fluent_code_app::plugin::DiscoveryScope::Global => "global",
+        fluent_code_app::plugin::DiscoveryScope::Project => "project",
     }
 }
 
@@ -259,7 +292,8 @@ mod tests {
     use chrono::{Duration, Utc};
     use fluent_code_app::app::{AppState, AppStatus};
     use fluent_code_app::session::model::{
-        Role, RunStatus, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, Turn,
+        Role, RunStatus, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
+        ToolSource, Turn,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -572,6 +606,7 @@ mod tests {
             run_id,
             tool_call_id: format!("call-{}", Uuid::new_v4()),
             tool_name: tool_name.to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments,
             preceding_turn_id,
             approval_state: ToolApprovalState::Pending,

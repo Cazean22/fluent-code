@@ -1,8 +1,10 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fluent_code_provider::ProviderRequest;
 use uuid::Uuid;
 
+use crate::plugin::{PluginLoadSnapshot, ToolRegistry};
 use crate::session::model::Session;
 
 const CHECKPOINT_INTERVAL: Duration = Duration::from_millis(250);
@@ -10,6 +12,8 @@ const CHECKPOINT_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub session: Session,
+    pub tool_registry: Arc<ToolRegistry>,
+    pub plugin_load_snapshot: PluginLoadSnapshot,
     pub draft_input: String,
     pub status: AppStatus,
     pub should_quit: bool,
@@ -21,12 +25,45 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(session: Session) -> Self {
-        Self::new_with_checkpoint_interval(session, CHECKPOINT_INTERVAL)
+        Self::new_with_tool_registry(session, Arc::new(ToolRegistry::built_in()))
+    }
+
+    pub fn new_with_tool_registry(session: Session, tool_registry: Arc<ToolRegistry>) -> Self {
+        Self::new_with_plugin_state(session, tool_registry, PluginLoadSnapshot::default())
     }
 
     pub fn new_with_checkpoint_interval(session: Session, checkpoint_interval: Duration) -> Self {
+        Self::new_with_dependencies(
+            session,
+            checkpoint_interval,
+            Arc::new(ToolRegistry::built_in()),
+            PluginLoadSnapshot::default(),
+        )
+    }
+
+    pub fn new_with_plugin_state(
+        session: Session,
+        tool_registry: Arc<ToolRegistry>,
+        plugin_load_snapshot: PluginLoadSnapshot,
+    ) -> Self {
+        Self::new_with_dependencies(
+            session,
+            CHECKPOINT_INTERVAL,
+            tool_registry,
+            plugin_load_snapshot,
+        )
+    }
+
+    pub fn new_with_dependencies(
+        session: Session,
+        checkpoint_interval: Duration,
+        tool_registry: Arc<ToolRegistry>,
+        plugin_load_snapshot: PluginLoadSnapshot,
+    ) -> Self {
         Self {
             session,
+            tool_registry,
+            plugin_load_snapshot,
             draft_input: String::new(),
             status: AppStatus::Idle,
             should_quit: false,

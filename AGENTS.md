@@ -1,67 +1,55 @@
 # AGENTS.md
 
-Guidance for coding agents working in `/Users/ytm-pc/Documents/codes/rust/fluent-code`.
+Guidance for coding agents working in `/Users/yangtingmei/Documents/codes/rust/fluent-code`.
 
-This repository is a Rust Cargo workspace. Follow the actual crate boundaries,
-verified commands, and repo-local conventions below rather than generic Rust habits.
+Prefer repo-local evidence over generic Rust habits.
 
-## 1. Repository overview
+## Workspace
 
-- Workspace members:
-  - `.` → `fluent-code` (root binary crate)
-  - `crates/fluent-code-app`
-  - `crates/fluent-code-provider`
-  - `crates/fluent-code-tui`
-- Workspace edition: `2024`
-- Shared foundations include Tokio, Ratatui, Crossterm, Tracing, Serde,
-  `rig-core`, `pulldown-cmark`, and `syntect`.
+- Members: `fluent-code`, `crates/fluent-code-app`, `crates/fluent-code-provider`, `crates/fluent-code-tui`
+- Edition: `2024`
+- Standalone example guest crate: `examples/plugins/echo/guest` (not a workspace member)
 
-## 2. Crate responsibilities
+## Crate roles
 
-### `fluent-code`
-- Thin composition root in `src/main.rs`
-- Loads config, session store, provider client, runtime, and launches the TUI
-- Keep this crate thin; do not move domain logic here unless explicitly asked.
+- `fluent-code`: thin composition root in `src/main.rs`
+- `fluent-code-app`: durable state and business logic (`app/`, `runtime/`, `session/`, `tool.rs`, `plugin/`, `config.rs`, `error.rs`)
+- `fluent-code-provider`: provider-facing logic, mock provider, `rig-core` / OpenAI integration
+- `fluent-code-tui`: Ratatui/Crossterm rendering, terminal lifecycle, input handling, local UI state
 
-### `fluent-code-app`
-- Owns application logic and durable state
-- Main areas: `app/`, `runtime/`, `session/`, `tool.rs`, `config.rs`, `error.rs`, `logging.rs`
-- Source of truth for operational invariants.
+Keep app invariants out of `fluent-code-tui`, provider-specific logic out of `fluent-code-app`, and `src/main.rs` thin.
 
-### `fluent-code-provider`
-- Owns provider-facing logic only
-- Contains the mock provider and OpenAI/`rig-core` integration
-- Converts between local provider types and upstream APIs
-- Do not leak provider-specific behavior into `fluent-code-tui`.
+## Rule files
 
-### `fluent-code-tui`
-- Owns Ratatui/Crossterm rendering, terminal lifecycle, input handling, and local UI state
-- Presentation-only logic belongs here, including markdown rendering and transcript behavior
-- Do not move app invariants or persistence rules into this crate.
-
-## 3. Local instruction files
-
-Current repo state:
 - Root `AGENTS.md` exists
 - No `.cursorrules`
 - No `.cursor/rules/`
 - No `.github/copilot-instructions.md`
 
-Do not assume hidden Cursor or Copilot rule files exist elsewhere in this repo.
+Do not assume hidden Cursor or Copilot rule files exist.
 
-## 4. Verified commands
+## Commands
 
-Run commands from the repository root unless there is a strong reason not to.
+Run from the repo root unless a manifest path is required.
 
 ### Build / check
 - `cargo build --workspace`
 - `cargo build -p fluent-code`
 - `cargo check --workspace`
+- `cargo check -p fluent-code-app`
+- `cargo check -p fluent-code-provider`
+- `cargo check -p fluent-code-tui`
 
 ### Run
 - `cargo run -p fluent-code`
 
-By default, the app uses the `mock` provider when no config overrides it.
+### Format / lint
+- `cargo fmt --all`
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo clippy -p fluent-code-app --all-targets -- -D warnings`
+- `cargo clippy -p fluent-code-provider --all-targets -- -D warnings`
+- `cargo clippy -p fluent-code-tui --all-targets -- -D warnings`
 
 ### Test
 - `cargo test --workspace`
@@ -69,119 +57,117 @@ By default, the app uses the `mock` provider when no config overrides it.
 - `cargo test -p fluent-code-provider`
 - `cargo test -p fluent-code-tui`
 
-### Run a single test
-Use the package plus the test name. If the test name is ambiguous, add `-- --exact`.
+### Single test
+Use package plus a test-name substring. Add `-- --exact` for module-qualified names or ambiguity.
 
-Verified examples:
+Examples:
 - `cargo test -p fluent-code-app creates_and_loads_latest_session`
-- `cargo test -p fluent-code-app saves_and_restores_turns`
-- `cargo test -p fluent-code-app mock_provider_streams_assistant_messages`
-- `cargo test -p fluent-code-app cancel_aborts_active_stream_task`
-- `cargo test -p fluent-code-tui tests::persists_partial_assistant_content_before_completion -- --exact`
+- `cargo test -p fluent-code-app plugin_tool_call_records_plugin_tool_source`
 - `cargo test -p fluent-code-tui tests::approve_tool_executes_and_resumes_run -- --exact`
+- `cargo test -p fluent-code-provider validate_openai_tool_call_id_rejects_empty_id`
 
-### Format / lint
-- `cargo fmt --all`
-- `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- Faster crate-local loop:
-  - `cargo clippy -p fluent-code-app --all-targets -- -D warnings`
-  - `cargo clippy -p fluent-code-provider --all-targets -- -D warnings`
-  - `cargo clippy -p fluent-code-tui --all-targets -- -D warnings`
+### Example plugin
+- `bash ./examples/plugins/echo/build.sh`
 
-## 5. Test layout and expectations
+## Validation order
 
-- Tests are inline `#[cfg(test)]` unit tests in source files.
-- There is no top-level `tests/` directory.
-- There is no `benches/` directory.
-- Async tests use `#[tokio::test]`; sync tests use plain `#[test]`.
-- Prefer colocated tests unless there is a strong reason to introduce integration tests.
-
-Test-heavy files include:
-- `crates/fluent-code-app/src/app/update.rs`
-- `crates/fluent-code-app/src/runtime/orchestrator.rs`
-- `crates/fluent-code-app/src/session/store.rs`
-- `crates/fluent-code-app/src/tool.rs`
-- `crates/fluent-code-tui/src/lib.rs`
-- `crates/fluent-code-tui/src/view.rs`
-- `crates/fluent-code-tui/src/conversation.rs`
-- `crates/fluent-code-tui/src/markdown_render.rs`
-- `crates/fluent-code-provider/src/rig.rs`
-
-## 6. Code style guidelines
-
-### Imports and formatting
-- Keep imports explicit.
-- Group standard library, then third-party crates, then local crate imports.
-- Let `rustfmt` reorder imports if it wants to.
-- Use `cargo fmt --all`; do not hand-format against `rustfmt`.
-
-### Naming
-- Types / enums / traits: `PascalCase`
-- Functions / modules / files / tests: `snake_case`
-- Constants: `SCREAMING_SNAKE_CASE`
-- Prefer behavior-oriented test names.
-- Use descriptive variable names.
-
-### Types and modeling
-- Prefer concrete enums for state and lifecycle modeling.
-- Follow the existing reducer/message/effect structure.
-- Preserve domain models like `Msg`, `Effect`, `Session`, `Turn`, `RunRecord`, `RunStatus`, `ProviderMessage`, and `ProviderToolCall`.
-- Avoid stringly-typed state when an enum or struct fits.
-
-### Error handling
-- Use crate-local `Result<T>` aliases and `thiserror` enums.
-- Propagate errors with `?`.
-- Use `map_err` when translating errors across subsystem boundaries.
-- Avoid panics in production logic.
-- `expect(...)` is acceptable in tests and tight invariants, but keep messages specific.
-
-### Control flow and boundaries
-- Prefer early returns for invalid, stale, or no-op paths.
-- Use `match` / `if let` to keep transitions explicit.
-- Keep the code clippy-clean without suppressing lints.
-- Preserve the split: app reducer mutates state, runtime performs async work, provider streams model output, TUI drains messages and renders.
-- Do not call providers directly from the reducer.
-- Do not bypass runtime task tracking or cancellation.
-
-## 7. Architecture-specific guidance
-
-- Keep `src/main.rs` thin.
-- Keep `fluent-code-provider` independent from app-owned business rules.
-- Keep `fluent-code-app` as the home of operational invariants.
-- Keep `fluent-code-tui` focused on presentation and local UI state.
-- When touching cross-crate APIs, update all dependent crates in the same pass.
-
-## 8. Current behavior to preserve
-
-- Streaming assistant output arrives incrementally.
-- Cancellation is enforced by both task abort and stale-message gating.
-- Checkpoint persistence is throttled, not save-on-every-chunk.
-- A multi-tool assistant turn should only resume after the full batch is terminal.
-- Missing-file `read` failures are recoverable tool results, not immediate run killers.
-- Markdown turn rendering is parser-driven via `pulldown-cmark`.
-- Streaming markdown commits only stable lines for the active assistant turn.
-- Committed fenced code blocks are syntax-highlighted; incomplete or unsupported fences fall back to plain indented code.
-- The TUI has compact/expanded detail modes, local help/detail overlay state, and local transcript scroll state.
-
-## 9. Suggested validation sequence
-
-For single-crate changes:
+Single-crate work:
 1. `cargo fmt --all`
 2. `cargo test -p <affected-crate>`
 3. `cargo clippy -p <affected-crate> --all-targets -- -D warnings`
 
-For broader or cross-crate work:
+Cross-crate work:
 1. `cargo fmt --all -- --check`
 2. `cargo check --workspace`
 3. `cargo test --workspace`
 4. `cargo clippy --workspace --all-targets -- -D warnings`
 
-## 10. Practical guidance for coding agents
+## Tests
 
-- Read crate boundaries before editing imports or moving logic.
-- Prefer small, behavior-preserving changes unless the user asks for a redesign.
-- Add tests when touching reducer logic, replay behavior, tool execution, provider mapping, markdown rendering, or TUI event handling.
-- If you introduce a new invariant, put it in `fluent-code-app`, not the root crate.
-- If you add TUI-only state, keep it in `fluent-code-tui` and do not persist it unless explicitly required.
-- Keep this file current when workspace structure, commands, or major interaction patterns change.
+- Tests are mostly inline `#[cfg(test)]` modules inside source files
+- No top-level `tests/` directory
+- Async tests use `#[tokio::test]`; sync tests use `#[test]`
+- Prefer colocated tests unless explicitly asked for integration-test structure
+
+Common test-heavy files:
+- `crates/fluent-code-app/src/app/update.rs`
+- `crates/fluent-code-app/src/runtime/orchestrator.rs`
+- `crates/fluent-code-app/src/session/store.rs`
+- `crates/fluent-code-app/src/tool.rs`
+- `crates/fluent-code-app/src/plugin/mod.rs`
+- `crates/fluent-code-tui/src/lib.rs`
+- `crates/fluent-code-tui/src/view.rs`
+- `crates/fluent-code-tui/src/conversation.rs`
+- `crates/fluent-code-provider/src/rig.rs`
+
+## Code style
+
+### Imports / formatting
+- Keep imports explicit
+- Group standard library, then third-party crates, then local crate imports
+- Let `rustfmt` handle ordering and wrapping
+- Do not hand-format against `rustfmt`
+
+### Naming
+- Types / enums / traits: `PascalCase`
+- Functions / modules / files / tests: `snake_case`
+- Constants: `SCREAMING_SNAKE_CASE`
+- Prefer descriptive behavior-oriented test names
+
+### Types / modeling
+- Prefer enums and structs over stringly-typed state
+- Follow the reducer/message/effect model used in `fluent-code-app`
+- Preserve core types like `Msg`, `Effect`, `Session`, `Turn`, `RunStatus`, `ProviderMessage`, and `ProviderToolCall`
+- Encode new invariants in types or explicit transitions when possible
+
+### Error handling / control flow
+- Use crate-local `Result<T>` aliases and `thiserror` enums
+- Propagate with `?`
+- Translate errors at subsystem boundaries with `map_err` or `From`
+- Avoid panics in production logic
+- `expect(...)` is fine in tests or tight invariants if the message is specific
+- Prefer early returns for invalid, stale, or no-op paths
+- Keep transitions explicit with `match`, `if let`, and narrow helpers
+- Keep code clippy-clean without suppressing lints
+
+## Architecture rules
+
+- Keep async work in `runtime/`, not inside the reducer
+- Keep provider streaming logic in `fluent-code-provider`
+- Keep presentation and local-only UI state in `fluent-code-tui`
+- Keep durable state, approval logic, replay logic, and session semantics in `fluent-code-app`
+- When changing cross-crate APIs, update all dependent crates in the same pass
+
+## Behavior to preserve
+
+- Assistant output streams incrementally
+- Runtime cancellation uses task abort plus stale-message gating
+- Session checkpointing is throttled, not save-on-every-chunk
+- Multi-tool batches resume only when the full batch is terminal
+- Missing-file `read` failures are recoverable tool results, not immediate run killers
+- TUI keeps compact/expanded detail modes and explicit transcript scroll/follow-tail state
+- Plugin load metadata and warnings are captured at startup and surfaced in the TUI
+- Plugin-backed tool calls record provenance in `ToolSource::Plugin`
+
+## Plugin / TUI / provider specifics
+
+- Plugin subsystem: `crates/fluent-code-app/src/plugin/`
+- Startup loads plugins in `src/main.rs` via `load_tool_registry(&config)`
+- Discovery scans project/global plugin roots for subdirectories containing `plugin.toml`
+- Invalid plugins are disabled with warnings instead of crashing startup
+- Current host only accepts zero-capability plugins: `filesystem = "none"`, `network = false`, `process = false`, `environment = []`
+- Sidebar overview and operations panel are the home for operational metadata
+- Compact vs expanded UI behavior is a real product pattern; preserve it
+- Inline tool/provenance rendering belongs in conversation/view helpers, not app state
+- If UI wording changes, update related view tests in the same pass
+- In `crates/fluent-code-provider/src/rig.rs`, validate provider-emitted tool call IDs before passing events downstream
+
+## Practical guidance
+
+- Read crate boundaries before moving logic or changing imports
+- Prefer small, behavior-preserving changes unless the user asked for redesign
+- Add tests when touching reducer logic, runtime behavior, plugin loading, markdown rendering, or TUI interaction
+- Do not bypass runtime task tracking or cancellation machinery
+- Do not put UI-only state into persisted session data unless explicitly required
+- Do not introduce new rule files unless the user asks
+- Keep this file current when commands, workspace structure, or major subsystem behavior changes

@@ -2,11 +2,13 @@ use fluent_code_app::{
     config::Config,
     error::Result,
     logging::{config_source_for_log, init_logging, path_for_log},
+    plugin::load_tool_registry,
     runtime::Runtime,
     session::store::FsSessionStore,
 };
 use fluent_code_provider::ProviderClient;
 use fluent_code_tui as tui;
+use std::sync::Arc;
 use tracing::info;
 
 #[tokio::main]
@@ -36,7 +38,16 @@ async fn main() -> Result<()> {
         config.model.reasoning_effort.clone(),
         config.selected_provider_config().cloned(),
     )?;
-    let runtime = Runtime::new(provider);
+    let loaded_tool_registry = load_tool_registry(&config)?;
+    let tool_registry = Arc::new(loaded_tool_registry.tool_registry);
+    let runtime = Runtime::new_with_tool_registry(provider, Arc::clone(&tool_registry));
 
-    tui::run_app(session, store, runtime).await
+    tui::run_app(
+        session,
+        store,
+        runtime,
+        tool_registry,
+        loaded_tool_registry.plugin_load_snapshot,
+    )
+    .await
 }

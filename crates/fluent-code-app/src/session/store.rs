@@ -267,7 +267,8 @@ mod tests {
 
     use super::{FsSessionStore, SessionStore};
     use crate::session::model::{
-        Role, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, Turn,
+        Role, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, ToolSource,
+        Turn,
     };
 
     #[test]
@@ -378,6 +379,7 @@ mod tests {
             run_id: Uuid::new_v4(),
             tool_call_id: "call-1".to_string(),
             tool_name: "uppercase_text".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: serde_json::json!({ "text": "hello" }),
             preceding_turn_id: None,
             approval_state: ToolApprovalState::Approved,

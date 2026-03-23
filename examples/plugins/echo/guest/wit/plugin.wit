@@ -1,0 +1,5 @@
+package fluent-code:tool-plugin@0.1.0;
+
+world plugin {
+  export invoke: func(tool-name: string, input-json: string) -> result<string, string>;
+}

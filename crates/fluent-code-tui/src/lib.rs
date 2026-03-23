@@ -8,19 +8,27 @@ pub mod view;
 
 use fluent_code_app::app::{AppState, Effect, update};
 use fluent_code_app::error::Result;
+use fluent_code_app::plugin::{PluginLoadSnapshot, ToolRegistry};
 use fluent_code_app::runtime::Runtime;
 use fluent_code_app::session::model::Session;
 use fluent_code_app::session::store::{FsSessionStore, SessionStore};
 use ratatui::layout::Rect;
+use std::sync::Arc;
 use tracing::{debug, info};
 
 use crate::events::TuiAction;
 use crate::ui_state::UiState;
 
-pub async fn run_app(session: Session, store: FsSessionStore, runtime: Runtime) -> Result<()> {
+pub async fn run_app(
+    session: Session,
+    store: FsSessionStore,
+    runtime: Runtime,
+    tool_registry: Arc<ToolRegistry>,
+    plugin_load_snapshot: PluginLoadSnapshot,
+) -> Result<()> {
     info!(session_id = %session.id, "starting tui application");
     let mut terminal = terminal::init()?;
-    let mut state = AppState::new(session);
+    let mut state = AppState::new_with_plugin_state(session, tool_registry, plugin_load_snapshot);
     let mut ui_state = UiState::default();
     let (runtime_sender, mut runtime_receiver) = tokio::sync::mpsc::unbounded_channel();
 
@@ -768,6 +776,72 @@ mod tests {
         );
 
         cleanup(store_root(&store));
+    }
+
+    #[tokio::test]
+    async fn new_session_preserves_plugin_snapshot() {
+        let _guard = test_lock().lock().await;
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+        let initial_session = store.create_new_session().expect("create initial session");
+
+        let plugin_snapshot = fluent_code_app::plugin::PluginLoadSnapshot {
+            accepted_plugins: vec![fluent_code_app::plugin::LoadedPluginMetadata {
+                name: "Docs Plugin".to_string(),
+                id: "docs.plugin".to_string(),
+                version: "0.2.0".to_string(),
+                scope: fluent_code_app::plugin::DiscoveryScope::Global,
+                description: Some("Indexes documentation.".to_string()),
+                tool_names: vec!["docs_search".to_string()],
+                tool_count: 1,
+            }],
+            warnings: vec!["plugin validation warning".to_string()],
+        };
+
+        let mut state = AppState::new_with_plugin_state(
+            initial_session,
+            std::sync::Arc::new(fluent_code_app::plugin::ToolRegistry::built_in()),
+            plugin_snapshot.clone(),
+        );
+        state.draft_input = "stale draft".to_string();
+        state.status = fluent_code_app::app::AppStatus::Error("old error".to_string());
+
+        let runtime = Runtime::new(ProviderClient::Mock(MockProvider::new(None)));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ui_state = UiState::default();
+
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx,
+            Msg::NewSession,
+        )
+        .await
+        .expect("create new session from tui");
+
+        assert_eq!(state.session.title, "New Session");
+        assert!(state.session.turns.is_empty());
+        assert!(state.session.runs.is_empty());
+        assert!(state.session.tool_invocations.is_empty());
+        assert!(state.draft_input.is_empty());
+        assert!(matches!(
+            state.status,
+            fluent_code_app::app::AppStatus::Idle
+        ));
+        assert!(state.active_run_id.is_none());
+        assert!(state.pending_resume_request.is_none());
+        assert!(ui_state.transcript_follow_tail);
+        assert_eq!(ui_state.transcript_scroll_top, 0);
+        assert_eq!(state.plugin_load_snapshot, plugin_snapshot);
+
+        let latest = store
+            .load_or_create_latest()
+            .expect("load latest created session");
+        assert_eq!(latest.id, state.session.id);
+
+        cleanup(root);
     }
 
     fn unique_test_dir() -> PathBuf {

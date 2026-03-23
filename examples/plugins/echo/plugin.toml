@@ -1,0 +1,38 @@
+[plugin]
+manifest_version = 1
+id = "example.echo"
+name = "Echo Plugin"
+version = "0.1.0"
+api_version = "0.1.0"
+description = "A sample tool plugin that echoes text"
+license = "MIT"
+homepage = "https://example.invalid/echo-plugin"
+
+[component]
+path = "dist/plugin.wasm"
+
+[runtime]
+abi = "wasm-component"
+wit_world = "plugin"
+wasi = "p2"
+
+[capabilities]
+filesystem = "none"
+network = false
+process = false
+environment = []
+
+[[tools]]
+name = "plugin_echo"
+description = "Echo text back to the caller"
+input_schema = { type = "object", properties = { text = { type = "string", description = "Text to echo" } }, required = ["text"], additionalProperties = false }
+enabled = true
+requires_approval = true
+timeout_ms = 30000
+max_output_bytes = 65536
+
+[tools.capabilities]
+filesystem = "none"
+network = false
+process = false
+environment = []

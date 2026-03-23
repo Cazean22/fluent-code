@@ -21,7 +21,16 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub logging: LoggingConfig,
     pub model: ModelConfig,
+    pub plugins: PluginConfig,
     pub model_providers: HashMap<String, ProviderConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginConfig {
+    pub enable_project_plugins: bool,
+    pub enable_global_plugins: bool,
+    pub project_dir: PathBuf,
+    pub global_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +101,12 @@ impl Config {
             config.logging = LoggingConfig::default_with_data_dir(&config.data_dir);
         }
 
+        if let Some(plugins) = raw.plugins {
+            config.plugins = PluginConfig::from_raw(plugins, current_dir, &config.data_dir);
+        } else {
+            config.plugins = PluginConfig::default_with_paths(current_dir, &config.data_dir);
+        }
+
         if let Some(provider) = raw.model_provider {
             config.model.provider = provider;
         }
@@ -126,6 +141,7 @@ impl Config {
                 reasoning_effort: None,
                 system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             },
+            plugins: PluginConfig::default_with_paths(base_dir, &base_dir.join(".fluent-code")),
             model_providers: HashMap::new(),
         }
     }
@@ -135,6 +151,7 @@ impl Config {
 struct RawConfig {
     data_dir: Option<PathBuf>,
     logging: Option<RawLoggingConfig>,
+    plugins: Option<RawPluginConfig>,
     model_provider: Option<String>,
     model: Option<String>,
     model_reasoning_effort: Option<String>,
@@ -160,6 +177,14 @@ struct RawLoggingFileConfig {
 struct RawLoggingStderrConfig {
     enabled: Option<bool>,
     level: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawPluginConfig {
+    enable_project_plugins: Option<bool>,
+    enable_global_plugins: Option<bool>,
+    project_dir: Option<PathBuf>,
+    global_dir: Option<PathBuf>,
 }
 
 impl LoggingConfig {
@@ -196,6 +221,38 @@ impl LoggingConfig {
                 enabled: stderr.enabled.unwrap_or(default.stderr.enabled),
                 level: stderr.level.unwrap_or(default.stderr.level),
             },
+        }
+    }
+}
+
+impl PluginConfig {
+    fn default_with_paths(current_dir: &Path, data_dir: &Path) -> Self {
+        Self {
+            enable_project_plugins: true,
+            enable_global_plugins: true,
+            project_dir: current_dir.join(".fluent-code").join("plugins"),
+            global_dir: data_dir.join("plugins"),
+        }
+    }
+
+    fn from_raw(raw: RawPluginConfig, current_dir: &Path, data_dir: &Path) -> Self {
+        let default = Self::default_with_paths(current_dir, data_dir);
+
+        Self {
+            enable_project_plugins: raw
+                .enable_project_plugins
+                .unwrap_or(default.enable_project_plugins),
+            enable_global_plugins: raw
+                .enable_global_plugins
+                .unwrap_or(default.enable_global_plugins),
+            project_dir: raw
+                .project_dir
+                .map(|path| resolve_path(current_dir, path))
+                .unwrap_or(default.project_dir),
+            global_dir: raw
+                .global_dir
+                .map(|path| resolve_path(data_dir, path))
+                .unwrap_or(default.global_dir),
         }
     }
 }
@@ -246,6 +303,14 @@ api_key_envs = ["OPENAI_API_KEY", "OPENAI_FALLBACK_KEY"]
                 "/tmp/fluent-code-config/.fluent-code-data"
             ))
         );
+        assert_eq!(
+            config.plugins.project_dir,
+            Path::new("/tmp/fluent-code-config/.fluent-code/plugins")
+        );
+        assert_eq!(
+            config.plugins.global_dir,
+            Path::new("/tmp/fluent-code-config/.fluent-code-data/plugins")
+        );
         assert_eq!(config.model.provider, "openai");
         assert_eq!(config.model.model, "gpt-5.4");
         assert_eq!(config.model.reasoning_effort.as_deref(), Some("medium"));
@@ -278,6 +343,16 @@ api_key_envs = ["OPENAI_API_KEY", "OPENAI_FALLBACK_KEY"]
         assert_eq!(
             config.logging,
             LoggingConfig::default_with_data_dir(Path::new("/tmp/fluent-code-config/.fluent-code"))
+        );
+        assert!(config.plugins.enable_project_plugins);
+        assert!(config.plugins.enable_global_plugins);
+        assert_eq!(
+            config.plugins.project_dir,
+            Path::new("/tmp/fluent-code-config/.fluent-code/plugins")
+        );
+        assert_eq!(
+            config.plugins.global_dir,
+            Path::new("/tmp/fluent-code-config/.fluent-code/plugins")
         );
         assert_eq!(
             config.model.system_prompt,
@@ -333,6 +408,34 @@ path = "/var/tmp/fluent-code.log"
         assert_eq!(
             config.logging.file.path,
             Path::new("/var/tmp/fluent-code.log")
+        );
+    }
+
+    #[test]
+    fn parses_plugin_config_and_resolves_relative_paths() {
+        let config = Config::from_toml_str(
+            r#"
+data_dir = ".runtime"
+
+[plugins]
+enable_project_plugins = false
+enable_global_plugins = true
+project_dir = ".custom-project-plugins"
+global_dir = "plugin-cache"
+"#,
+            Path::new("/tmp/fluent-code-config"),
+        )
+        .expect("parse plugin config");
+
+        assert!(!config.plugins.enable_project_plugins);
+        assert!(config.plugins.enable_global_plugins);
+        assert_eq!(
+            config.plugins.project_dir,
+            Path::new("/tmp/fluent-code-config/.custom-project-plugins")
+        );
+        assert_eq!(
+            config.plugins.global_dir,
+            Path::new("/tmp/fluent-code-config/.runtime/plugin-cache")
         );
     }
 }

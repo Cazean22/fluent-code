@@ -154,7 +154,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, state: &AppState, ui_state: 
 fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, ui_state: &UiState) {
     let sidebar = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(1)])
+        .constraints([Constraint::Length(9), Constraint::Min(1)])
         .split(area);
 
     let summary = Paragraph::new(Text::from(vec![
@@ -176,6 +176,29 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, ui_state: &Ui
                 TUI_THEME.text_muted,
             ),
         ]),
+        Line::from(vec![
+            Span::styled("plugins ", TUI_THEME.label),
+            Span::styled(
+                state.plugin_load_snapshot.plugin_count().to_string(),
+                TUI_THEME.info,
+            ),
+            Span::styled("  warnings ", TUI_THEME.label),
+            Span::styled(
+                state.plugin_load_snapshot.warning_count().to_string(),
+                if state.plugin_load_snapshot.warning_count() == 0 {
+                    TUI_THEME.text
+                } else {
+                    TUI_THEME.warning
+                },
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("loaded ", TUI_THEME.label),
+            Span::styled(
+                summarize_plugin_names(&state.plugin_load_snapshot),
+                TUI_THEME.text_muted,
+            ),
+        ]),
     ]))
     .block(
         Block::default()
@@ -193,9 +216,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, ui_state: &Ui
                 .border_style(TUI_THEME.panel_border)
                 .title(Span::styled(
                     if ui_state.show_tool_details {
-                        " tool activity · expanded "
+                        " operations · expanded "
                     } else {
-                        " tool activity · compact "
+                        " operations · compact "
                     },
                     TUI_THEME.title,
                 )),
@@ -275,17 +298,6 @@ fn render_row(row: &ConversationRow, show_tool_details: bool) -> Vec<Line<'stati
 }
 
 fn sidebar_tool_lines(state: &AppState, show_tool_details: bool) -> Vec<Line<'static>> {
-    if state.session.tool_invocations.is_empty() {
-        return vec![
-            Line::styled("No tool activity yet.", TUI_THEME.text_muted),
-            Line::default(),
-            Line::styled(
-                "Inline tool activity now appears in the main transcript. This panel stays as a compact overview.",
-                TUI_THEME.text_muted,
-            ),
-        ];
-    }
-
     let pending_count = state
         .session
         .tool_invocations
@@ -317,7 +329,13 @@ fn sidebar_tool_lines(state: &AppState, show_tool_details: bool) -> Vec<Line<'st
         })
         .count();
 
-    let mut lines = vec![
+    let mut lines = sidebar_plugin_lines(state, show_tool_details);
+
+    if !lines.is_empty() {
+        lines.push(Line::default());
+    }
+
+    lines.extend(vec![
         Line::from(vec![
             Span::styled("pending ", TUI_THEME.label),
             Span::styled(pending_count.to_string(), TUI_THEME.warning),
@@ -335,7 +353,17 @@ fn sidebar_tool_lines(state: &AppState, show_tool_details: bool) -> Vec<Line<'st
             Span::styled(failed_count.to_string(), TUI_THEME.error),
         ]),
         Line::default(),
-    ];
+    ]);
+
+    if state.session.tool_invocations.is_empty() {
+        lines.push(Line::styled("No tool activity yet.", TUI_THEME.text_muted));
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "Inline tool activity now appears in the main transcript. This panel stays as an operations overview.",
+            TUI_THEME.text_muted,
+        ));
+        return lines;
+    }
 
     if let Some(latest) = state
         .session
@@ -386,6 +414,127 @@ fn sidebar_tool_lines(state: &AppState, show_tool_details: bool) -> Vec<Line<'st
     }
 
     lines
+}
+
+fn sidebar_plugin_lines(state: &AppState, show_tool_details: bool) -> Vec<Line<'static>> {
+    let snapshot = &state.plugin_load_snapshot;
+    let mut lines = vec![Line::from(vec![
+        Span::styled("plugins ", TUI_THEME.label),
+        Span::styled(snapshot.plugin_count().to_string(), TUI_THEME.info),
+        Span::styled("  warnings ", TUI_THEME.label),
+        Span::styled(
+            snapshot.warning_count().to_string(),
+            if snapshot.warning_count() == 0 {
+                TUI_THEME.text
+            } else {
+                TUI_THEME.warning
+            },
+        ),
+    ])];
+
+    if snapshot.accepted_plugins.is_empty() {
+        lines.push(Line::styled("No plugins loaded.", TUI_THEME.text_muted));
+    } else if show_tool_details {
+        for plugin in &snapshot.accepted_plugins {
+            lines.push(Line::from(vec![
+                Span::styled("plugin ", TUI_THEME.label),
+                Span::styled(plugin.name.clone(), TUI_THEME.operational_label),
+                Span::raw(" "),
+                Span::styled(format!("v{}", plugin.version), TUI_THEME.operational_text),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  scope ", TUI_THEME.text_muted),
+                Span::styled(format_discovery_scope(plugin.scope), TUI_THEME.text),
+                Span::styled("  id ", TUI_THEME.text_muted),
+                Span::styled(plugin.id.clone(), TUI_THEME.text_muted),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  tools ", TUI_THEME.text_muted),
+                Span::styled(
+                    format!("{} ({})", plugin.tool_names.join(", "), plugin.tool_count()),
+                    TUI_THEME.operational_text,
+                ),
+            ]));
+
+            if let Some(description) = &plugin.description {
+                lines.extend(format_preview_lines(
+                    "  · ",
+                    Some("about "),
+                    description,
+                    TUI_THEME.text_muted,
+                    TUI_THEME.text_muted,
+                    2,
+                ));
+            }
+        }
+    } else {
+        for plugin in &snapshot.accepted_plugins {
+            lines.push(Line::from(vec![
+                Span::styled("• ", TUI_THEME.operational_prefix),
+                Span::styled(plugin.name.clone(), TUI_THEME.operational_label),
+                Span::raw(" "),
+                Span::styled(
+                    format!(
+                        "{} tool{}",
+                        plugin.tool_count(),
+                        if plugin.tool_count() == 1 { "" } else { "s" }
+                    ),
+                    TUI_THEME.text_muted,
+                ),
+            ]));
+        }
+    }
+
+    if snapshot.warnings.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("warnings ", TUI_THEME.label),
+            Span::styled("none", TUI_THEME.text_muted),
+        ]));
+    } else if show_tool_details {
+        lines.push(Line::from(vec![
+            Span::styled("warnings ", TUI_THEME.label),
+            Span::styled(snapshot.warning_count().to_string(), TUI_THEME.warning),
+        ]));
+        for warning in &snapshot.warnings {
+            lines.extend(format_preview_lines(
+                "! ",
+                None,
+                warning,
+                TUI_THEME.warning,
+                TUI_THEME.warning,
+                2,
+            ));
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("warning ", TUI_THEME.label),
+            Span::styled(summarize_text(&snapshot.warnings[0]), TUI_THEME.warning),
+        ]));
+    }
+
+    lines
+}
+
+fn summarize_plugin_names(snapshot: &fluent_code_app::plugin::PluginLoadSnapshot) -> String {
+    if snapshot.accepted_plugins.is_empty() {
+        return "none".to_string();
+    }
+
+    summarize_text(
+        &snapshot
+            .accepted_plugins
+            .iter()
+            .map(|plugin| plugin.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+fn format_discovery_scope(scope: fluent_code_app::plugin::DiscoveryScope) -> &'static str {
+    match scope {
+        fluent_code_app::plugin::DiscoveryScope::Global => "global",
+        fluent_code_app::plugin::DiscoveryScope::Project => "project",
+    }
 }
 
 fn render_turn_row(turn: &TurnRow) -> Vec<Line<'static>> {
@@ -454,10 +603,20 @@ fn render_turn_row(turn: &TurnRow) -> Vec<Line<'static>> {
 fn render_tool_row(tool: &ToolRow, show_tool_details: bool) -> Vec<Line<'static>> {
     let (approval_label, approval_style) = approval_badge(tool.approval_state);
     let (execution_label, execution_style) = execution_badge(tool.execution_state);
+    let provenance = if show_tool_details {
+        tool.provenance_expanded.as_ref()
+    } else {
+        tool.provenance_compact.as_ref()
+    };
 
     let mut lines = vec![Line::from(vec![
         Span::styled(INLINE_TOOL_PREFIX, TUI_THEME.operational_prefix),
         Span::styled(tool.tool_name.clone(), TUI_THEME.operational_label),
+        if let Some(provenance) = provenance {
+            Span::styled(format!(" · {provenance}"), TUI_THEME.tool_accent)
+        } else {
+            Span::raw(String::new())
+        },
         Span::raw(" "),
         Span::styled("· ", TUI_THEME.operational_prefix),
         Span::styled(approval_label.to_string(), approval_style),
@@ -544,10 +703,20 @@ fn render_tool_group_row(group: &ToolGroupRow, show_tool_details: bool) -> Vec<L
     for item in &group.items {
         let (approval_label, _) = approval_badge(item.approval_state);
         let (execution_label, _) = execution_badge(item.execution_state);
+        let provenance = if show_tool_details {
+            item.provenance_expanded.as_ref()
+        } else {
+            item.provenance_compact.as_ref()
+        };
 
         lines.push(Line::from(vec![
             Span::styled(GROUP_ITEM_PREFIX, TUI_THEME.operational_prefix),
             Span::styled(item.summary.clone(), TUI_THEME.operational_text),
+            if let Some(provenance) = provenance {
+                Span::styled(format!(" · {provenance}"), TUI_THEME.tool_accent)
+            } else {
+                Span::raw(String::new())
+            },
             Span::raw(" "),
             Span::styled("· ", TUI_THEME.operational_prefix),
             Span::styled(approval_label.to_string(), TUI_THEME.text_muted),
@@ -1023,8 +1192,10 @@ mod tests {
         transcript_max_scroll,
     };
     use fluent_code_app::app::AppState;
+    use fluent_code_app::plugin::{DiscoveryScope, LoadedPluginMetadata, PluginLoadSnapshot};
     use fluent_code_app::session::model::{
-        Role, RunStatus, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, Turn,
+        Role, RunStatus, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
+        ToolSource, Turn,
     };
 
     #[test]
@@ -1113,6 +1284,7 @@ mod tests {
             run_id,
             tool_call_id: "call-1".to_string(),
             tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"path": "crates/fluent-code-app/src/session/store.rs"}),
             preceding_turn_id: Some(turn.id),
             approval_state: ToolApprovalState::Pending,
@@ -1143,6 +1315,7 @@ mod tests {
             run_id,
             tool_call_id: "call-pending".to_string(),
             tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"path": "README.md"}),
             preceding_turn_id: None,
             approval_state: ToolApprovalState::Pending,
@@ -1158,6 +1331,7 @@ mod tests {
             run_id,
             tool_call_id: "call-running".to_string(),
             tool_name: "search".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"query": "PersistSession"}),
             preceding_turn_id: None,
             approval_state: ToolApprovalState::Approved,
@@ -1194,7 +1368,46 @@ mod tests {
 
         assert!(text.contains("No tool activity yet."));
         assert!(text.contains("main transcript"));
-        assert!(text.contains("compact overview"));
+        assert!(text.contains("operations overview"));
+    }
+
+    #[test]
+    fn sidebar_tool_lines_compact_mode_shows_plugin_and_warning_summary() {
+        let mut state = AppState::new(Session::new("plugin sidebar compact"));
+        state.plugin_load_snapshot = sample_plugin_load_snapshot();
+
+        let text = sidebar_tool_lines(&state, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("plugins 2  warnings 2"));
+        assert!(text.contains("Docs Plugin 2 tools"));
+        assert!(text.contains("Formatter 1 tool"));
+        assert!(text.contains("warning failed to parse plugin manifest"));
+    }
+
+    #[test]
+    fn sidebar_tool_lines_expanded_mode_shows_plugin_metadata_and_warning_lines() {
+        let mut state = AppState::new(Session::new("plugin sidebar expanded"));
+        state.plugin_load_snapshot = sample_plugin_load_snapshot();
+
+        let text = sidebar_tool_lines(&state, true)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("plugin Docs Plugin v0.2.0"));
+        assert!(text.contains("scope global  id global.docs"));
+        assert!(text.contains("tools docs_search, docs_read (2)"));
+        assert!(text.contains("about Indexes docs for the workspace."));
+        assert!(text.contains("plugin Formatter v1.4.1"));
+        assert!(text.contains("scope project  id project.fmt"));
+        assert!(text.contains("warnings 2"));
+        assert!(text.contains("failed to parse plugin manifest"));
+        assert!(text.contains("disabled during registry validation"));
     }
 
     #[test]
@@ -1215,6 +1428,7 @@ mod tests {
             run_id,
             tool_call_id: "call-1".to_string(),
             tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"path": "src/main.rs"}),
             preceding_turn_id: Some(turn.id),
             approval_state: ToolApprovalState::Approved,
@@ -1230,6 +1444,7 @@ mod tests {
             run_id,
             tool_call_id: "call-2".to_string(),
             tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"path": "src/lib.rs"}),
             preceding_turn_id: Some(turn.id),
             approval_state: ToolApprovalState::Approved,
@@ -1271,6 +1486,7 @@ mod tests {
             run_id,
             tool_call_id: "call-approval".to_string(),
             tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"path": "src/main.rs"}),
             preceding_turn_id: Some(turn.id),
             approval_state: ToolApprovalState::Pending,
@@ -1461,6 +1677,7 @@ mod tests {
             run_id,
             tool_call_id: "call-preview".to_string(),
             tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"path": "src/main.rs"}),
             preceding_turn_id: Some(turn.id),
             approval_state: ToolApprovalState::Approved,
@@ -1500,6 +1717,7 @@ mod tests {
             run_id,
             tool_call_id: "call-success".to_string(),
             tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"path": "src/main.rs"}),
             preceding_turn_id: Some(turn.id),
             approval_state: ToolApprovalState::Approved,
@@ -1542,6 +1760,7 @@ mod tests {
             run_id,
             tool_call_id: "call-success-expanded".to_string(),
             tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"path": "src/main.rs"}),
             preceding_turn_id: Some(turn.id),
             approval_state: ToolApprovalState::Approved,
@@ -1587,6 +1806,7 @@ mod tests {
                 run_id,
                 tool_call_id: call_id.to_string(),
                 tool_name: "read".to_string(),
+                tool_source: ToolSource::BuiltIn,
                 arguments: json!({"path": path}),
                 preceding_turn_id: Some(turn.id),
                 approval_state: ToolApprovalState::Approved,
@@ -1630,6 +1850,7 @@ mod tests {
             run_id,
             tool_call_id: "call-1".to_string(),
             tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"path": "src/main.rs"}),
             preceding_turn_id: Some(turn.id),
             approval_state: ToolApprovalState::Approved,
@@ -1645,6 +1866,7 @@ mod tests {
             run_id,
             tool_call_id: "call-2".to_string(),
             tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"path": "src/lib.rs"}),
             preceding_turn_id: Some(turn.id),
             approval_state: ToolApprovalState::Approved,
@@ -1685,6 +1907,7 @@ mod tests {
             run_id,
             tool_call_id: "call-1".to_string(),
             tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"path": "src/main.rs"}),
             preceding_turn_id: Some(turn.id),
             approval_state: ToolApprovalState::Pending,
@@ -1730,6 +1953,7 @@ mod tests {
             run_id,
             tool_call_id: "call-1".to_string(),
             tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"path": "src/main.rs"}),
             preceding_turn_id: Some(turn.id),
             approval_state: ToolApprovalState::Approved,
@@ -1745,6 +1969,7 @@ mod tests {
             run_id,
             tool_call_id: "call-2".to_string(),
             tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
             arguments: json!({"path": "src/lib.rs"}),
             preceding_turn_id: Some(turn.id),
             approval_state: ToolApprovalState::Approved,
@@ -1769,10 +1994,176 @@ mod tests {
         assert!(text.contains("  │     result alpha beta gamma delta"));
     }
 
+    #[test]
+    fn conversation_lines_compact_mode_shows_plugin_tool_provenance_briefly() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("plugin provenance compact");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Using project plugin tools.".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-plugin-compact".to_string(),
+            tool_name: "docs_search".to_string(),
+            tool_source: ToolSource::Plugin {
+                plugin_id: "global.docs".to_string(),
+                plugin_name: "Docs Plugin".to_string(),
+                plugin_version: "0.2.0".to_string(),
+                scope: DiscoveryScope::Global,
+            },
+            arguments: json!({"query": "AppState"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("found matches".to_string()),
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        });
+
+        let text = conversation_lines(&state_with_snapshot(session), false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("docs_search · plugin Docs Plugin · approved / completed"));
+        assert!(!text.contains("global.docs"));
+        assert!(!text.contains("v0.2.0"));
+    }
+
+    #[test]
+    fn conversation_lines_expanded_mode_shows_plugin_tool_provenance_details() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("plugin provenance expanded");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Using project plugin tools.".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-plugin-expanded".to_string(),
+            tool_name: "docs_search".to_string(),
+            tool_source: ToolSource::Plugin {
+                plugin_id: "project.docs".to_string(),
+                plugin_name: "Docs Plugin".to_string(),
+                plugin_version: "1.1.0".to_string(),
+                scope: DiscoveryScope::Project,
+            },
+            arguments: json!({"query": "AppState"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("found matches".to_string()),
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        });
+
+        let text = conversation_lines(&state_with_snapshot(session), true)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains(
+            "docs_search · plugin Docs Plugin v1.1.0 · project · project.docs · approved / completed"
+        ));
+    }
+
+    #[test]
+    fn conversation_lines_compact_mode_keeps_built_in_tools_quiet() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("built in quiet");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Using built in tools.".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-built-in".to_string(),
+            tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
+            arguments: json!({"path": "src/main.rs"}),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("ok".to_string()),
+            error: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+        });
+
+        let text = conversation_lines(&state_with_snapshot(session), false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!text.contains("via plugin"));
+    }
+
     fn line_text(line: &Line<'_>) -> String {
         line.spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
+    }
+
+    fn sample_plugin_load_snapshot() -> PluginLoadSnapshot {
+        PluginLoadSnapshot {
+            accepted_plugins: vec![
+                LoadedPluginMetadata {
+                    name: "Docs Plugin".to_string(),
+                    id: "global.docs".to_string(),
+                    version: "0.2.0".to_string(),
+                    scope: DiscoveryScope::Global,
+                    description: Some("Indexes docs for the workspace.".to_string()),
+                    tool_names: vec!["docs_search".to_string(), "docs_read".to_string()],
+                    tool_count: 2,
+                },
+                LoadedPluginMetadata {
+                    name: "Formatter".to_string(),
+                    id: "project.fmt".to_string(),
+                    version: "1.4.1".to_string(),
+                    scope: DiscoveryScope::Project,
+                    description: None,
+                    tool_names: vec!["format_diff".to_string()],
+                    tool_count: 1,
+                },
+            ],
+            warnings: vec![
+                "failed to parse plugin manifest '/tmp/broken/plugin.toml': invalid type".to_string(),
+                "plugin 'broken.docs' disabled during registry validation: reserved built-in tool name 'read'".to_string(),
+            ],
+        }
+    }
+
+    fn state_with_snapshot(session: Session) -> AppState {
+        let mut state = AppState::new(session);
+        state.plugin_load_snapshot = sample_plugin_load_snapshot();
+        state
     }
 }

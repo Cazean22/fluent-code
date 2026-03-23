@@ -23,6 +23,15 @@ pub fn built_in_tools() -> Vec<ProviderTool> {
     vec![uppercase_text_tool(), read_tool(), glob_tool(), grep_tool()]
 }
 
+pub fn built_in_tool_names() -> &'static [&'static str] {
+    &[
+        UPPERCASE_TEXT_TOOL_NAME,
+        READ_TOOL_NAME,
+        GLOB_TOOL_NAME,
+        GREP_TOOL_NAME,
+    ]
+}
+
 pub fn execute_built_in_tool(tool_call: &ProviderToolCall) -> Result<String> {
     let workspace_root = std::env::current_dir().map_err(FluentCodeError::Io)?;
 

@@ -6,19 +6,35 @@ use tracing::{Instrument, debug, info, info_span, warn};
 use uuid::Uuid;
 
 use crate::app::{Effect, Msg};
-use crate::tool::execute_built_in_tool;
+use crate::plugin::ToolRegistry;
+use crate::session::model::ToolInvocationId;
 
-#[derive(Debug, Clone)]
+#[derive(Default)]
+struct RunTasks {
+    assistant: Option<tokio::task::JoinHandle<()>>,
+    tools: HashMap<ToolInvocationId, tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Clone)]
 pub struct Runtime {
     provider: ProviderClient,
-    tasks: Arc<Mutex<HashMap<Uuid, tokio::task::JoinHandle<()>>>>,
+    tool_registry: Arc<ToolRegistry>,
+    tasks: Arc<Mutex<HashMap<Uuid, RunTasks>>>,
 }
 
 impl Runtime {
     pub fn new(provider: ProviderClient) -> Self {
+        Self::new_with_tool_registry(provider, Arc::new(ToolRegistry::built_in()))
+    }
+
+    pub fn new_with_tool_registry(
+        provider: ProviderClient,
+        tool_registry: Arc<ToolRegistry>,
+    ) -> Self {
         info!(component = "runtime", "runtime orchestrator created");
         Self {
             provider,
+            tool_registry,
             tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -39,14 +55,8 @@ impl Runtime {
             }
             Effect::CancelAssistant { run_id } => {
                 info!(run_id = %run_id, "cancel requested for assistant run");
-                if let Some(handle) = self
-                    .tasks
-                    .lock()
-                    .expect("runtime task registry lock")
-                    .remove(&run_id)
-                {
-                    handle.abort();
-                    info!(run_id = %run_id, "aborted assistant task");
+                if cancel_run_tasks(&self.tasks, run_id) {
+                    info!(run_id = %run_id, "aborted run tasks");
                 } else {
                     debug!(run_id = %run_id, "cancel requested for non-active run");
                 }
@@ -120,10 +130,7 @@ impl Runtime {
                             let _ = sender.send(message);
                         }
 
-                        tasks
-                            .lock()
-                            .expect("runtime task registry lock")
-                            .remove(&run_id);
+                        remove_assistant_task(&tasks, run_id);
                         debug!(
                             task_event = "removed_from_registry",
                             "assistant task removed from registry"
@@ -132,10 +139,7 @@ impl Runtime {
                     .instrument(assistant_span.or_current()),
                 );
 
-                self.tasks
-                    .lock()
-                    .expect("runtime task registry lock")
-                    .insert(run_id, handle);
+                insert_assistant_task(&self.tasks, run_id, handle);
                 debug!(run_id = %run_id, "assistant task inserted into registry");
             }
             Effect::ExecuteTool {
@@ -143,12 +147,13 @@ impl Runtime {
                 invocation_id,
                 tool_call,
             } => {
+                let tool_registry = Arc::clone(&self.tool_registry);
                 info!(
                     run_id = %run_id,
                     invocation_id = %invocation_id,
                     tool_name = %tool_call.name,
                     tool_call_id = %tool_call.id,
-                    "spawning built-in tool execution"
+                    "spawning tool execution"
                 );
                 let tool_execution_span = info_span!(
                     "tool_execution",
@@ -157,11 +162,47 @@ impl Runtime {
                     tool_name = %tool_call.name,
                     tool_call_id = %tool_call.id
                 );
-                tokio::spawn(
+                let tasks = Arc::clone(&self.tasks);
+                let plugin_registration = self
+                    .tool_registry
+                    .plugin_registration(&tool_call.name)
+                    .cloned();
+                let handle = tokio::spawn(
                     async move {
                         debug!(task_event = "started", "tool execution task started");
-                        let result =
-                            execute_built_in_tool(&tool_call).map_err(|error| error.to_string());
+                        let result = if let Some(registration) = plugin_registration {
+                            match tokio::time::timeout(
+                                tokio::time::Duration::from_millis(registration.timeout_ms),
+                                async {
+                                    tool_registry
+                                        .execute(&tool_call)
+                                        .map_err(|error| error.to_string())
+                                },
+                            )
+                            .await
+                            {
+                                Ok(Ok(output)) if output.len() <= registration.max_output_bytes => {
+                                    Ok(output)
+                                }
+                                Ok(Ok(_output)) => Err(format!(
+                                    "plugin '{}' tool '{}' exceeded max_output_bytes '{}'",
+                                    registration.plugin_id,
+                                    registration.tool_name,
+                                    registration.max_output_bytes
+                                )),
+                                Ok(Err(error)) => Err(error),
+                                Err(_) => Err(format!(
+                                    "plugin '{}' tool '{}' timed out after {}ms",
+                                    registration.plugin_id,
+                                    registration.tool_name,
+                                    registration.timeout_ms
+                                )),
+                            }
+                        } else {
+                            tool_registry
+                                .execute(&tool_call)
+                                .map_err(|error| error.to_string())
+                        };
                         match &result {
                             Ok(output) => {
                                 info!(output_bytes = output.len(), "tool execution completed")
@@ -173,12 +214,81 @@ impl Runtime {
                             invocation_id,
                             result,
                         });
+                        remove_tool_task(&tasks, run_id, invocation_id);
                     }
                     .instrument(tool_execution_span.or_current()),
                 );
+                insert_tool_task(&self.tasks, run_id, invocation_id, handle);
             }
         }
     }
+}
+
+fn insert_assistant_task(
+    tasks: &Arc<Mutex<HashMap<Uuid, RunTasks>>>,
+    run_id: Uuid,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let mut tasks = tasks.lock().expect("runtime task registry lock");
+    let entry = tasks.entry(run_id).or_default();
+    if let Some(existing) = entry.assistant.replace(handle) {
+        existing.abort();
+    }
+}
+
+fn insert_tool_task(
+    tasks: &Arc<Mutex<HashMap<Uuid, RunTasks>>>,
+    run_id: Uuid,
+    invocation_id: ToolInvocationId,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let mut tasks = tasks.lock().expect("runtime task registry lock");
+    let entry = tasks.entry(run_id).or_default();
+    if let Some(existing) = entry.tools.insert(invocation_id, handle) {
+        existing.abort();
+    }
+}
+
+fn remove_assistant_task(tasks: &Arc<Mutex<HashMap<Uuid, RunTasks>>>, run_id: Uuid) {
+    let mut tasks = tasks.lock().expect("runtime task registry lock");
+    if let Some(run_tasks) = tasks.get_mut(&run_id) {
+        run_tasks.assistant = None;
+        if run_tasks.tools.is_empty() {
+            tasks.remove(&run_id);
+        }
+    }
+}
+
+fn remove_tool_task(
+    tasks: &Arc<Mutex<HashMap<Uuid, RunTasks>>>,
+    run_id: Uuid,
+    invocation_id: ToolInvocationId,
+) {
+    let mut tasks = tasks.lock().expect("runtime task registry lock");
+    if let Some(run_tasks) = tasks.get_mut(&run_id) {
+        run_tasks.tools.remove(&invocation_id);
+        if run_tasks.assistant.is_none() && run_tasks.tools.is_empty() {
+            tasks.remove(&run_id);
+        }
+    }
+}
+
+fn cancel_run_tasks(tasks: &Arc<Mutex<HashMap<Uuid, RunTasks>>>, run_id: Uuid) -> bool {
+    let Some(mut run_tasks) = tasks
+        .lock()
+        .expect("runtime task registry lock")
+        .remove(&run_id)
+    else {
+        return false;
+    };
+
+    if let Some(handle) = run_tasks.assistant.take() {
+        handle.abort();
+    }
+    for (_, handle) in run_tasks.tools.drain() {
+        handle.abort();
+    }
+    true
 }
 
 #[cfg(test)]

@@ -9,6 +9,12 @@ level = "debug"
 enabled = true
 level = "warn"
 
+[plugins]
+enable_project_plugins = true
+enable_global_plugins = true
+project_dir = ".fluent-code/plugins"
+global_dir = ".fluent-code/plugins"
+
 model_provider = "openai"
 model = "gpt-5.4"
 model_reasoning_effort = "medium"

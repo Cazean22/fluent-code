@@ -2,6 +2,7 @@ pub mod app;
 pub mod config;
 pub mod error;
 pub mod logging;
+pub mod plugin;
 pub mod runtime;
 pub mod session;
 pub mod tool;

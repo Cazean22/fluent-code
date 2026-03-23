@@ -19,6 +19,9 @@ pub enum FluentCodeError {
     #[error("provider error: {0}")]
     Provider(String),
 
+    #[error("plugin error: {0}")]
+    Plugin(String),
+
     #[error("invalid session data: {0}")]
     Session(String),
 }
