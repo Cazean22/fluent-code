@@ -8,8 +8,8 @@ use ratatui::{
 };
 
 use crate::conversation::{
-    ConversationRow, RunMarkerKind, RunMarkerRow, ToolGroupKind, ToolGroupRow, ToolRow, TurnRow,
-    derive_conversation_rows,
+    ConversationRow, DelegatedTaskRow, RunMarkerKind, RunMarkerRow, ToolGroupKind, ToolGroupRow,
+    ToolRow, TurnRow, derive_conversation_rows,
 };
 use crate::markdown_render::{render_markdown_lines, render_streaming_markdown_lines};
 use crate::theme::TUI_THEME;
@@ -156,6 +156,11 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, ui_state: &Ui
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(9), Constraint::Min(1)])
         .split(area);
+    let overview_context = active_run_context(state);
+    let active_badge = overview_context
+        .active_run_label
+        .clone()
+        .unwrap_or_else(|| "none".to_string());
 
     let summary = Paragraph::new(Text::from(vec![
         Line::from(vec![
@@ -163,19 +168,25 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, ui_state: &Ui
             Span::styled(status_label(&state.status), status_style(&state.status)),
         ]),
         Line::from(vec![
+            Span::styled("focus ", TUI_THEME.label),
+            Span::styled(overview_context.focus_label, overview_context.focus_style),
+        ]),
+        Line::from(vec![
             Span::styled("last run ", TUI_THEME.label),
             Span::styled(run_status_label(state), TUI_THEME.text),
         ]),
         Line::from(vec![
             Span::styled("active ", TUI_THEME.label),
-            Span::styled(
-                state
-                    .active_run_id
-                    .map(|id| summarize_text(&id.to_string()))
-                    .unwrap_or_else(|| "none".to_string()),
-                TUI_THEME.text_muted,
-            ),
+            Span::styled(active_badge, overview_context.active_run_style),
         ]),
+        if let Some(task_label) = overview_context.task_label {
+            Line::from(vec![
+                Span::styled("task ", TUI_THEME.label),
+                Span::styled(task_label, TUI_THEME.operational_label),
+            ])
+        } else {
+            Line::default()
+        },
         Line::from(vec![
             Span::styled("plugins ", TUI_THEME.label),
             Span::styled(
@@ -328,6 +339,37 @@ fn sidebar_tool_lines(state: &AppState, show_tool_details: bool) -> Vec<Line<'st
                 || invocation.execution_state == ToolExecutionState::Failed
         })
         .count();
+    let delegated_invocations = state
+        .session
+        .tool_invocations
+        .iter()
+        .filter(|invocation| invocation.tool_name == "task" && invocation.child_run_id.is_some())
+        .count();
+    let delegated_running = state
+        .session
+        .tool_invocations
+        .iter()
+        .filter(|invocation| {
+            invocation.tool_name == "task"
+                && invocation.child_run_id.is_some()
+                && invocation.execution_state == ToolExecutionState::Running
+        })
+        .count();
+    let delegated_terminal = state
+        .session
+        .tool_invocations
+        .iter()
+        .filter(|invocation| {
+            invocation.tool_name == "task"
+                && invocation.child_run_id.is_some()
+                && matches!(
+                    invocation.execution_state,
+                    ToolExecutionState::Completed
+                        | ToolExecutionState::Failed
+                        | ToolExecutionState::Skipped
+                )
+        })
+        .count();
 
     let mut lines = sidebar_plugin_lines(state, show_tool_details);
 
@@ -351,6 +393,17 @@ fn sidebar_tool_lines(state: &AppState, show_tool_details: bool) -> Vec<Line<'st
         Line::from(vec![
             Span::styled("attention ", TUI_THEME.label),
             Span::styled(failed_count.to_string(), TUI_THEME.error),
+        ]),
+        Line::from(vec![
+            Span::styled("delegated ", TUI_THEME.label),
+            Span::styled(
+                delegated_invocations.to_string(),
+                TUI_THEME.operational_label,
+            ),
+            Span::styled("  running ", TUI_THEME.label),
+            Span::styled(delegated_running.to_string(), TUI_THEME.info),
+            Span::styled("  done ", TUI_THEME.label),
+            Span::styled(delegated_terminal.to_string(), TUI_THEME.success),
         ]),
         Line::default(),
     ]);
@@ -381,7 +434,7 @@ fn sidebar_tool_lines(state: &AppState, show_tool_details: bool) -> Vec<Line<'st
 
         lines.push(Line::from(vec![
             Span::styled("latest ", TUI_THEME.label),
-            Span::styled(latest.tool_name.clone(), TUI_THEME.tool_accent),
+            Span::styled(tool_summary_label(state, latest), TUI_THEME.tool_accent),
         ]));
         lines.push(Line::from(vec![
             Span::styled("status ", TUI_THEME.label),
@@ -390,6 +443,37 @@ fn sidebar_tool_lines(state: &AppState, show_tool_details: bool) -> Vec<Line<'st
                 TUI_THEME.text_muted,
             ),
         ]));
+
+        if let Some(delegated_task) = delegated_task_from_invocation(state, latest) {
+            if let Some(child_status) = delegated_task.child_run_status {
+                lines.push(Line::from(vec![
+                    Span::styled("child ", TUI_THEME.label),
+                    Span::styled(
+                        run_status_text(child_status),
+                        run_status_style(child_status),
+                    ),
+                ]));
+            }
+
+            if show_tool_details {
+                if let Some(prompt_preview) = delegated_task.prompt_preview {
+                    lines.push(Line::from(vec![
+                        Span::styled("prompt ", TUI_THEME.label),
+                        Span::styled(prompt_preview, TUI_THEME.text_muted),
+                    ]));
+                }
+
+                if let Some(child_run_id) = delegated_task.child_run_id {
+                    lines.push(Line::from(vec![
+                        Span::styled("child id ", TUI_THEME.label),
+                        Span::styled(
+                            summarize_text(&child_run_id.to_string()),
+                            TUI_THEME.text_muted,
+                        ),
+                    ]));
+                }
+            }
+        }
 
         if show_tool_details {
             lines.push(Line::from(vec![
@@ -611,7 +695,7 @@ fn render_tool_row(tool: &ToolRow, show_tool_details: bool) -> Vec<Line<'static>
 
     let mut lines = vec![Line::from(vec![
         Span::styled(INLINE_TOOL_PREFIX, TUI_THEME.operational_prefix),
-        Span::styled(tool.tool_name.clone(), TUI_THEME.operational_label),
+        Span::styled(tool.display_name.clone(), TUI_THEME.operational_label),
         if let Some(provenance) = provenance {
             Span::styled(format!(" · {provenance}"), TUI_THEME.tool_accent)
         } else {
@@ -632,6 +716,41 @@ fn render_tool_row(tool: &ToolRow, show_tool_details: bool) -> Vec<Line<'static>
         TUI_THEME.text_muted,
         1,
     ));
+
+    if let Some(delegated_task) = &tool.delegated_task
+        && show_tool_details
+    {
+        if let Some(child_status) = delegated_task.child_run_status {
+            lines.push(Line::from(vec![
+                Span::styled("  │   child ", TUI_THEME.text_muted),
+                Span::styled(
+                    run_status_text(child_status),
+                    run_status_style(child_status),
+                ),
+            ]));
+        }
+
+        if let Some(child_run_id) = delegated_task.child_run_id {
+            lines.push(Line::from(vec![
+                Span::styled("  │   child id ", TUI_THEME.text_muted),
+                Span::styled(
+                    summarize_text(&child_run_id.to_string()),
+                    TUI_THEME.operational_text,
+                ),
+            ]));
+        }
+
+        if let Some(prompt_preview) = delegated_task.prompt_preview.as_deref() {
+            lines.extend(format_preview_lines(
+                INLINE_TOOL_DETAIL_PREFIX,
+                Some("prompt "),
+                prompt_preview,
+                TUI_THEME.operational_text,
+                TUI_THEME.text_muted,
+                2,
+            ));
+        }
+    }
 
     if show_tool_details {
         lines.push(Line::from(vec![
@@ -764,10 +883,95 @@ fn render_run_marker_row(marker: &RunMarkerRow) -> Vec<Line<'static>> {
     vec![
         Line::from(vec![
             Span::styled(RUN_MARKER_PREFIX, TUI_THEME.operational_prefix),
-            Span::styled(marker.label, style),
+            Span::styled(marker.label.clone(), style),
         ]),
         Line::default(),
     ]
+}
+
+#[derive(Debug)]
+struct ActiveRunContext {
+    focus_label: String,
+    focus_style: ratatui::style::Style,
+    active_run_label: Option<String>,
+    active_run_style: ratatui::style::Style,
+    task_label: Option<String>,
+}
+
+fn active_run_context(state: &AppState) -> ActiveRunContext {
+    let Some(active_run_id) = state.active_run_id else {
+        return ActiveRunContext {
+            focus_label: "main session".to_string(),
+            focus_style: TUI_THEME.text,
+            active_run_label: None,
+            active_run_style: TUI_THEME.text_muted,
+            task_label: None,
+        };
+    };
+
+    let delegated_task = state
+        .session
+        .tool_invocations
+        .iter()
+        .find(|invocation| {
+            invocation.tool_name == "task" && invocation.child_run_id == Some(active_run_id)
+        })
+        .and_then(|invocation| delegated_task_from_invocation(state, invocation));
+
+    if let Some(delegated_task) = delegated_task {
+        let agent_name = delegated_task
+            .agent_name
+            .unwrap_or_else(|| "subagent".to_string());
+        return ActiveRunContext {
+            focus_label: format!("child subagent · {agent_name}"),
+            focus_style: TUI_THEME.info,
+            active_run_label: Some(format!(
+                "child {}",
+                summarize_text(&active_run_id.to_string())
+            )),
+            active_run_style: TUI_THEME.info,
+            task_label: Some(format!("task {agent_name}")),
+        };
+    }
+
+    ActiveRunContext {
+        focus_label: "main session".to_string(),
+        focus_style: TUI_THEME.text,
+        active_run_label: Some(summarize_text(&active_run_id.to_string())),
+        active_run_style: TUI_THEME.text_muted,
+        task_label: None,
+    }
+}
+
+fn tool_summary_label(
+    state: &AppState,
+    invocation: &fluent_code_app::session::model::ToolInvocationRecord,
+) -> String {
+    crate::conversation::derive_tool_row(&state.session, invocation).display_name
+}
+
+fn delegated_task_from_invocation(
+    state: &AppState,
+    invocation: &fluent_code_app::session::model::ToolInvocationRecord,
+) -> Option<DelegatedTaskRow> {
+    crate::conversation::derive_tool_row(&state.session, invocation).delegated_task
+}
+
+fn run_status_text(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::InProgress => "running",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "cancelled",
+    }
+}
+
+fn run_status_style(status: RunStatus) -> ratatui::style::Style {
+    match status {
+        RunStatus::InProgress => TUI_THEME.info,
+        RunStatus::Completed => TUI_THEME.success,
+        RunStatus::Failed | RunStatus::Cancelled => TUI_THEME.error,
+    }
 }
 
 fn approval_badge(state: ToolApprovalState) -> (&'static str, ratatui::style::Style) {
@@ -819,6 +1023,13 @@ fn run_status_label(state: &AppState) -> &'static str {
 }
 
 fn footer_text_with_ui(state: &AppState, show_tool_details: bool) -> String {
+    let active_context = active_run_context(state);
+    let run_hint = if active_context.focus_label == "main session" {
+        None
+    } else {
+        Some(active_context.focus_label.as_str())
+    };
+
     match &state.status {
         AppStatus::Idle => format!(
             "Enter send • F1 help • F2 details {} • ↑↓/Pg keys scroll • End latest • Ctrl-N new • Esc/Ctrl-C quit",
@@ -828,9 +1039,14 @@ fn footer_text_with_ui(state: &AppState, show_tool_details: bool) -> String {
                 "compact"
             }
         ),
-        AppStatus::Generating => {
-            "Assistant responding • F1 help • F2 details • Esc/Ctrl-C cancel".to_string()
-        }
+        AppStatus::Generating => match run_hint {
+            Some(run_hint) => {
+                format!(
+                    "Assistant responding · {run_hint} • F1 help • F2 details • Esc/Ctrl-C cancel"
+                )
+            }
+            None => "Assistant responding • F1 help • F2 details • Esc/Ctrl-C cancel".to_string(),
+        },
         AppStatus::AwaitingToolApproval => {
             if let Some(invocation) = state.session.pending_tool_invocation() {
                 let pending_count = state
@@ -844,15 +1060,22 @@ fn footer_text_with_ui(state: &AppState, show_tool_details: bool) -> String {
                     })
                     .count();
                 format!(
-                    "{pending_count} tool call(s) waiting • Enter/Y approve all • N deny one • F1 help • F2 details • Esc/Ctrl-C cancel"
+                    "{pending_count} tool call(s) waiting{} • Enter/Y approve all • N deny one • F1 help • F2 details • Esc/Ctrl-C cancel",
+                    run_hint
+                        .map(|run_hint| format!(" · {run_hint}"))
+                        .unwrap_or_default()
                 )
             } else {
                 "Awaiting tool approval".to_string()
             }
         }
-        AppStatus::RunningTool => {
-            "Executing approved tools • F1 help • F2 details • Esc/Ctrl-C cancel run".to_string()
-        }
+        AppStatus::RunningTool => match run_hint {
+            Some(run_hint) => format!(
+                "Executing approved tools · {run_hint} • F1 help • F2 details • Esc/Ctrl-C cancel run"
+            ),
+            None => "Executing approved tools • F1 help • F2 details • Esc/Ctrl-C cancel run"
+                .to_string(),
+        },
         AppStatus::Error(error) => format!(
             "Error: {} • F1 help • F2 details • Ctrl-N new session • Esc/Ctrl-C quit",
             summarize_text(error)
@@ -1188,8 +1411,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        conversation_lines, footer_text_with_ui, resolve_transcript_scroll, sidebar_tool_lines,
-        transcript_max_scroll,
+        active_run_context, conversation_lines, footer_text_with_ui, resolve_transcript_scroll,
+        sidebar_tool_lines, summarize_text, transcript_max_scroll,
     };
     use fluent_code_app::app::AppState;
     use fluent_code_app::plugin::{DiscoveryScope, LoadedPluginMetadata, PluginLoadSnapshot};
@@ -1257,6 +1480,18 @@ mod tests {
     }
 
     #[test]
+    fn footer_text_mentions_child_subagent_when_foreground_run_is_delegated() {
+        let (mut state, _parent_run_id, child_run_id) = delegated_child_state();
+        state.active_run_id = Some(child_run_id);
+        state.status = fluent_code_app::app::AppStatus::Generating;
+
+        let text = footer_text_with_ui(&state, false);
+
+        assert!(text.contains("Assistant responding"));
+        assert!(text.contains("child subagent · explore"));
+    }
+
+    #[test]
     fn conversation_lines_shows_empty_state_when_no_rows_exist() {
         let state = AppState::new(Session::new("empty"));
 
@@ -1291,6 +1526,9 @@ mod tests {
             execution_state: ToolExecutionState::NotStarted,
             result: None,
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: None,
             completed_at: None,
@@ -1322,6 +1560,9 @@ mod tests {
             execution_state: ToolExecutionState::NotStarted,
             result: None,
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: None,
             completed_at: None,
@@ -1338,6 +1579,9 @@ mod tests {
             execution_state: ToolExecutionState::Running,
             result: None,
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: None,
@@ -1354,7 +1598,25 @@ mod tests {
         assert!(text.contains("running 1"));
         assert!(text.contains("completed 0"));
         assert!(text.contains("attention 0"));
+        assert!(text.contains("delegated 0  running 0  done 0"));
         assert!(text.contains("latest search"));
+    }
+
+    #[test]
+    fn sidebar_tool_lines_surface_delegated_task_status_and_prompt() {
+        let (state, _parent_run_id, child_run_id) = delegated_child_state();
+        let text = sidebar_tool_lines(&state, true)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("delegated 1  running 1  done 0"));
+        assert!(text.contains("latest task explore"));
+        assert!(text.contains("status approved / running"));
+        assert!(text.contains("child running"));
+        assert!(text.contains("prompt Inspect session persistence state"));
+        assert!(text.contains(&summarize_text(&child_run_id.to_string())));
     }
 
     #[test]
@@ -1435,6 +1697,9 @@ mod tests {
             execution_state: ToolExecutionState::Completed,
             result: Some("ok".to_string()),
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1451,6 +1716,9 @@ mod tests {
             execution_state: ToolExecutionState::Completed,
             result: Some("ok".to_string()),
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1493,6 +1761,9 @@ mod tests {
             execution_state: ToolExecutionState::NotStarted,
             result: None,
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: None,
             completed_at: None,
@@ -1684,6 +1955,9 @@ mod tests {
             execution_state: ToolExecutionState::Completed,
             result: Some("line one\nline two\nline three\nline four".to_string()),
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1724,6 +1998,9 @@ mod tests {
             execution_state: ToolExecutionState::Completed,
             result: Some("useful success payload".to_string()),
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1767,6 +2044,9 @@ mod tests {
             execution_state: ToolExecutionState::Completed,
             result: Some("useful success payload".to_string()),
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1813,6 +2093,9 @@ mod tests {
                 execution_state: ToolExecutionState::Completed,
                 result: Some(result.to_string()),
                 error: None,
+                child_run_id: None,
+                delegation_agent_name: None,
+                delegation_prompt: None,
                 requested_at: Utc::now(),
                 approved_at: Some(Utc::now()),
                 completed_at: Some(Utc::now()),
@@ -1857,6 +2140,9 @@ mod tests {
             execution_state: ToolExecutionState::Completed,
             result: Some("alpha\nbeta\ngamma\ndelta".to_string()),
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1873,6 +2159,9 @@ mod tests {
             execution_state: ToolExecutionState::Completed,
             result: Some("one\ntwo\nthree\nfour".to_string()),
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1914,6 +2203,9 @@ mod tests {
             execution_state: ToolExecutionState::NotStarted,
             result: None,
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: None,
             completed_at: None,
@@ -1960,6 +2252,9 @@ mod tests {
             execution_state: ToolExecutionState::Completed,
             result: Some("first line\nsecond line\nthird line\nfourth line".to_string()),
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1976,6 +2271,9 @@ mod tests {
             execution_state: ToolExecutionState::Completed,
             result: Some("alpha\nbeta\ngamma\ndelta".to_string()),
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -2024,6 +2322,9 @@ mod tests {
             execution_state: ToolExecutionState::Completed,
             result: Some("found matches".to_string()),
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -2070,6 +2371,9 @@ mod tests {
             execution_state: ToolExecutionState::Completed,
             result: Some("found matches".to_string()),
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -2111,6 +2415,9 @@ mod tests {
             execution_state: ToolExecutionState::Completed,
             result: Some("ok".to_string()),
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -2123,6 +2430,74 @@ mod tests {
             .join("\n");
 
         assert!(!text.contains("via plugin"));
+    }
+
+    #[test]
+    fn conversation_lines_render_delegated_task_compact_label_instead_of_json() {
+        let (state, _parent_run_id, _child_run_id) = delegated_child_state();
+        let text = conversation_lines(&state, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("├─ tool task explore · approved / running"));
+        assert!(text.contains("task explore · Inspect session persistence state"));
+        assert!(!text.contains("{\"agent\":\"explore\""));
+    }
+
+    #[test]
+    fn conversation_lines_render_delegated_task_expanded_child_details() {
+        let (state, _parent_run_id, child_run_id) = delegated_child_state();
+        let text = conversation_lines(&state, true)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("child running"));
+        assert!(text.contains("prompt Inspect session persistence state"));
+        assert!(text.contains(&format!(
+            "child id {}",
+            summarize_text(&child_run_id.to_string())
+        )));
+        assert!(text.contains(
+            "args {\"agent\":\"explore\",\"prompt\":\"Inspect session persistence state\"}"
+        ));
+    }
+
+    #[test]
+    fn conversation_lines_show_child_foreground_run_marker() {
+        let (mut state, _parent_run_id, child_run_id) = delegated_child_state();
+        state.active_run_id = Some(child_run_id);
+        state.status = fluent_code_app::app::AppStatus::Generating;
+
+        let text = conversation_lines(&state, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Inspect child flow"));
+        assert!(text.contains("running · subagent explore"));
+        assert!(text.contains("task explore"));
+    }
+
+    #[test]
+    fn conversation_lines_child_foreground_state_can_power_overview_focus_labels() {
+        let (mut state, _parent_run_id, child_run_id) = delegated_child_state();
+        state.active_run_id = Some(child_run_id);
+        state.status = fluent_code_app::app::AppStatus::Generating;
+
+        let context = active_run_context(&state);
+        let expected_active_label = format!("child {}", summarize_text(&child_run_id.to_string()));
+
+        assert_eq!(context.focus_label, "child subagent · explore");
+        assert_eq!(context.task_label.as_deref(), Some("task explore"));
+        assert_eq!(
+            context.active_run_label.as_deref(),
+            Some(expected_active_label.as_str())
+        );
     }
 
     fn line_text(line: &Line<'_>) -> String {
@@ -2165,5 +2540,59 @@ mod tests {
         let mut state = AppState::new(session);
         state.plugin_load_snapshot = sample_plugin_load_snapshot();
         state
+    }
+
+    fn delegated_child_state() -> (AppState, Uuid, Uuid) {
+        let parent_run_id = Uuid::new_v4();
+        let child_run_id = Uuid::new_v4();
+        let invocation_id = Uuid::new_v4();
+        let mut session = Session::new("delegated child state");
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id: parent_run_id,
+            role: Role::Assistant,
+            content: "Delegate this task".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        session.turns.push(turn.clone());
+        session.turns.push(Turn {
+            id: Uuid::new_v4(),
+            run_id: child_run_id,
+            role: Role::User,
+            content: "Inspect child flow".to_string(),
+            timestamp: Utc::now(),
+        });
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: invocation_id,
+            run_id: parent_run_id,
+            tool_call_id: "task-call-1".to_string(),
+            tool_name: "task".to_string(),
+            tool_source: ToolSource::BuiltIn,
+            arguments: json!({
+                "agent": "explore",
+                "prompt": "Inspect session persistence state"
+            }),
+            preceding_turn_id: Some(turn.id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Running,
+            result: None,
+            error: None,
+            child_run_id: Some(child_run_id),
+            delegation_agent_name: Some("explore".to_string()),
+            delegation_prompt: Some("Inspect session persistence state".to_string()),
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: None,
+        });
+        session.upsert_run(parent_run_id, RunStatus::InProgress);
+        session.upsert_run_with_parent(
+            child_run_id,
+            RunStatus::InProgress,
+            Some(parent_run_id),
+            Some(invocation_id),
+        );
+
+        (AppState::new(session), parent_run_id, child_run_id)
     }
 }

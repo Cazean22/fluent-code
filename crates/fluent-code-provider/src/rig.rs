@@ -80,9 +80,13 @@ impl RigOpenAiProvider {
             .collect::<Vec<_>>();
 
         let _reasoning_effort = &self.reasoning_effort;
+        let system_prompt = request
+            .system_prompt_override
+            .clone()
+            .unwrap_or_else(|| self.system_prompt.clone());
 
         let mut stream = RigCompletionModel::completion_request(&model, to_rig_message(prompt))
-            .preamble(self.system_prompt.clone())
+            .preamble(system_prompt)
             .messages(history.iter().map(to_rig_message).collect())
             .tools(tool_definitions)
             .stream()

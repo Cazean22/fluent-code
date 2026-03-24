@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use fluent_code_provider::{ProviderTool, ProviderToolCall};
 
+use crate::agent::AgentRegistry;
 use crate::error::{FluentCodeError, Result};
 use crate::plugin::discovery::{DiscoveredPlugin, DiscoveryScope};
 use crate::plugin::manifest::PluginCapabilities;
@@ -106,19 +107,35 @@ impl PluginExecutor for WasmPluginExecutor {
 
 impl ToolRegistry {
     pub fn built_in() -> Self {
-        Self::from_discovered_with_executor(Vec::new(), Arc::new(NoopPluginExecutor))
-            .expect("built-in tool registry should always construct")
+        Self::with_agent_registry(AgentRegistry::built_in())
     }
 
-    pub fn from_discovered(plugins: Vec<DiscoveredPlugin>) -> Result<Self> {
-        Self::from_discovered_with_executor(plugins, Arc::new(WasmPluginExecutor::new()?))
+    pub fn with_agent_registry(agent_registry: &AgentRegistry) -> Self {
+        Self::from_discovered_with_executor(
+            agent_registry,
+            Vec::new(),
+            Arc::new(NoopPluginExecutor),
+        )
+        .expect("built-in tool registry should always construct")
+    }
+
+    pub fn from_discovered(
+        agent_registry: &AgentRegistry,
+        plugins: Vec<DiscoveredPlugin>,
+    ) -> Result<Self> {
+        Self::from_discovered_with_executor(
+            agent_registry,
+            plugins,
+            Arc::new(WasmPluginExecutor::new()?),
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn from_discovered_with_noop_executor(
+        agent_registry: &AgentRegistry,
         plugins: Vec<DiscoveredPlugin>,
     ) -> Result<Self> {
-        Self::from_discovered_with_executor(plugins, Arc::new(NoopPluginExecutor))
+        Self::from_discovered_with_executor(agent_registry, plugins, Arc::new(NoopPluginExecutor))
     }
 
     #[cfg(test)]
@@ -154,11 +171,12 @@ impl ToolRegistry {
     }
 
     fn from_discovered_with_executor(
+        agent_registry: &AgentRegistry,
         plugins: Vec<DiscoveredPlugin>,
         plugin_executor: Arc<dyn PluginExecutor>,
     ) -> Result<Self> {
         let mut tools = HashMap::new();
-        let mut provider_tools = built_in_tools();
+        let mut provider_tools = built_in_tools(agent_registry);
         let mut plugin_ids_by_scope = HashMap::<(String, DiscoveryScope), String>::new();
 
         for tool in &provider_tools {
@@ -290,6 +308,7 @@ mod tests {
     use serde_json::json;
 
     use super::{PluginExecutor, ToolRegistry};
+    use crate::agent::AgentRegistry;
     use crate::plugin::discovery::{DiscoveredPlugin, DiscoveryScope};
     use crate::plugin::manifest::{
         FilesystemCapability, PluginCapabilities, PluginHostRequirements, PluginManifest,
@@ -335,6 +354,7 @@ mod tests {
     #[test]
     fn project_plugin_overrides_global_plugin_with_same_name() {
         let registry = ToolRegistry::from_discovered_with_executor(
+            AgentRegistry::built_in(),
             vec![
                 plugin("global.echo", DiscoveryScope::Global, "plugin_echo"),
                 plugin("project.echo", DiscoveryScope::Project, "plugin_echo"),
@@ -356,6 +376,7 @@ mod tests {
     #[test]
     fn built_in_tool_names_are_reserved() {
         let error = ToolRegistry::from_discovered_with_executor(
+            AgentRegistry::built_in(),
             vec![plugin("project.echo", DiscoveryScope::Project, "read")],
             Arc::new(FakePluginExecutor::default()),
         )
@@ -367,6 +388,7 @@ mod tests {
     #[test]
     fn plugin_tools_execute_through_plugin_executor() {
         let registry = ToolRegistry::from_discovered_with_executor(
+            AgentRegistry::built_in(),
             vec![plugin(
                 "project.echo",
                 DiscoveryScope::Project,
@@ -385,6 +407,30 @@ mod tests {
         });
 
         assert_eq!(result.expect("plugin tool result"), "plugin result");
+    }
+
+    #[test]
+    fn task_tool_schema_uses_configured_agents() {
+        let agent_registry = AgentRegistry::from_agent_configs(&[crate::config::AgentConfig {
+            name: "oracle".to_string(),
+            description: "Answer architecture questions.".to_string(),
+            system_prompt: "You are the oracle subagent.".to_string(),
+        }])
+        .expect("custom agent registry");
+
+        let registry = ToolRegistry::with_agent_registry(&agent_registry);
+        let task_tool = registry
+            .provider_tools()
+            .into_iter()
+            .find(|tool| tool.name == "task")
+            .expect("task tool in provider registry");
+
+        assert_eq!(
+            task_tool.input_schema["properties"]["agent"]["enum"],
+            json!(["oracle"])
+        );
+        assert!(task_tool.description.contains("oracle"));
+        assert!(!task_tool.description.contains("explore"));
     }
 
     fn plugin(id: &str, scope: DiscoveryScope, tool_name: &str) -> DiscoveredPlugin {

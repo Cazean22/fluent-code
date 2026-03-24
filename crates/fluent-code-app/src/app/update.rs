@@ -3,9 +3,11 @@ use fluent_code_provider::{ProviderMessage, ProviderRequest, ProviderToolCall};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::agent::{TASK_TOOL_NAME, parse_task_request};
 use crate::app::{AppState, AppStatus, Effect, Msg};
 use crate::session::model::{
-    Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, Turn,
+    Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationId, ToolInvocationRecord,
+    Turn,
 };
 
 const READ_TOOL_NAME: &str = "read";
@@ -15,6 +17,12 @@ enum ToolBatchProgress {
     AwaitingApproval,
     Running,
     ReadyToResume,
+}
+
+#[derive(Debug, Clone)]
+enum ChildRunOutcome {
+    Completed,
+    Failed { error: String },
 }
 
 pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
@@ -94,6 +102,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
 
             let approved_at = Utc::now();
             let mut approved_tool_calls = Vec::new();
+            let mut delegated_child_start = None;
 
             for invocation in state
                 .session
@@ -106,21 +115,35 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 })
             {
                 invocation.approval_state = ToolApprovalState::Approved;
-                invocation.execution_state = ToolExecutionState::Running;
                 invocation.approved_at = Some(approved_at);
                 invocation.error = None;
 
-                approved_tool_calls.push((
-                    invocation.id,
-                    ProviderToolCall {
-                        id: invocation.tool_call_id.clone(),
-                        name: invocation.tool_name.clone(),
-                        arguments: invocation.arguments.clone(),
-                    },
-                ));
+                if invocation.tool_name == TASK_TOOL_NAME {
+                    invocation.execution_state = ToolExecutionState::Running;
+                    if delegated_child_start.is_none() {
+                        delegated_child_start = Some((
+                            invocation.id,
+                            ProviderToolCall {
+                                id: invocation.tool_call_id.clone(),
+                                name: invocation.tool_name.clone(),
+                                arguments: invocation.arguments.clone(),
+                            },
+                        ));
+                    }
+                } else {
+                    invocation.execution_state = ToolExecutionState::Running;
+                    approved_tool_calls.push((
+                        invocation.id,
+                        ProviderToolCall {
+                            id: invocation.tool_call_id.clone(),
+                            name: invocation.tool_name.clone(),
+                            arguments: invocation.arguments.clone(),
+                        },
+                    ));
+                }
             }
 
-            if approved_tool_calls.is_empty() {
+            if approved_tool_calls.is_empty() && delegated_child_start.is_none() {
                 return Vec::new();
             }
 
@@ -136,6 +159,9 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             );
 
             let mut effects = vec![Effect::PersistSession];
+            if let Some((invocation_id, tool_call)) = delegated_child_start {
+                effects.extend(start_child_run(state, run_id, invocation_id, &tool_call));
+            }
             effects.extend(
                 approved_tool_calls
                     .into_iter()
@@ -324,6 +350,9 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 execution_state: ToolExecutionState::NotStarted,
                 result: None,
                 error: None,
+                child_run_id: None,
+                delegation_agent_name: None,
+                delegation_prompt: None,
                 requested_at: Utc::now(),
                 approved_at: None,
                 completed_at: None,
@@ -385,74 +414,99 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             vec![Effect::PersistSession]
         }
         Msg::AssistantDone { run_id } => {
-            if state.active_run_id != Some(run_id) {
-                debug!(
+            if state.active_run_id == Some(run_id) {
+                if let Some(parent_effects) =
+                    complete_child_run(state, run_id, ChildRunOutcome::Completed)
+                {
+                    return parent_effects;
+                }
+
+                state.active_run_id = None;
+                state.pending_resume_request = None;
+                state.status = AppStatus::Idle;
+                state.session.updated_at = Utc::now();
+                state.session.upsert_run(run_id, RunStatus::Completed);
+
+                info!(
                     session_id = %state.session.id,
                     run_id = %run_id,
-                    active_run_id = ?state.active_run_id,
-                    "ignored stale assistant completion"
+                    "assistant run completed"
                 );
-                return Vec::new();
+
+                return vec![Effect::PersistSession];
             }
 
-            state.active_run_id = None;
-            state.pending_resume_request = None;
-            state.status = AppStatus::Idle;
-            state.session.updated_at = Utc::now();
-            state.session.upsert_run(run_id, RunStatus::Completed);
+            if state.session.find_run(run_id).is_some()
+                && let Some(parent_effects) =
+                    complete_child_run(state, run_id, ChildRunOutcome::Completed)
+            {
+                return parent_effects;
+            }
 
-            info!(
+            debug!(
                 session_id = %state.session.id,
                 run_id = %run_id,
-                "assistant run completed"
+                active_run_id = ?state.active_run_id,
+                "ignored stale assistant completion"
             );
-
-            vec![Effect::PersistSession]
+            Vec::new()
         }
         Msg::AssistantFailed { run_id, error } => {
-            if state.active_run_id != Some(run_id) {
-                debug!(
-                    session_id = %state.session.id,
-                    run_id = %run_id,
-                    active_run_id = ?state.active_run_id,
-                    error = %error,
-                    "ignored stale assistant failure"
-                );
-                return Vec::new();
+            if state.active_run_id == Some(run_id) {
+                if let Some(parent_effects) = complete_child_run(
+                    state,
+                    run_id,
+                    ChildRunOutcome::Failed {
+                        error: error.clone(),
+                    },
+                ) {
+                    return parent_effects;
+                }
+
+                state.active_run_id = None;
+                state.pending_resume_request = None;
+                state.status = AppStatus::Error(error);
+                state.session.updated_at = Utc::now();
+                state.session.upsert_run(run_id, RunStatus::Failed);
+
+                if let AppStatus::Error(message) = &state.status {
+                    warn!(
+                        session_id = %state.session.id,
+                        run_id = %run_id,
+                        error = %message,
+                        "assistant run failed"
+                    );
+                }
+
+                return vec![Effect::PersistSession];
             }
 
-            state.active_run_id = None;
-            state.pending_resume_request = None;
-            state.status = AppStatus::Error(error);
-            state.session.updated_at = Utc::now();
-            state.session.upsert_run(run_id, RunStatus::Failed);
-
-            if let AppStatus::Error(message) = &state.status {
-                warn!(
-                    session_id = %state.session.id,
-                    run_id = %run_id,
-                    error = %message,
-                    "assistant run failed"
-                );
+            if state.session.find_run(run_id).is_some()
+                && let Some(parent_effects) = complete_child_run(
+                    state,
+                    run_id,
+                    ChildRunOutcome::Failed {
+                        error: error.clone(),
+                    },
+                )
+            {
+                return parent_effects;
             }
 
-            vec![Effect::PersistSession]
+            debug!(
+                session_id = %state.session.id,
+                run_id = %run_id,
+                active_run_id = ?state.active_run_id,
+                error = %error,
+                "ignored stale assistant failure"
+            );
+            Vec::new()
         }
         Msg::ToolExecutionFinished {
             run_id,
             invocation_id,
             result,
         } => {
-            if state.active_run_id != Some(run_id) {
-                debug!(
-                    session_id = %state.session.id,
-                    run_id = %run_id,
-                    invocation_id = %invocation_id,
-                    active_run_id = ?state.active_run_id,
-                    "ignored stale tool result"
-                );
-                return Vec::new();
-            }
             let session_id = state.session.id;
             let Some(preceding_turn_id) = state
                 .session
@@ -520,6 +574,17 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
 
             state.session.updated_at = Utc::now();
 
+            if state.active_run_id != Some(run_id) {
+                debug!(
+                    session_id = %state.session.id,
+                    run_id = %run_id,
+                    invocation_id = %invocation_id,
+                    active_run_id = ?state.active_run_id,
+                    "recorded tool result for non-foreground run"
+                );
+                return vec![Effect::PersistSession];
+            }
+
             match tool_batch_progress(state, run_id, preceding_turn_id) {
                 ToolBatchProgress::AwaitingApproval => {
                     state.status = AppStatus::AwaitingToolApproval;
@@ -580,6 +645,219 @@ fn build_provider_request(state: &AppState, run_id: Uuid) -> ProviderRequest {
         .collect();
 
     ProviderRequest::new(messages, state.tool_registry.provider_tools())
+}
+
+fn start_child_run(
+    state: &mut AppState,
+    parent_run_id: Uuid,
+    invocation_id: ToolInvocationId,
+    tool_call: &ProviderToolCall,
+) -> Vec<Effect> {
+    let session_id = state.session.id;
+    let task_request = match parse_task_request(&state.agent_registry, &tool_call.arguments) {
+        Ok(task_request) => task_request,
+        Err(error) => {
+            finish_task_invocation_with_error(state, invocation_id, &error.to_string());
+            state.status = AppStatus::Generating;
+            state.pending_resume_request = Some(build_provider_request(state, parent_run_id));
+            let request = state
+                .pending_resume_request
+                .clone()
+                .expect("resume request after task parse failure");
+            warn!(
+                session_id = %session_id,
+                run_id = %parent_run_id,
+                invocation_id = %invocation_id,
+                error = %error,
+                "task invocation could not be delegated"
+            );
+            return vec![
+                Effect::PersistSession,
+                Effect::StartAssistant {
+                    run_id: parent_run_id,
+                    request,
+                },
+            ];
+        }
+    };
+
+    let Some(agent) = state.agent_registry.get(&task_request.agent) else {
+        let error_message = format!("task requested unknown agent '{}'", task_request.agent);
+        finish_task_invocation_with_error(state, invocation_id, &error_message);
+        state.status = AppStatus::Generating;
+        state.pending_resume_request = Some(build_provider_request(state, parent_run_id));
+        let request = state
+            .pending_resume_request
+            .clone()
+            .expect("resume request after missing agent");
+        warn!(
+            session_id = %session_id,
+            run_id = %parent_run_id,
+            invocation_id = %invocation_id,
+            agent = %task_request.agent,
+            "task invocation referenced an unknown agent"
+        );
+        return vec![
+            Effect::PersistSession,
+            Effect::StartAssistant {
+                run_id: parent_run_id,
+                request,
+            },
+        ];
+    };
+
+    let child_run_id = Uuid::new_v4();
+    if let Some(invocation) = state.session.find_tool_invocation_mut(invocation_id) {
+        invocation.child_run_id = Some(child_run_id);
+        invocation.delegation_agent_name = Some(task_request.agent.clone());
+        invocation.delegation_prompt = Some(task_request.prompt.clone());
+    }
+
+    state.session.upsert_run_with_parent(
+        child_run_id,
+        RunStatus::InProgress,
+        Some(parent_run_id),
+        Some(invocation_id),
+    );
+    state.active_run_id = Some(child_run_id);
+    state.status = AppStatus::Generating;
+    state.pending_resume_request = None;
+
+    state.session.turns.push(Turn {
+        id: Uuid::new_v4(),
+        run_id: child_run_id,
+        role: Role::User,
+        content: task_request.prompt.clone(),
+        timestamp: Utc::now(),
+    });
+    state.session.updated_at = Utc::now();
+
+    let child_request = ProviderRequest::new(
+        vec![ProviderMessage::UserText {
+            text: task_request.prompt,
+        }],
+        child_provider_tools(state),
+    )
+    .with_system_prompt_override(Some(agent.system_prompt.clone()));
+
+    info!(
+        session_id = %session_id,
+        parent_run_id = %parent_run_id,
+        child_run_id = %child_run_id,
+        invocation_id = %invocation_id,
+        agent = %agent.name,
+        "started delegated child run in foreground"
+    );
+
+    vec![
+        Effect::PersistSession,
+        Effect::StartAssistant {
+            run_id: child_run_id,
+            request: child_request,
+        },
+    ]
+}
+
+fn complete_child_run(
+    state: &mut AppState,
+    child_run_id: Uuid,
+    outcome: ChildRunOutcome,
+) -> Option<Vec<Effect>> {
+    let parent_link = state
+        .session
+        .find_run(child_run_id)
+        .and_then(|run| Some((run.parent_run_id?, run.parent_tool_invocation_id?)));
+
+    let (parent_run_id, parent_tool_invocation_id) = parent_link?;
+    let session_id = state.session.id;
+
+    let (child_status, synthetic_result) = match outcome {
+        ChildRunOutcome::Completed => {
+            let final_text = latest_assistant_text_for_run(state, child_run_id).unwrap_or_default();
+            (RunStatus::Completed, summarize_child_result(&final_text))
+        }
+        ChildRunOutcome::Failed { error } => {
+            let final_text = latest_assistant_text_for_run(state, child_run_id).unwrap_or_default();
+            let message = if final_text.trim().is_empty() {
+                format!("Subagent failed: {error}")
+            } else {
+                format!(
+                    "Subagent failed after replying: {}",
+                    summarize_child_result(&final_text)
+                )
+            };
+            (RunStatus::Failed, message)
+        }
+    };
+
+    if let Some(run) = state.session.find_run_mut(child_run_id) {
+        run.status = child_status;
+        run.updated_at = Utc::now();
+    }
+
+    state.active_run_id = Some(parent_run_id);
+    state.status = AppStatus::Generating;
+    state.pending_resume_request = None;
+
+    let result_effects = update(
+        state,
+        Msg::ToolExecutionFinished {
+            run_id: parent_run_id,
+            invocation_id: parent_tool_invocation_id,
+            result: Ok(synthetic_result),
+        },
+    );
+
+    info!(
+        session_id = %session_id,
+        parent_run_id = %parent_run_id,
+        child_run_id = %child_run_id,
+        invocation_id = %parent_tool_invocation_id,
+        "child run reached terminal state and parent resumed"
+    );
+
+    Some(result_effects)
+}
+
+fn finish_task_invocation_with_error(
+    state: &mut AppState,
+    invocation_id: ToolInvocationId,
+    error: &str,
+) {
+    if let Some(invocation) = state.session.find_tool_invocation_mut(invocation_id) {
+        invocation.execution_state = ToolExecutionState::Failed;
+        invocation.error = Some(error.to_string());
+        invocation.completed_at = Some(Utc::now());
+    }
+    state.session.updated_at = Utc::now();
+}
+
+fn latest_assistant_text_for_run(state: &AppState, run_id: Uuid) -> Option<String> {
+    state
+        .session
+        .turns
+        .iter()
+        .rev()
+        .find(|turn| turn.run_id == run_id && matches!(turn.role, Role::Assistant))
+        .map(|turn| turn.content.clone())
+}
+
+fn summarize_child_result(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        "Subagent finished without a final text response.".to_string()
+    } else {
+        format!("Subagent finished: {trimmed}")
+    }
+}
+
+fn child_provider_tools(state: &AppState) -> Vec<fluent_code_provider::ProviderTool> {
+    state
+        .tool_registry
+        .provider_tools()
+        .into_iter()
+        .filter(|tool| tool.name != TASK_TOOL_NAME)
+        .collect()
 }
 
 fn should_resume_after_tool_failure(tool_name: &str, error: &str) -> bool {
@@ -706,8 +984,12 @@ fn turn_to_provider_message(turn: &Turn) -> ProviderMessage {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::update;
+    use crate::agent::AgentRegistry;
     use crate::app::{AppState, AppStatus, Effect, Msg};
+    use crate::config::AgentConfig;
     use crate::session::model::{Role, RunStatus, Session, ToolApprovalState, ToolExecutionState};
 
     #[test]
@@ -1210,8 +1492,6 @@ mod tests {
 
     #[test]
     fn plugin_tool_call_records_plugin_tool_source() {
-        use std::sync::Arc;
-
         use crate::plugin::ToolRegistry;
         use crate::session::model::ToolSource;
 
@@ -1223,7 +1503,8 @@ mod tests {
             crate::plugin::DiscoveryScope::Project,
         ));
 
-        let mut state = AppState::new_with_tool_registry(Session::new("plugin source flow"), tool_registry);
+        let mut state =
+            AppState::new_with_tool_registry(Session::new("plugin source flow"), tool_registry);
         state.draft_input = "run plugin tool".to_string();
         let effects = update(&mut state, Msg::SubmitPrompt);
         let run_id = match effects.get(1) {
@@ -1254,6 +1535,210 @@ mod tests {
                 && plugin_name == "Project Echo"
                 && plugin_version == "1.2.3"
         ));
+    }
+
+    #[test]
+    fn approving_task_tool_starts_child_run_with_lineage_and_prompt_override() {
+        let mut state = AppState::new(Session::new("task delegation flow"));
+        state.draft_input = "delegate work".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let parent_run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id: parent_run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "task-call-1".to_string(),
+                    name: "task".to_string(),
+                    arguments: serde_json::json!({
+                        "agent": "explore",
+                        "prompt": "Inspect the runtime orchestrator"
+                    }),
+                },
+            },
+        );
+
+        let effects = update(&mut state, Msg::ApprovePendingTool);
+        let child_run_id = state.active_run_id.expect("child run should become active");
+        let child_request = match effects.last() {
+            Some(Effect::StartAssistant { run_id, request }) if *run_id == child_run_id => request,
+            _ => panic!("expected child assistant start effect"),
+        };
+
+        assert_ne!(child_run_id, parent_run_id);
+        assert!(matches!(state.status, AppStatus::Generating));
+        assert_eq!(
+            state.session.turns.last().map(|turn| turn.run_id),
+            Some(child_run_id)
+        );
+        assert_eq!(
+            state.session.turns.last().map(|turn| turn.content.as_str()),
+            Some("Inspect the runtime orchestrator")
+        );
+        assert_eq!(
+            state.session.tool_invocations[0].child_run_id,
+            Some(child_run_id)
+        );
+        assert_eq!(
+            state.session.tool_invocations[0]
+                .delegation_agent_name
+                .as_deref(),
+            Some("explore")
+        );
+        assert_eq!(
+            state.session.tool_invocations[0]
+                .delegation_prompt
+                .as_deref(),
+            Some("Inspect the runtime orchestrator")
+        );
+        assert_eq!(
+            state
+                .session
+                .find_run(child_run_id)
+                .expect("child run record")
+                .parent_run_id,
+            Some(parent_run_id)
+        );
+        assert_eq!(
+            child_request.system_prompt_override.as_deref(),
+            Some(
+                "You are the explore subagent. Investigate the repository carefully, follow existing code patterns, and answer with concrete findings grounded in the code you read. Focus on discovery, not implementation."
+            )
+        );
+        assert!(child_request.tools.iter().all(|tool| tool.name != "task"));
+    }
+
+    #[test]
+    fn child_completion_resumes_parent_with_synthetic_task_result() {
+        let mut state = AppState::new(Session::new("task completion flow"));
+        state.draft_input = "delegate work".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let parent_run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id: parent_run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "task-call-1".to_string(),
+                    name: "task".to_string(),
+                    arguments: serde_json::json!({
+                        "agent": "librarian",
+                        "prompt": "Summarize the provider layer"
+                    }),
+                },
+            },
+        );
+
+        update(&mut state, Msg::ApprovePendingTool);
+        let child_run_id = state.active_run_id.expect("child run should become active");
+
+        update(
+            &mut state,
+            Msg::AssistantChunk {
+                run_id: child_run_id,
+                delta: "Provider layer summary".to_string(),
+            },
+        );
+
+        let effects = update(
+            &mut state,
+            Msg::AssistantDone {
+                run_id: child_run_id,
+            },
+        );
+        let parent_request = match effects.last() {
+            Some(Effect::StartAssistant { run_id, request }) if *run_id == parent_run_id => request,
+            _ => panic!("expected resumed parent assistant effect"),
+        };
+
+        assert_eq!(state.active_run_id, Some(parent_run_id));
+        assert!(matches!(state.status, AppStatus::Generating));
+        assert_eq!(
+            state.session.tool_invocations[0].execution_state,
+            ToolExecutionState::Completed
+        );
+        assert_eq!(
+            state.session.tool_invocations[0].result.as_deref(),
+            Some("Subagent finished: Provider layer summary")
+        );
+        assert!(matches!(
+            state.session.find_run(child_run_id).map(|run| run.status),
+            Some(RunStatus::Completed)
+        ));
+        assert!(parent_request.messages.iter().any(|message| matches!(
+            message,
+            fluent_code_provider::ProviderMessage::ToolResult { content, .. }
+                if content == "Subagent finished: Provider layer summary"
+        )));
+    }
+
+    #[test]
+    fn custom_agent_registry_drives_task_delegation() {
+        let agent_registry = Arc::new(
+            AgentRegistry::from_agent_configs(&[AgentConfig {
+                name: "oracle".to_string(),
+                description: "Answer architecture questions.".to_string(),
+                system_prompt: "You are the oracle subagent.".to_string(),
+            }])
+            .expect("custom agent registry"),
+        );
+        let tool_registry = Arc::new(crate::plugin::ToolRegistry::with_agent_registry(
+            &agent_registry,
+        ));
+        let mut state = AppState::new_with_registries(
+            Session::new("custom task flow"),
+            agent_registry,
+            tool_registry,
+        );
+        state.draft_input = "delegate work".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let parent_run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id: parent_run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "task-call-1".to_string(),
+                    name: "task".to_string(),
+                    arguments: serde_json::json!({
+                        "agent": "oracle",
+                        "prompt": "Answer the architecture question"
+                    }),
+                },
+            },
+        );
+
+        let effects = update(&mut state, Msg::ApprovePendingTool);
+        let child_run_id = state.active_run_id.expect("child run should become active");
+        let child_request = match effects.last() {
+            Some(Effect::StartAssistant { run_id, request }) if *run_id == child_run_id => request,
+            _ => panic!("expected child assistant start effect"),
+        };
+
+        assert_ne!(child_run_id, parent_run_id);
+        assert_eq!(
+            state.session.tool_invocations[0]
+                .delegation_agent_name
+                .as_deref(),
+            Some("oracle")
+        );
+        assert_eq!(
+            child_request.system_prompt_override.as_deref(),
+            Some("You are the oracle subagent.")
+        );
+        assert!(child_request.tools.iter().all(|tool| tool.name != "task"));
     }
 
     fn request_contains_tool_name(

@@ -21,6 +21,7 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub logging: LoggingConfig,
     pub model: ModelConfig,
+    pub agents: Option<Vec<AgentConfig>>,
     pub plugins: PluginConfig,
     pub model_providers: HashMap<String, ProviderConfig>,
 }
@@ -57,6 +58,13 @@ pub struct ModelConfig {
     pub provider: String,
     pub model: String,
     pub reasoning_effort: Option<String>,
+    pub system_prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentConfig {
+    pub name: String,
+    pub description: String,
     pub system_prompt: String,
 }
 
@@ -101,6 +109,10 @@ impl Config {
             config.logging = LoggingConfig::default_with_data_dir(&config.data_dir);
         }
 
+        config.agents = raw
+            .agents
+            .map(|agents| agents.into_iter().map(AgentConfig::from_raw).collect());
+
         if let Some(plugins) = raw.plugins {
             config.plugins = PluginConfig::from_raw(plugins, current_dir, &config.data_dir);
         } else {
@@ -141,6 +153,7 @@ impl Config {
                 reasoning_effort: None,
                 system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             },
+            agents: None,
             plugins: PluginConfig::default_with_paths(base_dir, &base_dir.join(".fluent-code")),
             model_providers: HashMap::new(),
         }
@@ -151,6 +164,7 @@ impl Config {
 struct RawConfig {
     data_dir: Option<PathBuf>,
     logging: Option<RawLoggingConfig>,
+    agents: Option<Vec<RawAgentConfig>>,
     plugins: Option<RawPluginConfig>,
     model_provider: Option<String>,
     model: Option<String>,
@@ -185,6 +199,13 @@ struct RawPluginConfig {
     enable_global_plugins: Option<bool>,
     project_dir: Option<PathBuf>,
     global_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawAgentConfig {
+    name: String,
+    description: String,
+    system_prompt: String,
 }
 
 impl LoggingConfig {
@@ -257,6 +278,16 @@ impl PluginConfig {
     }
 }
 
+impl AgentConfig {
+    fn from_raw(raw: RawAgentConfig) -> Self {
+        Self {
+            name: raw.name,
+            description: raw.description,
+            system_prompt: raw.system_prompt,
+        }
+    }
+}
+
 fn resolve_path(current_dir: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
@@ -271,7 +302,7 @@ mod tests {
 
     use fluent_code_provider::WireApi;
 
-    use super::{Config, LoggingConfig};
+    use super::{AgentConfig, Config, LoggingConfig};
 
     #[test]
     fn parses_toml_model_and_provider_settings() {
@@ -358,7 +389,43 @@ api_key_envs = ["OPENAI_API_KEY", "OPENAI_FALLBACK_KEY"]
             config.model.system_prompt,
             "You are a helpful coding assistant."
         );
+        assert!(config.agents.is_none());
         assert!(config.model_providers.is_empty());
+    }
+
+    #[test]
+    fn parses_agent_config_entries() {
+        let config = Config::from_toml_str(
+            r#"
+[[agents]]
+name = "oracle"
+description = "Answer architecture questions."
+system_prompt = "You are the oracle subagent."
+
+[[agents]]
+name = "reviewer"
+description = "Review code changes."
+system_prompt = "You are the reviewer subagent."
+"#,
+            Path::new("/tmp/fluent-code-config"),
+        )
+        .expect("parse agent config");
+
+        assert_eq!(
+            config.agents,
+            Some(vec![
+                AgentConfig {
+                    name: "oracle".to_string(),
+                    description: "Answer architecture questions.".to_string(),
+                    system_prompt: "You are the oracle subagent.".to_string(),
+                },
+                AgentConfig {
+                    name: "reviewer".to_string(),
+                    description: "Review code changes.".to_string(),
+                    system_prompt: "You are the reviewer subagent.".to_string(),
+                },
+            ])
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use fluent_code_app::{
+    agent::AgentRegistry,
     config::Config,
     error::Result,
     logging::{config_source_for_log, init_logging, path_for_log},
@@ -31,6 +32,7 @@ async fn main() -> Result<()> {
 
     let store = FsSessionStore::new(config.data_dir.clone());
     let session = store.load_or_create_latest()?;
+    let agent_registry = Arc::new(AgentRegistry::from_configured(config.agents.as_deref())?);
     let provider = ProviderClient::new(
         &config.model.provider,
         config.model.model.clone(),
@@ -46,6 +48,7 @@ async fn main() -> Result<()> {
         session,
         store,
         runtime,
+        agent_registry,
         tool_registry,
         loaded_tool_registry.plugin_load_snapshot,
     )

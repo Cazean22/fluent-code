@@ -1,14 +1,16 @@
 use fluent_code_app::app::{AppState, AppStatus};
 use fluent_code_app::session::model::{
-    Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, ToolSource,
+    Role, RunStatus, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
+    ToolSource,
 };
+use uuid::Uuid;
 
 const SUMMARY_LIMIT: usize = 72;
 
 #[derive(Debug, Clone)]
 pub(crate) enum ConversationRow {
     Turn(TurnRow),
-    Tool(ToolRow),
+    Tool(Box<ToolRow>),
     ToolGroup(ToolGroupRow),
     RunMarker(RunMarkerRow),
 }
@@ -23,14 +25,24 @@ pub(crate) struct TurnRow {
 #[derive(Debug, Clone)]
 pub(crate) struct ToolRow {
     pub(crate) tool_name: String,
+    pub(crate) display_name: String,
     pub(crate) summary: String,
     pub(crate) provenance_compact: Option<String>,
     pub(crate) provenance_expanded: Option<String>,
     pub(crate) arguments_preview: String,
+    pub(crate) delegated_task: Option<DelegatedTaskRow>,
     pub(crate) approval_state: ToolApprovalState,
     pub(crate) execution_state: ToolExecutionState,
     pub(crate) result_preview: Option<String>,
     pub(crate) error_preview: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DelegatedTaskRow {
+    pub(crate) agent_name: Option<String>,
+    pub(crate) prompt_preview: Option<String>,
+    pub(crate) child_run_id: Option<Uuid>,
+    pub(crate) child_run_status: Option<RunStatus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +69,7 @@ pub(crate) enum RunMarkerKind {
 #[derive(Debug, Clone)]
 pub(crate) struct RunMarkerRow {
     pub(crate) kind: RunMarkerKind,
-    pub(crate) label: &'static str,
+    pub(crate) label: String,
 }
 
 pub(crate) fn derive_conversation_rows(state: &AppState) -> Vec<ConversationRow> {
@@ -81,7 +93,10 @@ pub(crate) fn derive_conversation_rows(state: &AppState) -> Vec<ConversationRow>
         attached_tools.sort_by_key(|invocation| invocation.requested_at);
 
         rows.extend(group_tool_rows(
-            attached_tools.into_iter().map(derive_tool_row).collect(),
+            attached_tools
+                .into_iter()
+                .map(|invocation| derive_tool_row(session, invocation))
+                .collect(),
         ));
     }
 
@@ -93,7 +108,10 @@ pub(crate) fn derive_conversation_rows(state: &AppState) -> Vec<ConversationRow>
     orphan_tools.sort_by_key(|invocation| invocation.requested_at);
 
     rows.extend(group_tool_rows(
-        orphan_tools.into_iter().map(derive_tool_row).collect(),
+        orphan_tools
+            .into_iter()
+            .map(|invocation| derive_tool_row(session, invocation))
+            .collect(),
     ));
 
     if let Some(marker) = derive_run_marker(state) {
@@ -105,14 +123,15 @@ pub(crate) fn derive_conversation_rows(state: &AppState) -> Vec<ConversationRow>
 
 fn derive_run_marker(state: &AppState) -> Option<RunMarkerRow> {
     if state.active_run_id.is_some() {
+        let active_child_suffix = active_child_run_suffix(state);
         return match &state.status {
             AppStatus::AwaitingToolApproval => Some(RunMarkerRow {
                 kind: RunMarkerKind::AwaitingApproval,
-                label: "awaiting approval",
+                label: format_run_marker_label("awaiting approval", active_child_suffix.as_deref()),
             }),
             AppStatus::Generating | AppStatus::RunningTool => Some(RunMarkerRow {
                 kind: RunMarkerKind::Running,
-                label: "running",
+                label: format_run_marker_label("running", active_child_suffix.as_deref()),
             }),
             _ => None,
         };
@@ -121,18 +140,44 @@ fn derive_run_marker(state: &AppState) -> Option<RunMarkerRow> {
     match state.session.latest_run_status() {
         Some(RunStatus::Completed) => Some(RunMarkerRow {
             kind: RunMarkerKind::Completed,
-            label: "completed",
+            label: "completed".to_string(),
         }),
         Some(RunStatus::Failed) => Some(RunMarkerRow {
             kind: RunMarkerKind::Failed,
-            label: "failed",
+            label: "failed".to_string(),
         }),
         Some(RunStatus::Cancelled) => Some(RunMarkerRow {
             kind: RunMarkerKind::Cancelled,
-            label: "cancelled",
+            label: "cancelled".to_string(),
         }),
         _ => None,
     }
+}
+
+fn format_run_marker_label(base: &str, child_suffix: Option<&str>) -> String {
+    match child_suffix {
+        Some(child_suffix) => format!("{base} · {child_suffix}"),
+        None => base.to_string(),
+    }
+}
+
+fn active_child_run_suffix(state: &AppState) -> Option<String> {
+    let active_run_id = state.active_run_id?;
+    let invocation = state.session.tool_invocations.iter().find(|invocation| {
+        invocation.tool_name == "task" && invocation.child_run_id == Some(active_run_id)
+    })?;
+
+    Some(
+        match invocation
+            .delegation_agent_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|agent| !agent.is_empty())
+        {
+            Some(agent) => format!("subagent {agent}"),
+            None => "subagent".to_string(),
+        },
+    )
 }
 
 fn group_tool_rows(tool_rows: Vec<ToolRow>) -> Vec<ConversationRow> {
@@ -182,7 +227,11 @@ fn flush_tool_buffer(
         return;
     }
 
-    grouped_rows.extend(buffer.drain(..).map(ConversationRow::Tool));
+    grouped_rows.extend(
+        buffer
+            .drain(..)
+            .map(|tool| ConversationRow::Tool(Box::new(tool))),
+    );
 }
 
 fn classify_group_kind(tool: &ToolRow) -> Option<ToolGroupKind> {
@@ -199,17 +248,72 @@ fn classify_group_kind(tool: &ToolRow) -> Option<ToolGroupKind> {
     None
 }
 
-fn derive_tool_row(invocation: &ToolInvocationRecord) -> ToolRow {
+pub(crate) fn derive_tool_row(session: &Session, invocation: &ToolInvocationRecord) -> ToolRow {
+    let delegated_task = derive_delegated_task_row(session, invocation);
+    let display_name = delegated_task_display_name(invocation, delegated_task.as_ref());
+
     ToolRow {
         tool_name: invocation.tool_name.clone(),
-        summary: summarize_tool(invocation),
+        display_name,
+        summary: summarize_tool(invocation, delegated_task.as_ref()),
         provenance_compact: summarize_tool_provenance_compact(&invocation.tool_source),
         provenance_expanded: summarize_tool_provenance_expanded(&invocation.tool_source),
         arguments_preview: summarize_json(&invocation.arguments),
+        delegated_task,
         approval_state: invocation.approval_state,
         execution_state: invocation.execution_state,
         result_preview: invocation.result.as_deref().map(summarize_text),
         error_preview: invocation.error.as_deref().map(summarize_text),
+    }
+}
+
+fn derive_delegated_task_row(
+    session: &Session,
+    invocation: &ToolInvocationRecord,
+) -> Option<DelegatedTaskRow> {
+    if invocation.tool_name != "task" {
+        return None;
+    }
+
+    let agent_name = invocation
+        .delegation_agent_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|agent| !agent.is_empty())
+        .map(str::to_owned);
+    let prompt_preview = invocation
+        .delegation_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .map(summarize_text);
+    let child_run_status = invocation
+        .child_run_id
+        .and_then(|child_run_id| session.find_run(child_run_id).map(|run| run.status));
+
+    if agent_name.is_none() && prompt_preview.is_none() && child_run_status.is_none() {
+        return None;
+    }
+
+    Some(DelegatedTaskRow {
+        agent_name,
+        prompt_preview,
+        child_run_id: invocation.child_run_id,
+        child_run_status,
+    })
+}
+
+fn delegated_task_display_name(
+    invocation: &ToolInvocationRecord,
+    delegated_task: Option<&DelegatedTaskRow>,
+) -> String {
+    if invocation.tool_name != "task" {
+        return invocation.tool_name.clone();
+    }
+
+    match delegated_task.and_then(|delegated_task| delegated_task.agent_name.as_deref()) {
+        Some(agent) => format!("task {agent}"),
+        None => invocation.tool_name.clone(),
     }
 }
 
@@ -242,7 +346,25 @@ fn format_discovery_scope(scope: fluent_code_app::plugin::DiscoveryScope) -> &'s
     }
 }
 
-fn summarize_tool(invocation: &ToolInvocationRecord) -> String {
+fn summarize_tool(
+    invocation: &ToolInvocationRecord,
+    delegated_task: Option<&DelegatedTaskRow>,
+) -> String {
+    if invocation.tool_name == "task" {
+        let display_name = delegated_task_display_name(invocation, delegated_task);
+
+        if let Some(prompt_preview) = delegated_task.and_then(|delegated_task| {
+            delegated_task
+                .prompt_preview
+                .as_deref()
+                .filter(|prompt| !prompt.is_empty())
+        }) {
+            return format!("{display_name} · {prompt_preview}");
+        }
+
+        return display_name;
+    }
+
     if let Some(path) = invocation
         .arguments
         .get("filePath")
@@ -584,6 +706,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn derive_conversation_rows_summarizes_delegated_task_with_agent_and_prompt() {
+        let parent_run_id = Uuid::new_v4();
+        let child_run_id = Uuid::new_v4();
+        let mut session = Session::new("delegated task summary");
+        let turn = make_turn(parent_run_id, Role::Assistant, "delegating now");
+        let mut invocation = make_tool_invocation(
+            parent_run_id,
+            Some(turn.id),
+            "task",
+            json!({"agent": "explore", "prompt": "Inspect session persistence state"}),
+            Utc::now(),
+        );
+        invocation.delegation_agent_name = Some("explore".to_string());
+        invocation.delegation_prompt = Some("Inspect session persistence state".to_string());
+        invocation.child_run_id = Some(child_run_id);
+        invocation.approval_state = ToolApprovalState::Approved;
+        invocation.execution_state = ToolExecutionState::Running;
+
+        session.turns.push(turn);
+        session.tool_invocations.push(invocation);
+        session.upsert_run(parent_run_id, RunStatus::InProgress);
+        session.upsert_run_with_parent(
+            child_run_id,
+            RunStatus::InProgress,
+            Some(parent_run_id),
+            Some(session.tool_invocations[0].id),
+        );
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert!(matches!(
+            &rows[1],
+            ConversationRow::Tool(tool)
+                if tool.display_name == "task explore"
+                    && tool.summary.contains("task explore")
+                    && tool.summary.contains("Inspect session persistence state")
+                    && tool
+                        .delegated_task
+                        .as_ref()
+                        .and_then(|delegated_task| delegated_task.agent_name.as_deref())
+                        == Some("explore")
+                    && tool
+                        .delegated_task
+                        .as_ref()
+                        .and_then(|delegated_task| delegated_task.child_run_status)
+                        == Some(RunStatus::InProgress)
+        ));
+    }
+
+    #[test]
+    fn derive_conversation_rows_labels_active_child_marker_as_subagent() {
+        let parent_run_id = Uuid::new_v4();
+        let child_run_id = Uuid::new_v4();
+        let mut session = Session::new("child marker label");
+        let turn = make_turn(parent_run_id, Role::Assistant, "delegating now");
+        let mut invocation = make_tool_invocation(
+            parent_run_id,
+            Some(turn.id),
+            "task",
+            json!({"agent": "explore", "prompt": "Inspect child flow"}),
+            Utc::now(),
+        );
+        invocation.delegation_agent_name = Some("explore".to_string());
+        invocation.delegation_prompt = Some("Inspect child flow".to_string());
+        invocation.child_run_id = Some(child_run_id);
+        invocation.approval_state = ToolApprovalState::Approved;
+        invocation.execution_state = ToolExecutionState::Running;
+
+        session.turns.push(turn);
+        session.tool_invocations.push(invocation);
+        session.upsert_run(parent_run_id, RunStatus::InProgress);
+        session.upsert_run_with_parent(
+            child_run_id,
+            RunStatus::InProgress,
+            Some(parent_run_id),
+            Some(session.tool_invocations[0].id),
+        );
+
+        let mut state = AppState::new(session);
+        state.active_run_id = Some(child_run_id);
+        state.status = AppStatus::Generating;
+
+        let rows = derive_conversation_rows(&state);
+
+        assert!(matches!(
+            rows.last(),
+            Some(ConversationRow::RunMarker(marker))
+                if marker.kind == RunMarkerKind::Running
+                    && marker.label == "running · subagent explore"
+        ));
+    }
+
     fn make_turn(run_id: uuid::Uuid, role: Role, content: &str) -> Turn {
         Turn {
             id: Uuid::new_v4(),
@@ -613,6 +829,9 @@ mod tests {
             execution_state: ToolExecutionState::NotStarted,
             result: None,
             error: None,
+            child_run_id: None,
+            delegation_agent_name: None,
+            delegation_prompt: None,
             requested_at,
             approved_at: None,
             completed_at: None,

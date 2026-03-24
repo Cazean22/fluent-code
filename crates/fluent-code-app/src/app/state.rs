@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use fluent_code_provider::ProviderRequest;
 use uuid::Uuid;
 
+use crate::agent::AgentRegistry;
 use crate::plugin::{PluginLoadSnapshot, ToolRegistry};
 use crate::session::model::Session;
 
@@ -12,6 +13,7 @@ const CHECKPOINT_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub session: Session,
+    pub agent_registry: Arc<AgentRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub plugin_load_snapshot: PluginLoadSnapshot,
     pub draft_input: String,
@@ -25,30 +27,54 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(session: Session) -> Self {
-        Self::new_with_tool_registry(session, Arc::new(ToolRegistry::built_in()))
+        let agent_registry = Arc::new(AgentRegistry::built_in().clone());
+        let tool_registry = Arc::new(ToolRegistry::with_agent_registry(&agent_registry));
+        Self::new_with_registries(session, agent_registry, tool_registry)
     }
 
     pub fn new_with_tool_registry(session: Session, tool_registry: Arc<ToolRegistry>) -> Self {
-        Self::new_with_plugin_state(session, tool_registry, PluginLoadSnapshot::default())
+        Self::new_with_registries(
+            session,
+            Arc::new(AgentRegistry::built_in().clone()),
+            tool_registry,
+        )
+    }
+
+    pub fn new_with_registries(
+        session: Session,
+        agent_registry: Arc<AgentRegistry>,
+        tool_registry: Arc<ToolRegistry>,
+    ) -> Self {
+        Self::new_with_plugin_state(
+            session,
+            agent_registry,
+            tool_registry,
+            PluginLoadSnapshot::default(),
+        )
     }
 
     pub fn new_with_checkpoint_interval(session: Session, checkpoint_interval: Duration) -> Self {
+        let agent_registry = Arc::new(AgentRegistry::built_in().clone());
+        let tool_registry = Arc::new(ToolRegistry::with_agent_registry(&agent_registry));
         Self::new_with_dependencies(
             session,
             checkpoint_interval,
-            Arc::new(ToolRegistry::built_in()),
+            agent_registry,
+            tool_registry,
             PluginLoadSnapshot::default(),
         )
     }
 
     pub fn new_with_plugin_state(
         session: Session,
+        agent_registry: Arc<AgentRegistry>,
         tool_registry: Arc<ToolRegistry>,
         plugin_load_snapshot: PluginLoadSnapshot,
     ) -> Self {
         Self::new_with_dependencies(
             session,
             CHECKPOINT_INTERVAL,
+            agent_registry,
             tool_registry,
             plugin_load_snapshot,
         )
@@ -57,11 +83,13 @@ impl AppState {
     pub fn new_with_dependencies(
         session: Session,
         checkpoint_interval: Duration,
+        agent_registry: Arc<AgentRegistry>,
         tool_registry: Arc<ToolRegistry>,
         plugin_load_snapshot: PluginLoadSnapshot,
     ) -> Self {
         Self {
             session,
+            agent_registry,
             tool_registry,
             plugin_load_snapshot,
             draft_input: String::new(),

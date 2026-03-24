@@ -6,6 +6,7 @@ pub mod theme;
 pub mod ui_state;
 pub mod view;
 
+use fluent_code_app::agent::AgentRegistry;
 use fluent_code_app::app::{AppState, Effect, update};
 use fluent_code_app::error::Result;
 use fluent_code_app::plugin::{PluginLoadSnapshot, ToolRegistry};
@@ -23,12 +24,18 @@ pub async fn run_app(
     session: Session,
     store: FsSessionStore,
     runtime: Runtime,
+    agent_registry: Arc<AgentRegistry>,
     tool_registry: Arc<ToolRegistry>,
     plugin_load_snapshot: PluginLoadSnapshot,
 ) -> Result<()> {
     info!(session_id = %session.id, "starting tui application");
     let mut terminal = terminal::init()?;
-    let mut state = AppState::new_with_plugin_state(session, tool_registry, plugin_load_snapshot);
+    let mut state = AppState::new_with_plugin_state(
+        session,
+        agent_registry,
+        tool_registry,
+        plugin_load_snapshot,
+    );
     let mut ui_state = UiState::default();
     let (runtime_sender, mut runtime_receiver) = tokio::sync::mpsc::unbounded_channel();
 
@@ -800,6 +807,7 @@ mod tests {
 
         let mut state = AppState::new_with_plugin_state(
             initial_session,
+            std::sync::Arc::new(fluent_code_app::agent::AgentRegistry::built_in().clone()),
             std::sync::Arc::new(fluent_code_app::plugin::ToolRegistry::built_in()),
             plugin_snapshot.clone(),
         );
@@ -842,6 +850,128 @@ mod tests {
         assert_eq!(latest.id, state.session.id);
 
         cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn task_delegation_swaps_foreground_to_child_and_back_to_parent() {
+        let _guard = test_lock().lock().await;
+        let store = FsSessionStore::new(unique_test_dir());
+        let session = Session::new("task foreground flow");
+        let mut state = AppState::new_with_checkpoint_interval(session, Duration::from_millis(10));
+        state.draft_input = "delegate".to_string();
+
+        let runtime = Runtime::new(ProviderClient::Mock(MockProvider::with_chunk_delay(
+            Duration::from_millis(5),
+        )));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ui_state = UiState::default();
+
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx.clone(),
+            Msg::SubmitPrompt,
+        )
+        .await
+        .expect("submit prompt");
+
+        let parent_run_id = state.active_run_id.expect("parent run should be active");
+
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx.clone(),
+            Msg::AssistantToolCall {
+                run_id: parent_run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "task-call-1".to_string(),
+                    name: "task".to_string(),
+                    arguments: serde_json::json!({
+                        "agent": "explore",
+                        "prompt": "Inspect session persistence"
+                    }),
+                },
+            },
+        )
+        .await
+        .expect("inject task tool call");
+
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx.clone(),
+            Msg::ApprovePendingTool,
+        )
+        .await
+        .expect("approve delegated task");
+
+        let child_run_id = state
+            .active_run_id
+            .expect("child run should become foreground");
+        assert_ne!(child_run_id, parent_run_id);
+
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx.clone(),
+            Msg::AssistantChunk {
+                run_id: child_run_id,
+                delta: "subagent answer".to_string(),
+            },
+        )
+        .await
+        .expect("child assistant chunk");
+
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx.clone(),
+            Msg::AssistantDone {
+                run_id: child_run_id,
+            },
+        )
+        .await
+        .expect("complete child run");
+
+        assert_eq!(state.active_run_id, Some(parent_run_id));
+        assert!(matches!(
+            state.status,
+            fluent_code_app::app::AppStatus::Generating
+        ));
+        assert_eq!(
+            state.session.tool_invocations[0].result.as_deref(),
+            Some("Subagent finished: subagent answer")
+        );
+
+        let persisted = store
+            .load(&state.session.id)
+            .expect("load session after task delegation");
+        assert_eq!(persisted.tool_invocations.len(), 1);
+        assert_eq!(
+            persisted.tool_invocations[0].child_run_id,
+            Some(child_run_id)
+        );
+        assert!(matches!(
+            persisted
+                .runs
+                .iter()
+                .find(|run| run.id == child_run_id)
+                .map(|run| run.status),
+            Some(fluent_code_app::session::model::RunStatus::Completed)
+        ));
+
+        drop(rx);
+        cleanup(store_root(&store));
     }
 
     fn unique_test_dir() -> PathBuf {

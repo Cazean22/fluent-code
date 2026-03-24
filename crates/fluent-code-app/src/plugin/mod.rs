@@ -5,6 +5,7 @@ mod registry;
 
 use tracing::warn;
 
+use crate::agent::AgentRegistry;
 use crate::config::Config;
 use crate::error::Result;
 
@@ -52,10 +53,14 @@ pub struct LoadedToolRegistry {
 
 pub fn load_tool_registry(config: &Config) -> Result<LoadedToolRegistry> {
     let discovery = discovery::discover_plugins(&config.plugins);
-    build_loaded_tool_registry(discovery)
+    let agent_registry = AgentRegistry::from_configured(config.agents.as_deref())?;
+    build_loaded_tool_registry(&agent_registry, discovery)
 }
 
-fn build_loaded_tool_registry(discovery: discovery::PluginDiscovery) -> Result<LoadedToolRegistry> {
+fn build_loaded_tool_registry(
+    agent_registry: &AgentRegistry,
+    discovery: discovery::PluginDiscovery,
+) -> Result<LoadedToolRegistry> {
     let mut accepted_plugins = Vec::new();
     let mut accepted_plugin_metadata = Vec::new();
     let mut warnings = Vec::new();
@@ -69,7 +74,7 @@ fn build_loaded_tool_registry(discovery: discovery::PluginDiscovery) -> Result<L
         let mut candidate_plugins = accepted_plugins.clone();
         candidate_plugins.push(plugin.clone());
 
-        match validate_candidate_plugins(candidate_plugins) {
+        match validate_candidate_plugins(agent_registry, candidate_plugins) {
             Ok(_) => {
                 accepted_plugin_metadata.push(LoadedPluginMetadata::from_discovered(&plugin));
                 accepted_plugins.push(plugin);
@@ -86,7 +91,7 @@ fn build_loaded_tool_registry(discovery: discovery::PluginDiscovery) -> Result<L
     }
 
     Ok(LoadedToolRegistry {
-        tool_registry: build_tool_registry(accepted_plugins)?,
+        tool_registry: build_tool_registry(agent_registry, accepted_plugins)?,
         plugin_load_snapshot: PluginLoadSnapshot {
             accepted_plugins: accepted_plugin_metadata,
             warnings,
@@ -117,26 +122,38 @@ impl LoadedPluginMetadata {
     }
 }
 
-fn validate_candidate_plugins(candidate_plugins: Vec<discovery::DiscoveredPlugin>) -> Result<()> {
+fn validate_candidate_plugins(
+    agent_registry: &AgentRegistry,
+    candidate_plugins: Vec<discovery::DiscoveredPlugin>,
+) -> Result<()> {
     #[cfg(test)]
     {
-        registry::ToolRegistry::from_discovered_with_noop_executor(candidate_plugins)
-            .map(|_| ())
+        registry::ToolRegistry::from_discovered_with_noop_executor(
+            agent_registry,
+            candidate_plugins,
+        )
+        .map(|_| ())
     }
 
     #[cfg(not(test))]
-    registry::ToolRegistry::from_discovered(candidate_plugins).map(|_| ())
+    registry::ToolRegistry::from_discovered(agent_registry, candidate_plugins).map(|_| ())
 }
 
-fn build_tool_registry(candidate_plugins: Vec<discovery::DiscoveredPlugin>) -> Result<ToolRegistry> {
+fn build_tool_registry(
+    agent_registry: &AgentRegistry,
+    candidate_plugins: Vec<discovery::DiscoveredPlugin>,
+) -> Result<ToolRegistry> {
     #[cfg(test)]
     {
-        registry::ToolRegistry::from_discovered_with_noop_executor(candidate_plugins)
+        registry::ToolRegistry::from_discovered_with_noop_executor(
+            agent_registry,
+            candidate_plugins,
+        )
     }
 
     #[cfg(not(test))]
     {
-        registry::ToolRegistry::from_discovered(candidate_plugins)
+        registry::ToolRegistry::from_discovered(agent_registry, candidate_plugins)
     }
 }
 
@@ -146,6 +163,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::agent::AgentRegistry;
     use crate::config::{Config, LoggingConfig, ModelConfig, PluginConfig};
     use crate::plugin::discovery::{DiscoveredPlugin, PluginDiscovery};
     use crate::plugin::manifest::{
@@ -157,35 +175,38 @@ mod tests {
 
     #[test]
     fn load_tool_registry_preserves_plugin_snapshot_and_warnings() {
-        let loaded = build_loaded_tool_registry(PluginDiscovery {
-            plugins: vec![
-                discovered_plugin(
-                    "global.docs",
-                    "Docs Plugin",
-                    "0.2.0",
-                    super::DiscoveryScope::Global,
-                    Some("Indexes docs for the workspace."),
-                    &["docs_search", "docs_read"],
-                ),
-                discovered_plugin(
-                    "project.docs",
-                    "Project Docs",
-                    "1.0.0",
-                    super::DiscoveryScope::Project,
-                    None,
-                    &["read"],
-                ),
-            ],
-            warnings: vec![
-                "failed to parse plugin manifest '/tmp/broken/plugin.toml': invalid type"
-                    .to_string(),
-            ],
-        })
+        let loaded = build_loaded_tool_registry(
+            AgentRegistry::built_in(),
+            PluginDiscovery {
+                plugins: vec![
+                    discovered_plugin(
+                        "global.docs",
+                        "Docs Plugin",
+                        "0.2.0",
+                        super::DiscoveryScope::Global,
+                        Some("Indexes docs for the workspace."),
+                        &["docs_search", "docs_read"],
+                    ),
+                    discovered_plugin(
+                        "project.docs",
+                        "Project Docs",
+                        "1.0.0",
+                        super::DiscoveryScope::Project,
+                        None,
+                        &["read"],
+                    ),
+                ],
+                warnings: vec![
+                    "failed to parse plugin manifest '/tmp/broken/plugin.toml': invalid type"
+                        .to_string(),
+                ],
+            },
+        )
         .expect("load plugin registry with snapshot");
 
         assert_eq!(loaded.plugin_load_snapshot.plugin_count(), 1);
         assert_eq!(loaded.plugin_load_snapshot.warning_count(), 2);
-        assert_eq!(loaded.tool_registry.provider_tools().len(), 6);
+        assert_eq!(loaded.tool_registry.provider_tools().len(), 7);
 
         let plugin = &loaded.plugin_load_snapshot.accepted_plugins[0];
         assert_eq!(plugin.name, "Docs Plugin");
@@ -234,7 +255,7 @@ mod tests {
 
         assert_eq!(loaded.plugin_load_snapshot.plugin_count(), 1);
         assert_eq!(loaded.plugin_load_snapshot.warning_count(), 0);
-        assert_eq!(loaded.tool_registry.provider_tools().len(), 6);
+        assert_eq!(loaded.tool_registry.provider_tools().len(), 7);
 
         cleanup(&base);
     }
@@ -254,6 +275,7 @@ mod tests {
                 reasoning_effort: None,
                 system_prompt: "test".to_string(),
             },
+            agents: None,
             plugins: PluginConfig {
                 enable_project_plugins: true,
                 enable_global_plugins: true,
@@ -292,14 +314,8 @@ mod tests {
         }
 
         fs::write(plugin_dir.join("plugin.toml"), manifest).expect("write plugin manifest");
-        fs::copy(locate_test_component(), plugin_dir.join("plugin.wasm"))
-            .expect("copy valid test plugin component");
-    }
-
-    fn locate_test_component() -> std::path::PathBuf {
-        PathBuf::from(
-            "/Users/yangtingmei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wit-bindgen-0.36.0/wasi-cli@0.2.0.wasm",
-        )
+        fs::write(plugin_dir.join("plugin.wasm"), b"test-component")
+            .expect("write placeholder plugin component");
     }
 
     fn discovered_plugin(

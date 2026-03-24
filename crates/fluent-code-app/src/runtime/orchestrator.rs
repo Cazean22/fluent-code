@@ -361,7 +361,7 @@ mod tests {
                     vec![ProviderMessage::UserText {
                         text: "please use uppercase_text: hello world".to_string(),
                     }],
-                    crate::tool::built_in_tools(),
+                    crate::tool::built_in_tools(crate::agent::AgentRegistry::built_in()),
                 ),
             },
             tx,
@@ -512,5 +512,40 @@ mod tests {
                 _ => break,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn child_request_uses_system_prompt_override_without_task_tool() {
+        let runtime = Runtime::new(ProviderClient::Mock(MockProvider::with_chunk_delay(
+            tokio::time::Duration::from_millis(5),
+        )));
+        let run_id = uuid::Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        runtime.spawn_effect(
+            Effect::StartAssistant {
+                run_id,
+                request: ProviderRequest::new(
+                    vec![ProviderMessage::UserText {
+                        text: "child prompt".to_string(),
+                    }],
+                    crate::tool::built_in_tools(crate::agent::AgentRegistry::built_in())
+                        .into_iter()
+                        .filter(|tool| tool.name != "task")
+                        .collect(),
+                )
+                .with_system_prompt_override(Some("You are a child agent".to_string())),
+            },
+            tx,
+        );
+
+        let message = tokio::time::timeout(tokio::time::Duration::from_millis(300), rx.recv())
+            .await
+            .expect("receive child assistant chunk")
+            .expect("child assistant message");
+
+        assert!(
+            matches!(message, Msg::AssistantChunk { run_id: received_run_id, .. } if received_run_id == run_id)
+        );
     }
 }

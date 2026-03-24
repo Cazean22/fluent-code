@@ -5,6 +5,7 @@ use fluent_code_provider::{ProviderTool, ProviderToolCall};
 use regex::Regex;
 use serde_json::Value;
 
+use crate::agent::{AgentRegistry, TASK_TOOL_NAME, task_tool};
 use crate::error::{FluentCodeError, Result};
 
 const UPPERCASE_TEXT_TOOL_NAME: &str = "uppercase_text";
@@ -19,8 +20,14 @@ const MAX_GLOB_MATCHES: usize = 200;
 const DEFAULT_GREP_HEAD_LIMIT: usize = 50;
 const MAX_GREP_HEAD_LIMIT: usize = 200;
 
-pub fn built_in_tools() -> Vec<ProviderTool> {
-    vec![uppercase_text_tool(), read_tool(), glob_tool(), grep_tool()]
+pub fn built_in_tools(agent_registry: &AgentRegistry) -> Vec<ProviderTool> {
+    vec![
+        uppercase_text_tool(),
+        read_tool(),
+        glob_tool(),
+        grep_tool(),
+        task_tool(agent_registry),
+    ]
 }
 
 pub fn built_in_tool_names() -> &'static [&'static str] {
@@ -29,6 +36,7 @@ pub fn built_in_tool_names() -> &'static [&'static str] {
         READ_TOOL_NAME,
         GLOB_TOOL_NAME,
         GREP_TOOL_NAME,
+        TASK_TOOL_NAME,
     ]
 }
 
@@ -40,6 +48,9 @@ pub fn execute_built_in_tool(tool_call: &ProviderToolCall) -> Result<String> {
         READ_TOOL_NAME => execute_read(&workspace_root, &tool_call.arguments),
         GLOB_TOOL_NAME => execute_glob(&workspace_root, &tool_call.arguments),
         GREP_TOOL_NAME => execute_grep(&workspace_root, &tool_call.arguments),
+        TASK_TOOL_NAME => Err(FluentCodeError::Provider(
+            "task tool execution is handled by app orchestration".to_string(),
+        )),
         other => Err(FluentCodeError::Provider(format!(
             "unsupported built-in tool '{other}'"
         ))),
@@ -482,6 +493,8 @@ mod tests {
 
     use fluent_code_provider::ProviderToolCall;
 
+    use crate::agent::AgentRegistry;
+
     use super::{built_in_tools, execute_built_in_tool};
 
     fn current_dir_lock() -> &'static Mutex<()> {
@@ -491,7 +504,7 @@ mod tests {
 
     #[test]
     fn built_in_tools_include_read_glob_and_grep() {
-        let tools = built_in_tools();
+        let tools = built_in_tools(AgentRegistry::built_in());
         let names = tools
             .iter()
             .map(|tool| tool.name.as_str())
@@ -500,6 +513,7 @@ mod tests {
         assert!(names.contains(&"read"));
         assert!(names.contains(&"glob"));
         assert!(names.contains(&"grep"));
+        assert!(names.contains(&"task"));
     }
 
     #[test]

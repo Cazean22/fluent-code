@@ -48,6 +48,33 @@ impl Session {
         self.runs.push(RunRecord {
             id: run_id,
             status,
+            parent_run_id: None,
+            parent_tool_invocation_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+    }
+
+    pub fn upsert_run_with_parent(
+        &mut self,
+        run_id: RunId,
+        status: RunStatus,
+        parent_run_id: Option<RunId>,
+        parent_tool_invocation_id: Option<ToolInvocationId>,
+    ) {
+        if let Some(run) = self.runs.iter_mut().find(|run| run.id == run_id) {
+            run.status = status;
+            run.parent_run_id = parent_run_id;
+            run.parent_tool_invocation_id = parent_tool_invocation_id;
+            run.updated_at = Utc::now();
+            return;
+        }
+
+        self.runs.push(RunRecord {
+            id: run_id,
+            status,
+            parent_run_id,
+            parent_tool_invocation_id,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
@@ -55,6 +82,14 @@ impl Session {
 
     pub fn latest_run_status(&self) -> Option<RunStatus> {
         self.runs.last().map(|run| run.status)
+    }
+
+    pub fn find_run(&self, run_id: RunId) -> Option<&RunRecord> {
+        self.runs.iter().find(|run| run.id == run_id)
+    }
+
+    pub fn find_run_mut(&mut self, run_id: RunId) -> Option<&mut RunRecord> {
+        self.runs.iter_mut().find(|run| run.id == run_id)
     }
 
     pub fn pending_tool_invocation(&self) -> Option<&ToolInvocationRecord> {
@@ -85,6 +120,10 @@ impl Session {
 pub struct RunRecord {
     pub id: RunId,
     pub status: RunStatus,
+    #[serde(default)]
+    pub parent_run_id: Option<RunId>,
+    #[serde(default)]
+    pub parent_tool_invocation_id: Option<ToolInvocationId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -116,6 +155,12 @@ pub struct ToolInvocationRecord {
     pub result: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub child_run_id: Option<RunId>,
+    #[serde(default)]
+    pub delegation_agent_name: Option<String>,
+    #[serde(default)]
+    pub delegation_prompt: Option<String>,
     pub requested_at: DateTime<Utc>,
     #[serde(default)]
     pub approved_at: Option<DateTime<Utc>>,

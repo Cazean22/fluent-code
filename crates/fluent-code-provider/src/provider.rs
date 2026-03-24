@@ -93,11 +93,22 @@ pub struct ProviderRequest {
     pub messages: Vec<ProviderMessage>,
     #[serde(default)]
     pub tools: Vec<ProviderTool>,
+    #[serde(default)]
+    pub system_prompt_override: Option<String>,
 }
 
 impl ProviderRequest {
     pub fn new(messages: Vec<ProviderMessage>, tools: Vec<ProviderTool>) -> Self {
-        Self { messages, tools }
+        Self {
+            messages,
+            tools,
+            system_prompt_override: None,
+        }
+    }
+
+    pub fn with_system_prompt_override(mut self, system_prompt_override: Option<String>) -> Self {
+        self.system_prompt_override = system_prompt_override;
+        self
     }
 }
 
@@ -265,4 +276,41 @@ fn chunk_text(text: &str) -> Vec<String> {
     }
 
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProviderMessage, ProviderRequest, ProviderTool};
+
+    #[test]
+    fn provider_request_defaults_to_no_system_prompt_override() {
+        let request = ProviderRequest::new(
+            vec![ProviderMessage::UserText {
+                text: "hello".to_string(),
+            }],
+            vec![ProviderTool {
+                name: "read".to_string(),
+                description: "read tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+        );
+
+        assert!(request.system_prompt_override.is_none());
+    }
+
+    #[test]
+    fn provider_request_can_override_system_prompt() {
+        let request = ProviderRequest::new(
+            vec![ProviderMessage::UserText {
+                text: "delegate".to_string(),
+            }],
+            vec![],
+        )
+        .with_system_prompt_override(Some("You are a child agent".to_string()));
+
+        assert_eq!(
+            request.system_prompt_override.as_deref(),
+            Some("You are a child agent")
+        );
+    }
 }
