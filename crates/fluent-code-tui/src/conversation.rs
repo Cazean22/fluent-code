@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use fluent_code_app::app::{AppState, AppStatus};
 use fluent_code_app::session::model::{
     Role, RunStatus, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
@@ -80,60 +81,116 @@ pub(crate) struct RunMarkerRow {
 }
 
 pub(crate) fn derive_conversation_rows(state: &AppState) -> Vec<ConversationRow> {
-    let mut rows = Vec::new();
     let session = &state.session;
 
-    for turn in &session.turns {
-        rows.push(ConversationRow::Turn(TurnRow {
-            role: turn.role,
-            content: turn.content.clone(),
-            is_streaming: matches!(turn.role, Role::Assistant)
-                && state.active_run_id == Some(turn.run_id)
-                && matches!(state.status, AppStatus::Generating),
-        }));
+    // Build a flat timeline of all events sorted by timestamp so that
+    // reasoning, turns, and tool calls appear in the order they actually
+    // happened rather than being grouped by turn.
+    let mut timeline = build_timeline(state);
+    timeline.sort_by_key(|e| e.sort_key);
 
-        if matches!(turn.role, Role::Assistant) && !turn.reasoning.is_empty() {
-            rows.push(ConversationRow::Reasoning(ReasoningRow {
-                content: turn.reasoning.clone(),
-                is_streaming: state.active_run_id == Some(turn.run_id)
-                    && matches!(state.status, AppStatus::Generating),
-            }));
+    let mut rows = Vec::new();
+    let mut pending_tools: Vec<ToolRow> = Vec::new();
+
+    for entry in &timeline {
+        match entry.kind {
+            TimelineKind::Reasoning(turn_idx) => {
+                flush_pending_tools(&mut rows, &mut pending_tools);
+                let turn = &session.turns[turn_idx];
+                let is_streaming = matches!(turn.role, Role::Assistant)
+                    && state.active_run_id == Some(turn.run_id)
+                    && matches!(state.status, AppStatus::Generating);
+                rows.push(ConversationRow::Reasoning(ReasoningRow {
+                    content: turn.reasoning.clone(),
+                    is_streaming,
+                }));
+            }
+            TimelineKind::Turn(turn_idx) => {
+                flush_pending_tools(&mut rows, &mut pending_tools);
+                let turn = &session.turns[turn_idx];
+                let is_streaming = matches!(turn.role, Role::Assistant)
+                    && state.active_run_id == Some(turn.run_id)
+                    && matches!(state.status, AppStatus::Generating);
+                rows.push(ConversationRow::Turn(TurnRow {
+                    role: turn.role,
+                    content: turn.content.clone(),
+                    is_streaming,
+                }));
+            }
+            TimelineKind::Tool(inv_idx) => {
+                let invocation = &session.tool_invocations[inv_idx];
+                pending_tools.push(derive_tool_row(session, invocation));
+            }
         }
-
-        let mut attached_tools = session
-            .tool_invocations
-            .iter()
-            .filter(|invocation| invocation.preceding_turn_id == Some(turn.id))
-            .collect::<Vec<_>>();
-        attached_tools.sort_by_key(|invocation| invocation.requested_at);
-
-        rows.extend(group_tool_rows(
-            attached_tools
-                .into_iter()
-                .map(|invocation| derive_tool_row(session, invocation))
-                .collect(),
-        ));
     }
 
-    let mut orphan_tools = session
-        .tool_invocations
-        .iter()
-        .filter(|invocation| invocation.preceding_turn_id.is_none())
-        .collect::<Vec<_>>();
-    orphan_tools.sort_by_key(|invocation| invocation.requested_at);
-
-    rows.extend(group_tool_rows(
-        orphan_tools
-            .into_iter()
-            .map(|invocation| derive_tool_row(session, invocation))
-            .collect(),
-    ));
+    flush_pending_tools(&mut rows, &mut pending_tools);
 
     if let Some(marker) = derive_run_marker(state) {
         rows.push(ConversationRow::RunMarker(marker));
     }
 
     rows
+}
+
+// ---------------------------------------------------------------------------
+// Timeline construction
+// ---------------------------------------------------------------------------
+
+/// Priority within the same timestamp: reasoning (0) < turn content (1) < tool (2).
+const PRIORITY_REASONING: u8 = 0;
+const PRIORITY_TURN: u8 = 1;
+const PRIORITY_TOOL: u8 = 2;
+
+enum TimelineKind {
+    Reasoning(usize),
+    Turn(usize),
+    Tool(usize),
+}
+
+struct TimelineEntry {
+    /// `(timestamp, priority, sequence)` – used for a single `sort_by_key`.
+    sort_key: (DateTime<Utc>, u8, usize),
+    kind: TimelineKind,
+}
+
+fn build_timeline(state: &AppState) -> Vec<TimelineEntry> {
+    let session = &state.session;
+    let mut entries = Vec::new();
+    let mut seq = 0usize;
+
+    for (i, turn) in session.turns.iter().enumerate() {
+        if matches!(turn.role, Role::Assistant) && !turn.reasoning.is_empty() {
+            entries.push(TimelineEntry {
+                sort_key: (turn.timestamp, PRIORITY_REASONING, seq),
+                kind: TimelineKind::Reasoning(i),
+            });
+            seq += 1;
+        }
+
+        entries.push(TimelineEntry {
+            sort_key: (turn.timestamp, PRIORITY_TURN, seq),
+            kind: TimelineKind::Turn(i),
+        });
+        seq += 1;
+    }
+
+    for (i, invocation) in session.tool_invocations.iter().enumerate() {
+        entries.push(TimelineEntry {
+            sort_key: (invocation.requested_at, PRIORITY_TOOL, seq),
+            kind: TimelineKind::Tool(i),
+        });
+        seq += 1;
+    }
+
+    entries
+}
+
+fn flush_pending_tools(rows: &mut Vec<ConversationRow>, pending: &mut Vec<ToolRow>) {
+    if pending.is_empty() {
+        return;
+    }
+    rows.extend(group_tool_rows(std::mem::take(pending)));
 }
 
 fn derive_run_marker(state: &AppState) -> Option<RunMarkerRow> {
@@ -461,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_conversation_rows_inserts_reasoning_row_after_assistant_turn() {
+    fn derive_conversation_rows_inserts_reasoning_row_before_assistant_turn() {
         let run_id = Uuid::new_v4();
         let mut session = Session::new("assistant reasoning");
         let mut turn = make_turn(run_id, Role::Assistant, "answer");
@@ -475,34 +532,39 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(matches!(
             &rows[0],
-            ConversationRow::Turn(row) if row.content == "answer"
+            ConversationRow::Reasoning(row) if row.content == "plan"
         ));
         assert!(matches!(
             &rows[1],
-            ConversationRow::Reasoning(row) if row.content == "plan"
+            ConversationRow::Turn(row) if row.content == "answer"
         ));
     }
 
     #[test]
-    fn derive_conversation_rows_inlines_tools_after_preceding_turn() {
+    fn derive_conversation_rows_interleaves_turns_and_tools_chronologically() {
         let run_id = Uuid::new_v4();
-        let mut session = Session::new("attached tools");
-        let first_turn = make_turn(run_id, Role::User, "inspect");
-        let second_turn = make_turn(run_id, Role::Assistant, "working");
+        let base = Utc::now();
+        let mut session = Session::new("chronological tools");
+
+        let mut first_turn = make_turn(run_id, Role::User, "inspect");
+        first_turn.timestamp = base;
+
+        let mut second_turn = make_turn(run_id, Role::Assistant, "working");
+        second_turn.timestamp = base + Duration::seconds(3);
 
         let early = make_tool_invocation(
             run_id,
             Some(first_turn.id),
             "search",
             json!({"query": "PersistSession"}),
-            Utc::now(),
+            base + Duration::seconds(1),
         );
         let later = make_tool_invocation(
             run_id,
             Some(first_turn.id),
             "read",
             json!({"path": "src/main.rs"}),
-            Utc::now() + Duration::seconds(1),
+            base + Duration::seconds(2),
         );
 
         session.turns = vec![first_turn.clone(), second_turn.clone()];

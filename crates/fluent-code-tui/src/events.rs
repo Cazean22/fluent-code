@@ -7,7 +7,6 @@ pub enum TuiAction {
     Message(Msg),
     ToggleToolDetails,
     ToggleHelpOverlay,
-    ToggleLayoutMode,
     ScrollUp,
     ScrollDown,
     PageUp,
@@ -41,18 +40,6 @@ pub fn next_action_from_event(
         })
     ) {
         return Some(TuiAction::ToggleToolDetails);
-    }
-
-    if matches!(
-        event,
-        Event::Key(KeyEvent {
-            code: KeyCode::F(3),
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            ..
-        })
-    ) {
-        return Some(TuiAction::ToggleLayoutMode);
     }
 
     if matches!(
@@ -293,21 +280,6 @@ mod tests {
     }
 
     #[test]
-    fn f3_maps_to_layout_toggle_action() {
-        let event = Event::Key(KeyEvent {
-            code: KeyCode::F(3),
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        });
-
-        assert!(matches!(
-            next_action_from_event(event, "draft", &AppStatus::Idle),
-            Some(TuiAction::ToggleLayoutMode)
-        ));
-    }
-
-    #[test]
     fn navigation_keys_map_to_transcript_actions() {
         let cases = [
             (KeyCode::Up, TuiAction::ScrollUp),
@@ -393,7 +365,6 @@ mod tests {
                 | (TuiAction::PageDown, TuiAction::PageDown)
                 | (TuiAction::JumpTop, TuiAction::JumpTop)
                 | (TuiAction::JumpBottom, TuiAction::JumpBottom)
-                | (TuiAction::ToggleLayoutMode, TuiAction::ToggleLayoutMode)
         )
     }
 }
