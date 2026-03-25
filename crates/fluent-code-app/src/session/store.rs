@@ -31,12 +31,24 @@ impl FsSessionStore {
 
         match self.read_latest_session_id()? {
             Some(id) => {
+                let meta_path = self.session_meta_path(&id);
                 info!(
                     session_id = %id,
                     store_root = %path_for_log(&self.root),
                     "loading latest persisted session"
                 );
-                self.load(&id)
+                if !meta_path.exists() {
+                    warn!(
+                        session_id = %id,
+                        store_root = %path_for_log(&self.root),
+                        session_meta_path = %path_for_log(&meta_path),
+                        latest_session_path = %path_for_log(&self.latest_session_path()),
+                        "latest session metadata missing; creating a new session"
+                    );
+                    self.create_new_session()
+                } else {
+                    self.load(&id)
+                }
             }
             None => {
                 info!(
@@ -266,6 +278,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{FsSessionStore, SessionStore};
+    use crate::error::FluentCodeError;
     use crate::session::model::{
         Role, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, ToolSource,
         Turn,
@@ -316,6 +329,7 @@ mod tests {
             run_id: Uuid::new_v4(),
             role: Role::User,
             content: "hello".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         });
 
@@ -369,6 +383,60 @@ mod tests {
     }
 
     #[test]
+    fn loads_legacy_turns_without_reasoning_field() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+
+        let session = Session::new("legacy turns");
+        let session_dir = root.join("sessions").join(session.id.to_string());
+        std::fs::create_dir_all(&session_dir).expect("create legacy session dir");
+
+        std::fs::write(root.join("latest_session"), session.id.to_string())
+            .expect("write latest session id");
+
+        std::fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "id": session.id,
+                "title": session.title,
+                "created_at": session.created_at,
+                "updated_at": session.updated_at,
+                "runs": [],
+                "tool_invocations": []
+            }))
+            .expect("serialize legacy session metadata"),
+        )
+        .expect("write session metadata");
+
+        std::fs::write(
+            session_dir.join("turns.jsonl"),
+            format!(
+                concat!(
+                    "{{",
+                    "\"id\":\"{}\",",
+                    "\"run_id\":\"{}\",",
+                    "\"role\":\"Assistant\",",
+                    "\"content\":\"hello\",",
+                    "\"timestamp\":\"{}\"",
+                    "}}\n"
+                ),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Utc::now().to_rfc3339(),
+            ),
+        )
+        .expect("write legacy turn row");
+
+        let loaded = store.load(&session.id).expect("load legacy turns");
+
+        assert_eq!(loaded.turns.len(), 1);
+        assert_eq!(loaded.turns[0].content, "hello");
+        assert_eq!(loaded.turns[0].reasoning, "");
+
+        cleanup(root);
+    }
+
+    #[test]
     fn saves_and_restores_tool_invocations() {
         let root = unique_test_dir();
         let store = FsSessionStore::new(root.clone());
@@ -404,6 +472,76 @@ mod tests {
         assert_eq!(loaded.tool_invocations.len(), 1);
         assert_eq!(loaded.tool_invocations[0].tool_name, "uppercase_text");
         assert_eq!(loaded.tool_invocations[0].result.as_deref(), Some("HELLO"));
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn stale_latest_session_pointer_creates_new_session() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+        let stale_id = Uuid::new_v4();
+
+        std::fs::create_dir_all(root.join("sessions")).expect("create sessions root");
+        std::fs::write(root.join("latest_session"), stale_id.to_string())
+            .expect("write stale latest session id");
+
+        let created = store
+            .load_or_create_latest()
+            .expect("create session for stale latest pointer");
+
+        assert_ne!(created.id, stale_id);
+        assert_eq!(created.title, "New Session");
+        assert!(store.session_meta_path(&created.id).exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("latest_session")).expect("read latest session id"),
+            created.id.to_string()
+        );
+
+        let reloaded = store
+            .load_or_create_latest()
+            .expect("load replacement latest session");
+        assert_eq!(reloaded.id, created.id);
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn load_errors_when_session_metadata_is_missing() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+        let session_id = Uuid::new_v4();
+
+        let err = store
+            .load(&session_id)
+            .expect_err("missing session metadata should error");
+
+        assert_eq!(
+            err.to_string(),
+            format!("invalid session data: session metadata not found for {session_id}")
+        );
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn malformed_latest_session_metadata_still_errors() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+        let session_id = Uuid::new_v4();
+        let session_dir = root.join("sessions").join(session_id.to_string());
+
+        std::fs::create_dir_all(&session_dir).expect("create session dir");
+        std::fs::write(root.join("latest_session"), session_id.to_string())
+            .expect("write latest session id");
+        std::fs::write(session_dir.join("session.json"), "{not valid json")
+            .expect("write malformed session metadata");
+
+        let err = store
+            .load_or_create_latest()
+            .expect_err("malformed latest session metadata should error");
+
+        assert!(matches!(err, FluentCodeError::SerdeJson(_)));
 
         cleanup(root);
     }

@@ -207,6 +207,8 @@ pub struct Turn {
     pub run_id: RunId,
     pub role: Role,
     pub content: String,
+    #[serde(default)]
+    pub reasoning: String,
     pub timestamp: DateTime<Utc>,
 }
 
