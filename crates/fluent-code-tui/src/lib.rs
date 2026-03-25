@@ -82,7 +82,12 @@ async fn run_loop(
             break;
         }
 
-        if let Some(action) = events::next_action(&state.draft_input, &state.status)? {
+        // Drain all pending input events before the next render so that
+        // accumulated mouse-wheel / arrow-key events are collapsed into a
+        // single scroll adjustment instead of one-render-per-event.
+        let mut scroll_delta: i16 = 0;
+
+        while let Some(action) = events::next_action(&state.draft_input, &state.status)? {
             match action {
                 TuiAction::Message(msg) => {
                     handle_message(state, store, runtime, ui_state, runtime_sender.clone(), msg)
@@ -97,16 +102,28 @@ async fn run_loop(
                 TuiAction::ToggleLayoutMode => {
                     ui_state.layout_mode = ui_state.layout_mode.toggle();
                 }
-                TuiAction::ScrollUp => adjust_transcript_scroll(terminal, state, ui_state, -1)?,
-                TuiAction::ScrollDown => adjust_transcript_scroll(terminal, state, ui_state, 1)?,
-                TuiAction::PageUp => adjust_transcript_scroll(terminal, state, ui_state, -10)?,
-                TuiAction::PageDown => adjust_transcript_scroll(terminal, state, ui_state, 10)?,
+                TuiAction::ScrollUp => scroll_delta = scroll_delta.saturating_sub(1),
+                TuiAction::ScrollDown => scroll_delta = scroll_delta.saturating_add(1),
+                TuiAction::PageUp => scroll_delta = scroll_delta.saturating_sub(10),
+                TuiAction::PageDown => scroll_delta = scroll_delta.saturating_add(10),
                 TuiAction::JumpTop => {
+                    scroll_delta = 0;
                     ui_state.transcript_scroll_top = 0;
                     ui_state.transcript_follow_tail = false;
                 }
-                TuiAction::JumpBottom => ui_state.reset_transcript_navigation(),
+                TuiAction::JumpBottom => {
+                    scroll_delta = 0;
+                    ui_state.reset_transcript_navigation();
+                }
             }
+
+            if state.should_quit {
+                break;
+            }
+        }
+
+        if scroll_delta != 0 {
+            adjust_transcript_scroll(terminal, state, ui_state, scroll_delta)?;
         }
     }
 

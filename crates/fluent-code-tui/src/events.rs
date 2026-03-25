@@ -224,7 +224,10 @@ pub fn map_event_to_message(event: Event, current_input: &str, status: &AppStatu
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton,
+        MouseEvent, MouseEventKind,
+    };
     use fluent_code_app::app::{AppStatus, Msg};
 
     use super::{TuiAction, map_event_to_message, next_action_from_event};
@@ -235,7 +238,7 @@ mod tests {
             code: KeyCode::Char('n'),
             modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::NONE,
+            state: KeyEventState::NONE,
         });
 
         assert!(matches!(
@@ -247,7 +250,7 @@ mod tests {
             code: KeyCode::Char('n'),
             modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::NONE,
+            state: KeyEventState::NONE,
         });
         assert!(matches!(
             map_event_to_message(ctrl_n, "draft", &AppStatus::Error("boom".to_string())),
@@ -258,7 +261,7 @@ mod tests {
             code: KeyCode::Char('n'),
             modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::NONE,
+            state: KeyEventState::NONE,
         });
         assert!(map_event_to_message(ctrl_n, "draft", &AppStatus::Generating).is_none());
     }
@@ -269,19 +272,19 @@ mod tests {
             code: KeyCode::F(1),
             modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::NONE,
+            state: KeyEventState::NONE,
         });
         let f2 = Event::Key(KeyEvent {
             code: KeyCode::F(2),
             modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::NONE,
+            state: KeyEventState::NONE,
         });
         let f3 = Event::Key(KeyEvent {
             code: KeyCode::F(3),
             modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::NONE,
+            state: KeyEventState::NONE,
         });
 
         assert!(map_event_to_message(f1, "draft", &AppStatus::Idle).is_none());
@@ -295,7 +298,7 @@ mod tests {
             code: KeyCode::F(3),
             modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::NONE,
+            state: KeyEventState::NONE,
         });
 
         assert!(matches!(
@@ -320,12 +323,38 @@ mod tests {
                 code,
                 modifiers: KeyModifiers::NONE,
                 kind: KeyEventKind::Press,
-                state: crossterm::event::KeyEventState::NONE,
+                state: KeyEventState::NONE,
             });
 
             let action = next_action_from_event(event, "draft", &AppStatus::Idle);
             assert!(matches!(action, Some(actual) if same_action_variant(&actual, &expected)));
         }
+    }
+
+    #[test]
+    fn mouse_wheel_events_are_ignored() {
+        for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+            let event = Event::Mouse(MouseEvent {
+                kind,
+                column: 12,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            });
+
+            assert!(next_action_from_event(event, "draft", &AppStatus::Idle).is_none());
+        }
+    }
+
+    #[test]
+    fn non_wheel_mouse_events_do_not_map_to_actions() {
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(next_action_from_event(event, "draft", &AppStatus::Idle).is_none());
     }
 
     #[test]
