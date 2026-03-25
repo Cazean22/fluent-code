@@ -79,16 +79,22 @@ impl RigOpenAiProvider {
             })
             .collect::<Vec<_>>();
 
-        let _reasoning_effort = &self.reasoning_effort;
         let system_prompt = request
             .system_prompt_override
             .clone()
             .unwrap_or_else(|| self.system_prompt.clone());
 
-        let mut stream = RigCompletionModel::completion_request(&model, to_rig_message(prompt))
-            .preamble(system_prompt)
-            .messages(history.iter().map(to_rig_message).collect())
-            .tools(tool_definitions)
+        let mut completion_request =
+            RigCompletionModel::completion_request(&model, to_rig_message(prompt))
+                .preamble(system_prompt)
+                .messages(history.iter().map(to_rig_message).collect())
+                .tools(tool_definitions);
+
+        if let Some(params) = reasoning_effort_additional_params(self.reasoning_effort.as_deref()) {
+            completion_request = completion_request.additional_params(params);
+        }
+
+        let mut stream = completion_request
             .stream()
             .await
             .map_err(|error| ProviderError::Message(error.to_string()))?;
@@ -162,6 +168,41 @@ fn validate_openai_tool_call_id(tool_name: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+fn parse_reasoning_effort(value: &str) -> Option<openai::responses_api::ReasoningEffort> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(openai::responses_api::ReasoningEffort::None),
+        "minimal" => Some(openai::responses_api::ReasoningEffort::Minimal),
+        "low" => Some(openai::responses_api::ReasoningEffort::Low),
+        "medium" => Some(openai::responses_api::ReasoningEffort::Medium),
+        "high" => Some(openai::responses_api::ReasoningEffort::High),
+        "xhigh" => Some(openai::responses_api::ReasoningEffort::Xhigh),
+        _ => None,
+    }
+}
+
+fn reasoning_effort_additional_params(value: Option<&str>) -> Option<serde_json::Value> {
+    let value = value?;
+    let effort = match parse_reasoning_effort(value) {
+        Some(effort) => effort,
+        None => {
+            warn!(
+                provider = "openai",
+                reasoning_effort = %value,
+                "ignoring unsupported reasoning_effort setting"
+            );
+            return None;
+        }
+    };
+
+    Some(
+        openai::responses_api::AdditionalParameters {
+            reasoning: Some(openai::responses_api::Reasoning::new().with_effort(effort)),
+            ..Default::default()
+        }
+        .to_json(),
+    )
+}
+
 fn to_rig_message(message: &ProviderMessage) -> Message {
     match message {
         ProviderMessage::UserText { text } => Message::user(text.clone()),
@@ -208,8 +249,12 @@ fn resolve_api_key(provider_config: &ProviderConfig) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_openai_tool_call_id;
+    use super::{
+        parse_reasoning_effort, reasoning_effort_additional_params, validate_openai_tool_call_id,
+    };
     use crate::ProviderError;
+    use rig::providers::openai;
+    use serde_json::Value;
 
     #[test]
     fn validate_openai_tool_call_id_accepts_non_empty_id() {
@@ -238,5 +283,59 @@ mod tests {
             ProviderError::Message(message)
                 if message == "openai stream emitted tool call 'glob' with empty id"
         ));
+    }
+
+    #[test]
+    fn parse_reasoning_effort_accepts_supported_values() {
+        assert!(matches!(
+            parse_reasoning_effort("none"),
+            Some(openai::responses_api::ReasoningEffort::None)
+        ));
+        assert!(matches!(
+            parse_reasoning_effort("minimal"),
+            Some(openai::responses_api::ReasoningEffort::Minimal)
+        ));
+        assert!(matches!(
+            parse_reasoning_effort("low"),
+            Some(openai::responses_api::ReasoningEffort::Low)
+        ));
+        assert!(matches!(
+            parse_reasoning_effort("medium"),
+            Some(openai::responses_api::ReasoningEffort::Medium)
+        ));
+        assert!(matches!(
+            parse_reasoning_effort("high"),
+            Some(openai::responses_api::ReasoningEffort::High)
+        ));
+        assert!(matches!(
+            parse_reasoning_effort("xhigh"),
+            Some(openai::responses_api::ReasoningEffort::Xhigh)
+        ));
+        assert!(matches!(
+            parse_reasoning_effort(" High "),
+            Some(openai::responses_api::ReasoningEffort::High)
+        ));
+    }
+
+    #[test]
+    fn parse_reasoning_effort_rejects_unknown_value() {
+        assert!(parse_reasoning_effort("turbo").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_additional_params_serializes_reasoning_effort() {
+        let params = reasoning_effort_additional_params(Some("medium"))
+            .expect("supported reasoning effort should produce additional params");
+
+        assert_eq!(
+            params["reasoning"]["effort"],
+            Value::String("medium".to_string())
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_additional_params_returns_none_for_none_or_invalid_value() {
+        assert!(reasoning_effort_additional_params(None).is_none());
+        assert!(reasoning_effort_additional_params(Some("unknown")).is_none());
     }
 }

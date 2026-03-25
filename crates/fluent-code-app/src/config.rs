@@ -7,7 +7,7 @@ use std::{
 use fluent_code_provider::ProviderConfig;
 use serde::Deserialize;
 
-use crate::Result;
+use crate::{FluentCodeError, Result};
 
 const ROOT_CONFIG_FILE: &str = "fluent-code.toml";
 const DATA_DIR_CONFIG_FILE: &str = "config.toml";
@@ -128,7 +128,8 @@ impl Config {
         }
 
         if let Some(reasoning_effort) = raw.model_reasoning_effort {
-            config.model.reasoning_effort = Some(reasoning_effort);
+            config.model.reasoning_effort =
+                Some(validate_model_reasoning_effort(reasoning_effort)?);
         }
 
         if let Some(system_prompt) = raw.system_prompt {
@@ -296,6 +297,25 @@ fn resolve_path(current_dir: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
+fn validate_model_reasoning_effort(value: String) -> Result<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+
+    if is_supported_reasoning_effort(&normalized) {
+        return Ok(normalized);
+    }
+
+    Err(FluentCodeError::Config(format!(
+        "invalid model_reasoning_effort value '{value}'; expected one of: none, minimal, low, medium, high, xhigh"
+    )))
+}
+
+fn is_supported_reasoning_effort(value: &str) -> bool {
+    matches!(
+        value,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -303,6 +323,7 @@ mod tests {
     use fluent_code_provider::WireApi;
 
     use super::{AgentConfig, Config, LoggingConfig};
+    use crate::FluentCodeError;
 
     #[test]
     fn parses_toml_model_and_provider_settings() {
@@ -391,6 +412,36 @@ api_key_envs = ["OPENAI_API_KEY", "OPENAI_FALLBACK_KEY"]
         );
         assert!(config.agents.is_none());
         assert!(config.model_providers.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_model_reasoning_effort() {
+        let error = Config::from_toml_str(
+            r#"
+model_reasoning_effort = "turbo"
+"#,
+            Path::new("/tmp/fluent-code-config"),
+        )
+        .expect_err("invalid reasoning effort should fail config loading");
+
+        assert!(matches!(
+            error,
+            FluentCodeError::Config(message)
+                if message == "invalid model_reasoning_effort value 'turbo'; expected one of: none, minimal, low, medium, high, xhigh"
+        ));
+    }
+
+    #[test]
+    fn normalizes_model_reasoning_effort_during_loading() {
+        let config = Config::from_toml_str(
+            r#"
+model_reasoning_effort = " High "
+"#,
+            Path::new("/tmp/fluent-code-config"),
+        )
+        .expect("supported reasoning effort should parse after normalization");
+
+        assert_eq!(config.model.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]

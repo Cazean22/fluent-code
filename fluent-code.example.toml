@@ -17,6 +17,8 @@ global_dir = ".fluent-code/plugins"
 
 model_provider = "openai"
 model = "gpt-5.4"
+# Supported values: none, minimal, low, medium, high, xhigh.
+# Values are trimmed and normalized to lowercase during config loading.
 model_reasoning_effort = "medium"
 system_prompt = "You are a helpful coding assistant."
 
