@@ -327,6 +327,13 @@ fn log_tui_message(context: &str, state: &AppState, message: &fluent_code_app::a
             chunk_bytes = delta.len(),
             "{context}"
         ),
+        fluent_code_app::app::Msg::AssistantReasoningChunk { run_id, delta } => debug!(
+            session_id = %state.session.id,
+            message_kind = "assistant_reasoning_chunk",
+            run_id = %run_id,
+            chunk_bytes = delta.len(),
+            "{context}"
+        ),
         fluent_code_app::app::Msg::AssistantToolCall { run_id, tool_call } => debug!(
             session_id = %state.session.id,
             message_kind = "assistant_tool_call",
