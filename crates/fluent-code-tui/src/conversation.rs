@@ -10,6 +10,7 @@ const SUMMARY_LIMIT: usize = 72;
 #[derive(Debug, Clone)]
 pub(crate) enum ConversationRow {
     Turn(TurnRow),
+    Reasoning(ReasoningRow),
     Tool(Box<ToolRow>),
     ToolGroup(ToolGroupRow),
     RunMarker(RunMarkerRow),
@@ -18,6 +19,12 @@ pub(crate) enum ConversationRow {
 #[derive(Debug, Clone)]
 pub(crate) struct TurnRow {
     pub(crate) role: Role,
+    pub(crate) content: String,
+    pub(crate) is_streaming: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReasoningRow {
     pub(crate) content: String,
     pub(crate) is_streaming: bool,
 }
@@ -84,6 +91,14 @@ pub(crate) fn derive_conversation_rows(state: &AppState) -> Vec<ConversationRow>
                 && state.active_run_id == Some(turn.run_id)
                 && matches!(state.status, AppStatus::Generating),
         }));
+
+        if matches!(turn.role, Role::Assistant) && !turn.reasoning.is_empty() {
+            rows.push(ConversationRow::Reasoning(ReasoningRow {
+                content: turn.reasoning.clone(),
+                is_streaming: state.active_run_id == Some(turn.run_id)
+                    && matches!(state.status, AppStatus::Generating),
+            }));
+        }
 
         let mut attached_tools = session
             .tool_invocations
@@ -442,6 +457,29 @@ mod tests {
         assert!(matches!(
             &rows[1],
             ConversationRow::Turn(turn) if turn.content == second_turn.content
+        ));
+    }
+
+    #[test]
+    fn derive_conversation_rows_inserts_reasoning_row_after_assistant_turn() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("assistant reasoning");
+        let mut turn = make_turn(run_id, Role::Assistant, "answer");
+        turn.reasoning = "plan".to_string();
+
+        session.turns = vec![turn.clone()];
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            &rows[0],
+            ConversationRow::Turn(row) if row.content == "answer"
+        ));
+        assert!(matches!(
+            &rows[1],
+            ConversationRow::Reasoning(row) if row.content == "plan"
         ));
     }
 
@@ -806,6 +844,7 @@ mod tests {
             run_id,
             role,
             content: content.to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         }
     }

@@ -8,8 +8,8 @@ use ratatui::{
 };
 
 use crate::conversation::{
-    ConversationRow, DelegatedTaskRow, RunMarkerKind, RunMarkerRow, ToolGroupKind, ToolGroupRow,
-    ToolRow, TurnRow, derive_conversation_rows,
+    ConversationRow, DelegatedTaskRow, ReasoningRow, RunMarkerKind, RunMarkerRow, ToolGroupKind,
+    ToolGroupRow, ToolRow, TurnRow, derive_conversation_rows,
 };
 use crate::markdown_render::{render_markdown_lines, render_streaming_markdown_lines};
 use crate::theme::TUI_THEME;
@@ -316,6 +316,7 @@ pub(crate) fn conversation_lines(state: &AppState, show_tool_details: bool) -> V
 fn render_row(row: &ConversationRow, show_tool_details: bool) -> Vec<Line<'static>> {
     match row {
         ConversationRow::Turn(turn) => render_turn_row(turn),
+        ConversationRow::Reasoning(reasoning) => render_reasoning_row(reasoning),
         ConversationRow::Tool(tool) => render_tool_row(tool, show_tool_details),
         ConversationRow::ToolGroup(group) => render_tool_group_row(group, show_tool_details),
         ConversationRow::RunMarker(marker) => render_run_marker_row(marker),
@@ -695,6 +696,31 @@ fn render_turn_row(turn: &TurnRow) -> Vec<Line<'static>> {
     )]));
     lines.push(Line::default());
 
+    lines
+}
+
+fn render_reasoning_row(reasoning: &ReasoningRow) -> Vec<Line<'static>> {
+    let content = if reasoning.content.trim().is_empty() {
+        "(empty)".to_string()
+    } else {
+        reasoning.content.clone()
+    };
+
+    let content_lines = if reasoning.is_streaming {
+        format_streaming_turn_content_lines(&content, TUI_THEME.text_muted)
+    } else {
+        format_turn_content_lines(&content, TUI_THEME.text_muted)
+    };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled("│  ", TUI_THEME.card_prefix),
+        Span::styled("REASONING", TUI_THEME.system_accent),
+        Span::raw(" "),
+        Span::styled("analysis", TUI_THEME.text_muted),
+    ])];
+
+    lines.extend(content_lines);
+    lines.push(Line::default());
     lines
 }
 
@@ -1592,6 +1618,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Investigating session storage.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -1623,6 +1650,31 @@ mod tests {
         assert!(text.contains("ASSISTANT"));
         assert!(text.contains("├─ tool read"));
         assert!(text.contains("crates/fluent-code-app/src/session/store.rs"));
+    }
+
+    #[test]
+    fn conversation_lines_render_reasoning_as_separate_adjacent_row() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("reasoning transcript");
+        session.turns.push(Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Final answer.".to_string(),
+            reasoning: "First inspect the state transitions.".to_string(),
+            timestamp: Utc::now(),
+        });
+
+        let text = conversation_lines(&AppState::new(session), false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("ASSISTANT response"));
+        assert!(text.contains("Final answer."));
+        assert!(text.contains("REASONING analysis"));
+        assert!(text.contains("First inspect the state transitions."));
     }
 
     #[test]
@@ -1763,6 +1815,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Reading project files.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -1827,6 +1880,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Waiting on tools.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -1873,6 +1927,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Still working.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         });
 
@@ -1898,6 +1953,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Done.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         });
         session.upsert_run(run_id, RunStatus::Completed);
@@ -1921,6 +1977,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Oops.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         });
         session.upsert_run(run_id, RunStatus::Failed);
@@ -1944,6 +2001,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "first line\ncontinues here\n\nnext paragraph".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         });
 
@@ -1966,6 +2024,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "- first item\n2. second item\n```rust\nfn main() {}\n```".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         });
 
@@ -1991,6 +2050,7 @@ mod tests {
             role: Role::Assistant,
             content: "# Heading\n> quoted text\nUse **bold** and `inline_code` plus [docs](https://example.com)."
                 .to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         });
 
@@ -2021,6 +2081,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Inspecting results.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -2064,6 +2125,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Inspecting results.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -2110,6 +2172,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Inspecting results.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -2155,6 +2218,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Reading project files.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -2206,6 +2270,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Reading project files.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -2269,6 +2334,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "I will inspect the files first.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -2318,6 +2384,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Inspecting grouped tool output.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -2383,6 +2450,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Using project plugin tools.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -2432,6 +2500,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Using project plugin tools.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -2481,6 +2550,7 @@ mod tests {
             run_id,
             role: Role::Assistant,
             content: "Using built in tools.".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -2634,6 +2704,7 @@ mod tests {
             run_id: parent_run_id,
             role: Role::Assistant,
             content: "Delegate this task".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         };
 
@@ -2643,6 +2714,7 @@ mod tests {
             run_id: child_run_id,
             role: Role::User,
             content: "Inspect child flow".to_string(),
+            reasoning: String::new(),
             timestamp: Utc::now(),
         });
         session.tool_invocations.push(ToolInvocationRecord {
