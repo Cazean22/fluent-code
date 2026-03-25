@@ -7,6 +7,7 @@ pub enum TuiAction {
     Message(Msg),
     ToggleToolDetails,
     ToggleHelpOverlay,
+    ToggleLayoutMode,
     ScrollUp,
     ScrollDown,
     PageUp,
@@ -40,6 +41,18 @@ pub fn next_action_from_event(
         })
     ) {
         return Some(TuiAction::ToggleToolDetails);
+    }
+
+    if matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::F(3),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            ..
+        })
+    ) {
+        return Some(TuiAction::ToggleLayoutMode);
     }
 
     if matches!(
@@ -131,6 +144,11 @@ pub fn next_action_from_event(
 
 pub fn map_event_to_message(event: Event, current_input: &str, status: &AppStatus) -> Option<Msg> {
     match event {
+        Event::Paste(text) if matches!(status, AppStatus::Idle | AppStatus::Error(_)) => {
+            let mut next = current_input.to_owned();
+            next.push_str(&text);
+            Some(Msg::InputChanged(next))
+        }
         Event::Key(KeyEvent { kind, .. }) if kind != KeyEventKind::Press => None,
         Event::Key(KeyEvent {
             code: KeyCode::Char('c'),
@@ -259,9 +277,31 @@ mod tests {
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::NONE,
         });
+        let f3 = Event::Key(KeyEvent {
+            code: KeyCode::F(3),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        });
 
         assert!(map_event_to_message(f1, "draft", &AppStatus::Idle).is_none());
         assert!(map_event_to_message(f2, "draft", &AppStatus::Idle).is_none());
+        assert!(map_event_to_message(f3, "draft", &AppStatus::Idle).is_none());
+    }
+
+    #[test]
+    fn f3_maps_to_layout_toggle_action() {
+        let event = Event::Key(KeyEvent {
+            code: KeyCode::F(3),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        });
+
+        assert!(matches!(
+            next_action_from_event(event, "draft", &AppStatus::Idle),
+            Some(TuiAction::ToggleLayoutMode)
+        ));
     }
 
     #[test]
@@ -288,6 +328,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn paste_event_updates_input_in_one_message() {
+        let event = Event::Paste(" world\nnext line".to_string());
+
+        assert!(matches!(
+            map_event_to_message(event, "hello", &AppStatus::Idle),
+            Some(Msg::InputChanged(input)) if input == "hello world\nnext line"
+        ));
+    }
+
+    #[test]
+    fn paste_event_preserves_crlf_line_breaks() {
+        let event = Event::Paste(" first\r\nsecond\rthird".to_string());
+
+        assert!(matches!(
+            map_event_to_message(event, "hello", &AppStatus::Idle),
+            Some(Msg::InputChanged(input)) if input == "hello first\r\nsecond\rthird"
+        ));
+    }
+
+    #[test]
+    fn paste_event_is_ignored_while_tool_is_running() {
+        let event = Event::Paste("ignored".to_string());
+
+        assert!(map_event_to_message(event, "hello", &AppStatus::RunningTool).is_none());
+    }
+
     fn same_action_variant(actual: &TuiAction, expected: &TuiAction) -> bool {
         matches!(
             (actual, expected),
@@ -297,6 +364,7 @@ mod tests {
                 | (TuiAction::PageDown, TuiAction::PageDown)
                 | (TuiAction::JumpTop, TuiAction::JumpTop)
                 | (TuiAction::JumpBottom, TuiAction::JumpBottom)
+                | (TuiAction::ToggleLayoutMode, TuiAction::ToggleLayoutMode)
         )
     }
 }

@@ -13,7 +13,7 @@ use crate::conversation::{
 };
 use crate::markdown_render::{render_markdown_lines, render_streaming_markdown_lines};
 use crate::theme::TUI_THEME;
-use crate::ui_state::UiState;
+use crate::ui_state::{LayoutMode, UiState};
 
 const SUMMARY_LIMIT: usize = 72;
 const TOOL_PREVIEW_LINE_LIMIT: usize = 3;
@@ -23,43 +23,38 @@ const GROUP_PREFIX: &str = "  ├─ ";
 const GROUP_ITEM_PREFIX: &str = "  │   • ";
 const GROUP_DETAIL_PREFIX: &str = "  │     ";
 const RUN_MARKER_PREFIX: &str = "  · run ";
+const SIDEBAR_HEIGHT: u16 = 18;
+const SIDEBAR_WIDTH: u16 = 36;
 
 pub fn render(frame: &mut Frame, state: &AppState, ui_state: &UiState) {
-    let shell = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
+    let (header_area, body_area, input_area, footer_area) = shell_areas(frame.area());
+    let (transcript_area, sidebar_area) = body_areas(body_area, ui_state.layout_mode);
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(1), Constraint::Length(34)])
-        .split(shell[1]);
-
-    render_header(frame, shell[0], state);
-    render_transcript(frame, body[0], state, ui_state);
-    render_sidebar(frame, body[1], state, ui_state);
-    render_input(frame, shell[2], state);
-    render_footer(frame, shell[3], state, ui_state);
+    render_header(frame, header_area, state);
+    render_transcript(frame, transcript_area, state, ui_state);
+    render_sidebar(frame, sidebar_area, state, ui_state);
+    render_input(frame, input_area, state);
+    render_footer(frame, footer_area, state, ui_state);
 
     if ui_state.show_help_overlay {
         render_help_overlay(frame, frame.area());
     }
 
     if matches!(state.status, AppStatus::Idle | AppStatus::Error(_)) {
-        let cursor_x = shell[2]
+        let cursor_x = input_area
             .x
             .saturating_add(state.draft_input.len() as u16 + 1);
-        let cursor_y = shell[2].y.saturating_add(1);
+        let cursor_y = input_area.y.saturating_add(1);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 
-pub(crate) fn transcript_area(area: Rect) -> Rect {
+pub(crate) fn transcript_area(area: Rect, layout_mode: LayoutMode) -> Rect {
+    let (_, body_area, _, _) = shell_areas(area);
+    body_areas(body_area, layout_mode).0
+}
+
+fn shell_areas(area: Rect) -> (Rect, Rect, Rect, Rect) {
     let shell = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -70,17 +65,35 @@ pub(crate) fn transcript_area(area: Rect) -> Rect {
         ])
         .split(area);
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(1), Constraint::Length(34)])
-        .split(shell[1])[0]
+    (shell[0], shell[1], shell[2], shell[3])
 }
 
-fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
+fn body_areas(area: Rect, layout_mode: LayoutMode) -> (Rect, Rect) {
+    let body = Layout::default()
+        .direction(match layout_mode {
+            LayoutMode::SideBySide => Direction::Horizontal,
+            LayoutMode::Stacked => Direction::Vertical,
+        })
+        .constraints(match layout_mode {
+            LayoutMode::SideBySide => [Constraint::Min(1), Constraint::Length(SIDEBAR_WIDTH)],
+            LayoutMode::Stacked => [Constraint::Min(1), Constraint::Length(SIDEBAR_HEIGHT)],
+        })
+        .split(area);
+
+    (body[0], body[1])
+}
+
+fn header_areas(area: Rect) -> (Rect, Rect) {
     let header = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(1), Constraint::Length(18)])
         .split(area);
+
+    (header[0], header[1])
+}
+
+fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
+    let (title_area, run_area) = header_areas(area);
 
     let run_badge = match state.session.latest_run_status() {
         Some(RunStatus::InProgress) => "in progress",
@@ -124,8 +137,8 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
             .title(Span::styled(" status ", TUI_THEME.title)),
     );
 
-    frame.render_widget(title, header[0]);
-    frame.render_widget(run, header[1]);
+    frame.render_widget(title, title_area);
+    frame.render_widget(run, run_area);
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, state: &AppState, ui_state: &UiState) {
@@ -265,6 +278,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::default(),
         Line::from("F1  toggle help"),
         Line::from("F2  toggle tool detail density"),
+        Line::from("F3  toggle transcript layout"),
         Line::from("↑/↓/PgUp/PgDn/Home/End  transcript navigation"),
         Line::from("Enter  send prompt / approve tools"),
         Line::from("Y  approve pending tool batch"),
@@ -1022,30 +1036,38 @@ fn run_status_label(state: &AppState) -> &'static str {
     }
 }
 
-fn footer_text_with_ui(state: &AppState, show_tool_details: bool) -> String {
+fn footer_text_with_ui(
+    state: &AppState,
+    show_tool_details: bool,
+    layout_mode: LayoutMode,
+) -> String {
     let active_context = active_run_context(state);
     let run_hint = if active_context.focus_label == "main session" {
         None
     } else {
         Some(active_context.focus_label.as_str())
     };
+    let layout_label = layout_mode.label();
 
     match &state.status {
         AppStatus::Idle => format!(
-            "Enter send • F1 help • F2 details {} • ↑↓/Pg keys scroll • End latest • Ctrl-N new • Esc/Ctrl-C quit",
+            "Enter send • F1 help • F2 details {} • F3 layout {} • ↑↓/Pg keys scroll • End latest • Ctrl-N new • Esc/Ctrl-C quit",
             if show_tool_details {
                 "expanded"
             } else {
                 "compact"
-            }
+            },
+            layout_label,
         ),
         AppStatus::Generating => match run_hint {
             Some(run_hint) => {
                 format!(
-                    "Assistant responding · {run_hint} • F1 help • F2 details • Esc/Ctrl-C cancel"
+                    "Assistant responding · {run_hint} • F1 help • F2 details • F3 layout {layout_label} • Esc/Ctrl-C cancel"
                 )
             }
-            None => "Assistant responding • F1 help • F2 details • Esc/Ctrl-C cancel".to_string(),
+            None => format!(
+                "Assistant responding • F1 help • F2 details • F3 layout {layout_label} • Esc/Ctrl-C cancel"
+            ),
         },
         AppStatus::AwaitingToolApproval => {
             if let Some(invocation) = state.session.pending_tool_invocation() {
@@ -1060,7 +1082,7 @@ fn footer_text_with_ui(state: &AppState, show_tool_details: bool) -> String {
                     })
                     .count();
                 format!(
-                    "{pending_count} tool call(s) waiting{} • Enter/Y approve all • N deny one • F1 help • F2 details • Esc/Ctrl-C cancel",
+                    "{pending_count} tool call(s) waiting{} • Enter/Y approve all • N deny one • F1 help • F2 details • F3 layout {layout_label} • Esc/Ctrl-C cancel",
                     run_hint
                         .map(|run_hint| format!(" · {run_hint}"))
                         .unwrap_or_default()
@@ -1071,20 +1093,22 @@ fn footer_text_with_ui(state: &AppState, show_tool_details: bool) -> String {
         }
         AppStatus::RunningTool => match run_hint {
             Some(run_hint) => format!(
-                "Executing approved tools · {run_hint} • F1 help • F2 details • Esc/Ctrl-C cancel run"
+                "Executing approved tools · {run_hint} • F1 help • F2 details • F3 layout {layout_label} • Esc/Ctrl-C cancel run"
             ),
-            None => "Executing approved tools • F1 help • F2 details • Esc/Ctrl-C cancel run"
-                .to_string(),
+            None => format!(
+                "Executing approved tools • F1 help • F2 details • F3 layout {layout_label} • Esc/Ctrl-C cancel run"
+            ),
         },
         AppStatus::Error(error) => format!(
-            "Error: {} • F1 help • F2 details • Ctrl-N new session • Esc/Ctrl-C quit",
-            summarize_text(error)
+            "Error: {} • F1 help • F2 details • F3 layout {} • Ctrl-N new session • Esc/Ctrl-C quit",
+            summarize_text(error),
+            layout_label,
         ),
     }
 }
 
 fn footer_text(state: &AppState, ui_state: &UiState) -> String {
-    footer_text_with_ui(state, ui_state.show_tool_details)
+    footer_text_with_ui(state, ui_state.show_tool_details, ui_state.layout_mode)
 }
 
 fn summarize_json(value: &serde_json::Value) -> String {
@@ -1406,14 +1430,17 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use ratatui::layout::Rect;
     use ratatui::text::Line;
     use serde_json::json;
     use uuid::Uuid;
 
     use super::{
-        active_run_context, conversation_lines, footer_text_with_ui, resolve_transcript_scroll,
-        sidebar_tool_lines, summarize_text, transcript_max_scroll,
+        active_run_context, body_areas, conversation_lines, footer_text_with_ui,
+        resolve_transcript_scroll, shell_areas, sidebar_tool_lines, summarize_text,
+        transcript_area, transcript_max_scroll,
     };
+    use crate::ui_state::LayoutMode;
     use fluent_code_app::app::AppState;
     use fluent_code_app::plugin::{DiscoveryScope, LoadedPluginMetadata, PluginLoadSnapshot};
     use fluent_code_app::session::model::{
@@ -1472,11 +1499,66 @@ mod tests {
     }
 
     #[test]
-    fn footer_text_reports_tool_detail_mode() {
+    fn transcript_area_matches_side_by_side_layout_body_geometry() {
+        let area = Rect::new(2, 4, 120, 40);
+        let (_, body_area, _, _) = shell_areas(area);
+        let (conversation_area, sidebar_area) = body_areas(body_area, LayoutMode::SideBySide);
+
+        assert_eq!(
+            transcript_area(area, LayoutMode::SideBySide),
+            conversation_area
+        );
+        assert_eq!(conversation_area.x, body_area.x);
+        assert_eq!(conversation_area.y, body_area.y);
+        assert_eq!(conversation_area.height, body_area.height);
+        assert_eq!(sidebar_area.y, body_area.y);
+        assert_eq!(sidebar_area.height, body_area.height);
+        assert_eq!(
+            conversation_area.x + conversation_area.width,
+            sidebar_area.x
+        );
+        assert_eq!(
+            sidebar_area.x + sidebar_area.width,
+            body_area.x + body_area.width
+        );
+    }
+
+    #[test]
+    fn transcript_area_matches_stacked_layout_body_geometry() {
+        let area = Rect::new(2, 4, 120, 40);
+        let (_, body_area, _, _) = shell_areas(area);
+        let (conversation_area, sidebar_area) = body_areas(body_area, LayoutMode::Stacked);
+
+        assert_eq!(
+            transcript_area(area, LayoutMode::Stacked),
+            conversation_area
+        );
+        assert_eq!(conversation_area.x, area.x);
+        assert_eq!(conversation_area.width, area.width);
+        assert_eq!(sidebar_area.x, area.x);
+        assert_eq!(sidebar_area.width, area.width);
+        assert_eq!(conversation_area.y, body_area.y);
+        assert_eq!(
+            conversation_area.y + conversation_area.height,
+            sidebar_area.y
+        );
+        assert_eq!(
+            sidebar_area.y + sidebar_area.height,
+            body_area.y + body_area.height
+        );
+    }
+
+    #[test]
+    fn footer_text_reports_tool_detail_and_layout_modes() {
         let state = AppState::new(Session::new("ui state test"));
 
-        assert!(footer_text_with_ui(&state, false).contains("compact"));
-        assert!(footer_text_with_ui(&state, true).contains("expanded"));
+        assert!(footer_text_with_ui(&state, false, LayoutMode::SideBySide).contains("compact"));
+        assert!(footer_text_with_ui(&state, true, LayoutMode::SideBySide).contains("expanded"));
+        assert!(
+            footer_text_with_ui(&state, false, LayoutMode::SideBySide)
+                .contains("layout side-by-side")
+        );
+        assert!(footer_text_with_ui(&state, false, LayoutMode::Stacked).contains("layout stacked"));
     }
 
     #[test]
@@ -1485,7 +1567,7 @@ mod tests {
         state.active_run_id = Some(child_run_id);
         state.status = fluent_code_app::app::AppStatus::Generating;
 
-        let text = footer_text_with_ui(&state, false);
+        let text = footer_text_with_ui(&state, false, LayoutMode::SideBySide);
 
         assert!(text.contains("Assistant responding"));
         assert!(text.contains("child subagent · explore"));

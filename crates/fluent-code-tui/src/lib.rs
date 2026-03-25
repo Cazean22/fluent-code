@@ -94,6 +94,9 @@ async fn run_loop(
                 TuiAction::ToggleHelpOverlay => {
                     ui_state.show_help_overlay = !ui_state.show_help_overlay;
                 }
+                TuiAction::ToggleLayoutMode => {
+                    ui_state.layout_mode = ui_state.layout_mode.toggle();
+                }
                 TuiAction::ScrollUp => adjust_transcript_scroll(terminal, state, ui_state, -1)?,
                 TuiAction::ScrollDown => adjust_transcript_scroll(terminal, state, ui_state, 1)?,
                 TuiAction::PageUp => adjust_transcript_scroll(terminal, state, ui_state, -10)?,
@@ -191,7 +194,10 @@ fn adjust_transcript_scroll(
     delta: i16,
 ) -> Result<()> {
     let area = terminal.size()?;
-    let transcript_area = view::transcript_area(Rect::new(0, 0, area.width, area.height));
+    let transcript_area = view::transcript_area(
+        Rect::new(0, 0, area.width, area.height),
+        ui_state.layout_mode,
+    );
     let max_scroll = view::transcript_max_scroll(
         &view::conversation_lines(state, ui_state.show_tool_details),
         transcript_area.width,
