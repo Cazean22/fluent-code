@@ -58,6 +58,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 run_id,
                 role: Role::User,
                 content: prompt,
+                reasoning: String::new(),
                 timestamp: Utc::now(),
             };
             state.session.turns.push(turn);
@@ -293,29 +294,50 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             let should_checkpoint = state.should_checkpoint_now();
             let chunk_bytes = delta.len();
 
-            if let Some(last_turn) = state.session.turns.last_mut()
-                && matches!(last_turn.role, Role::Assistant)
-                && last_turn.run_id == run_id
-            {
-                last_turn.content.push_str(&delta);
-                state.session.updated_at = Utc::now();
+            let existing_turn = active_assistant_turn_mut(state, run_id).is_some();
+            let turn = ensure_active_assistant_turn(state, run_id);
+            turn.content.push_str(&delta);
+            state.session.updated_at = Utc::now();
+            if existing_turn {
                 debug!(run_id = %run_id, chunk_bytes, checkpoint_due = should_checkpoint, "appended assistant chunk to existing turn");
-                return if should_checkpoint {
-                    vec![Effect::PersistSessionIfDue]
-                } else {
-                    Vec::new()
-                };
+            } else {
+                debug!(run_id = %run_id, chunk_bytes, checkpoint_due = should_checkpoint, "started assistant turn from first chunk");
             }
 
-            state.session.turns.push(Turn {
-                id: Uuid::new_v4(),
-                run_id,
-                role: Role::Assistant,
-                content: delta,
-                timestamp: Utc::now(),
-            });
+            if should_checkpoint {
+                vec![Effect::PersistSessionIfDue]
+            } else {
+                Vec::new()
+            }
+        }
+        Msg::AssistantReasoningChunk { run_id, delta } => {
+            if state.active_run_id != Some(run_id) {
+                debug!(
+                    session_id = %state.session.id,
+                    run_id = %run_id,
+                    active_run_id = ?state.active_run_id,
+                    "ignored stale assistant reasoning chunk"
+                );
+                return Vec::new();
+            }
+
+            state.status = AppStatus::Generating;
+            state.pending_resume_request = None;
+            let should_checkpoint = state.should_checkpoint_now();
+            let chunk_bytes = delta.len();
+            let existing_turn = active_assistant_turn_mut(state, run_id).is_some();
+            let had_text = active_assistant_turn_mut(state, run_id)
+                .map(|turn| !turn.content.is_empty())
+                .unwrap_or(false);
+            let turn = ensure_active_assistant_turn(state, run_id);
+            turn.reasoning.push_str(&delta);
             state.session.updated_at = Utc::now();
-            debug!(run_id = %run_id, chunk_bytes, checkpoint_due = should_checkpoint, "started assistant turn from first chunk");
+
+            if existing_turn {
+                debug!(run_id = %run_id, chunk_bytes, checkpoint_due = should_checkpoint, had_text, "appended assistant reasoning chunk to existing turn");
+            } else {
+                debug!(run_id = %run_id, chunk_bytes, checkpoint_due = should_checkpoint, "started assistant turn from first reasoning chunk");
+            }
 
             if should_checkpoint {
                 vec![Effect::PersistSessionIfDue]
@@ -728,6 +750,7 @@ fn start_child_run(
         run_id: child_run_id,
         role: Role::User,
         content: task_request.prompt.clone(),
+        reasoning: String::new(),
         timestamp: Utc::now(),
     });
     state.session.updated_at = Utc::now();
@@ -840,6 +863,29 @@ fn latest_assistant_text_for_run(state: &AppState, run_id: Uuid) -> Option<Strin
         .rev()
         .find(|turn| turn.run_id == run_id && matches!(turn.role, Role::Assistant))
         .map(|turn| turn.content.clone())
+}
+
+fn active_assistant_turn_mut(state: &mut AppState, run_id: Uuid) -> Option<&mut Turn> {
+    state
+        .session
+        .turns
+        .last_mut()
+        .filter(|turn| matches!(turn.role, Role::Assistant) && turn.run_id == run_id)
+}
+
+fn ensure_active_assistant_turn(state: &mut AppState, run_id: Uuid) -> &mut Turn {
+    if active_assistant_turn_mut(state, run_id).is_none() {
+        state.session.turns.push(Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: String::new(),
+            reasoning: String::new(),
+            timestamp: Utc::now(),
+        });
+    }
+
+    active_assistant_turn_mut(state, run_id).expect("assistant turn just ensured")
 }
 
 fn summarize_child_result(text: &str) -> String {
@@ -986,7 +1032,7 @@ fn turn_to_provider_message(turn: &Turn) -> ProviderMessage {
 mod tests {
     use std::sync::Arc;
 
-    use super::update;
+    use super::{build_provider_request, update};
     use crate::agent::AgentRegistry;
     use crate::app::{AppState, AppStatus, Effect, Msg};
     use crate::config::AgentConfig;
@@ -1402,6 +1448,86 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::StartAssistant { .. }))
         );
+    }
+
+    #[test]
+    fn assistant_reasoning_chunk_starts_assistant_turn_before_text() {
+        let mut state = AppState::new(Session::new("reasoning first flow"));
+        state.draft_input = "hello".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        let effects = update(
+            &mut state,
+            Msg::AssistantReasoningChunk {
+                run_id,
+                delta: "plan first".to_string(),
+            },
+        );
+
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::PersistSession))
+        );
+        assert_eq!(state.session.turns.len(), 2);
+        assert!(matches!(state.session.turns[1].role, Role::Assistant));
+        assert_eq!(state.session.turns[1].content, "");
+        assert_eq!(state.session.turns[1].reasoning, "plan first");
+
+        update(
+            &mut state,
+            Msg::AssistantChunk {
+                run_id,
+                delta: "final answer".to_string(),
+            },
+        );
+
+        assert_eq!(state.session.turns.len(), 2);
+        assert_eq!(state.session.turns[1].content, "final answer");
+        assert_eq!(state.session.turns[1].reasoning, "plan first");
+    }
+
+    #[test]
+    fn build_provider_request_replays_assistant_text_without_reasoning() {
+        let mut state = AppState::new(Session::new("reasoning replay boundary"));
+        state.draft_input = "hello".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantReasoningChunk {
+                run_id,
+                delta: "private chain".to_string(),
+            },
+        );
+        update(
+            &mut state,
+            Msg::AssistantChunk {
+                run_id,
+                delta: "public answer".to_string(),
+            },
+        );
+
+        let request = build_provider_request(&state, run_id);
+
+        assert!(request.messages.iter().any(|message| matches!(
+            message,
+            fluent_code_provider::ProviderMessage::AssistantText { text }
+                if text == "public answer"
+        )));
+        assert!(!request.messages.iter().any(|message| matches!(
+            message,
+            fluent_code_provider::ProviderMessage::AssistantText { text }
+                if text.contains("private chain")
+        )));
     }
 
     #[test]

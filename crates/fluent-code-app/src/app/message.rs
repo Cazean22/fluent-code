@@ -15,6 +15,10 @@ pub enum Msg {
         run_id: Uuid,
         delta: String,
     },
+    AssistantReasoningChunk {
+        run_id: Uuid,
+        delta: String,
+    },
     AssistantToolCall {
         run_id: Uuid,
         tool_call: ProviderToolCall,

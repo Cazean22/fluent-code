@@ -89,6 +89,14 @@ impl Runtime {
                                     debug!(chunk_bytes = delta.len(), "assistant chunk received");
                                     let _ = sender.send(Msg::AssistantChunk { run_id, delta });
                                 }
+                                ProviderEvent::ReasoningDelta(delta) => {
+                                    debug!(
+                                        chunk_bytes = delta.len(),
+                                        "assistant reasoning chunk received"
+                                    );
+                                    let _ =
+                                        sender.send(Msg::AssistantReasoningChunk { run_id, delta });
+                                }
                                 ProviderEvent::ToolCall(tool_call) => {
                                     saw_tool_call = true;
                                     info!(
