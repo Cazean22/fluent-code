@@ -149,6 +149,7 @@ pub struct ProviderToolCall {
 #[derive(Debug, Clone)]
 pub enum ProviderEvent {
     TextDelta(String),
+    ReasoningDelta(String),
     ToolCall(ProviderToolCall),
 }
 

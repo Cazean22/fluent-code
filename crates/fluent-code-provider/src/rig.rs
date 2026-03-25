@@ -103,6 +103,27 @@ impl RigOpenAiProvider {
                     );
                     on_event(ProviderEvent::TextDelta(text.text))
                 }
+                Ok(StreamedAssistantContent::Reasoning(reasoning)) => {
+                    let summary = reasoning.display_text();
+                    if !summary.is_empty() {
+                        debug!(
+                            provider = "openai",
+                            chunk_bytes = summary.len(),
+                            "openai provider emitted reasoning delta"
+                        );
+                        on_event(ProviderEvent::ReasoningDelta(summary));
+                    }
+                }
+                Ok(StreamedAssistantContent::ReasoningDelta { reasoning, .. }) => {
+                    if !reasoning.is_empty() {
+                        debug!(
+                            provider = "openai",
+                            chunk_bytes = reasoning.len(),
+                            "openai provider emitted reasoning delta"
+                        );
+                        on_event(ProviderEvent::ReasoningDelta(reasoning));
+                    }
+                }
                 Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
                     validate_openai_tool_call_id(&tool_call.function.name, &tool_call.id)?;
                     info!(provider = "openai", tool_name = %tool_call.function.name, tool_call_id = %tool_call.id, "openai provider emitted tool call");
@@ -113,8 +134,6 @@ impl RigOpenAiProvider {
                     }));
                 }
                 Ok(StreamedAssistantContent::ToolCallDelta { .. })
-                | Ok(StreamedAssistantContent::Reasoning(_))
-                | Ok(StreamedAssistantContent::ReasoningDelta { .. })
                 | Ok(StreamedAssistantContent::Final(_)) => {}
                 Err(error) => {
                     warn!(provider = "openai", error = %error, "openai provider stream failed");
