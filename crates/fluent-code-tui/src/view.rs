@@ -308,9 +308,14 @@ pub(crate) fn conversation_lines(state: &AppState, show_tool_details: bool) -> V
         )];
     }
 
-    rows.iter()
-        .flat_map(|row| render_row(row, show_tool_details))
-        .collect()
+    let mut lines = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::default());
+        }
+        lines.extend(render_row(row, show_tool_details));
+    }
+    lines
 }
 
 fn render_row(row: &ConversationRow, show_tool_details: bool) -> Vec<Line<'static>> {
@@ -678,23 +683,18 @@ fn render_turn_row(turn: &TurnRow) -> Vec<Line<'static>> {
         Role::Tool => "╰─ tool",
     };
 
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("╭─ ", TUI_THEME.card_prefix),
-            Span::styled(label, accent_style),
-            Span::raw(" "),
-            Span::styled(meta_text, TUI_THEME.text_muted),
-        ]),
-        Line::default(),
-    ];
+    let mut lines = vec![Line::from(vec![
+        Span::styled("╭─ ", TUI_THEME.card_prefix),
+        Span::styled(label, accent_style),
+        Span::raw(" "),
+        Span::styled(meta_text, TUI_THEME.text_muted),
+    ])];
 
     lines.extend(content_lines);
-    lines.push(Line::default());
     lines.push(Line::from(vec![Span::styled(
         divider,
         TUI_THEME.transcript_divider,
     )]));
-    lines.push(Line::default());
 
     lines
 }
@@ -720,7 +720,6 @@ fn render_reasoning_row(reasoning: &ReasoningRow) -> Vec<Line<'static>> {
     ])];
 
     lines.extend(content_lines);
-    lines.push(Line::default());
     lines
 }
 
@@ -842,7 +841,6 @@ fn render_tool_row(tool: &ToolRow, show_tool_details: bool) -> Vec<Line<'static>
         ]));
     }
 
-    lines.push(Line::default());
     lines
 }
 
@@ -908,7 +906,6 @@ fn render_tool_group_row(group: &ToolGroupRow, show_tool_details: bool) -> Vec<L
         }
     }
 
-    lines.push(Line::default());
     lines
 }
 
@@ -920,13 +917,10 @@ fn render_run_marker_row(marker: &RunMarkerRow) -> Vec<Line<'static>> {
         RunMarkerKind::Failed | RunMarkerKind::Cancelled => TUI_THEME.error,
     };
 
-    vec![
-        Line::from(vec![
-            Span::styled(RUN_MARKER_PREFIX, TUI_THEME.operational_prefix),
-            Span::styled(marker.label.clone(), style),
-        ]),
-        Line::default(),
-    ]
+    vec![Line::from(vec![
+        Span::styled(RUN_MARKER_PREFIX, TUI_THEME.operational_prefix),
+        Span::styled(marker.label.clone(), style),
+    ])]
 }
 
 #[derive(Debug)]

@@ -1,6 +1,7 @@
 use chrono::Utc;
 use fluent_code_provider::{ProviderMessage, ProviderRequest, ProviderToolCall};
 use tracing::{debug, info, warn};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::agent::{TASK_TOOL_NAME, parse_task_request};
@@ -654,14 +655,30 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
 }
 
 fn build_provider_request(state: &AppState, run_id: Uuid) -> ProviderRequest {
+    let root_run_ids: HashSet<Uuid> = state
+        .session
+        .runs
+        .iter()
+        .filter(|run| run.parent_run_id.is_none())
+        .map(|run| run.id)
+        .collect();
+
+    let is_root_run = root_run_ids.contains(&run_id);
+
     let messages = state
         .session
         .turns
         .iter()
-        .filter(|turn| turn.run_id == run_id)
+        .filter(|turn| {
+            if is_root_run {
+                root_run_ids.contains(&turn.run_id)
+            } else {
+                turn.run_id == run_id
+            }
+        })
         .flat_map(|turn| {
             let mut messages = vec![turn_to_provider_message(turn)];
-            append_tool_messages_after_turn(&mut messages, state, run_id, turn.id);
+            append_tool_messages_after_turn(&mut messages, state, turn.run_id, turn.id);
             messages
         })
         .collect();
