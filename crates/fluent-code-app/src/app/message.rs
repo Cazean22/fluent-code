@@ -1,6 +1,7 @@
 use fluent_code_provider::{ProviderRequest, ProviderToolCall};
 use uuid::Uuid;
 
+use crate::app::permissions::PermissionReply;
 use crate::session::model::ToolInvocationId;
 
 #[derive(Debug, Clone)]
@@ -8,8 +9,7 @@ pub enum Msg {
     InputChanged(String),
     SubmitPrompt,
     NewSession,
-    ApprovePendingTool,
-    DenyPendingTool,
+    ReplyToPendingTool(PermissionReply),
     CancelActiveRun,
     AssistantChunk {
         run_id: Uuid,

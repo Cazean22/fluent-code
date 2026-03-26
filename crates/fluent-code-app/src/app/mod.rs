@@ -1,4 +1,5 @@
 pub mod message;
+pub mod permissions;
 pub mod state;
 pub mod update;
 

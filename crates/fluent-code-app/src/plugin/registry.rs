@@ -9,7 +9,7 @@ use crate::agent::AgentRegistry;
 use crate::error::{FluentCodeError, Result};
 use crate::plugin::discovery::{DiscoveredPlugin, DiscoveryScope};
 use crate::plugin::manifest::PluginCapabilities;
-use crate::session::model::ToolSource;
+use crate::session::model::{ToolPermissionAction, ToolSource};
 use crate::tool::{built_in_tool_names, built_in_tools, execute_built_in_tool};
 
 use super::host::WasmPluginExecutor;
@@ -50,6 +50,21 @@ pub struct PluginToolRegistration {
     pub timeout_ms: u64,
     pub max_output_bytes: usize,
     pub capabilities: PluginCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPolicyOrigin {
+    BuiltInDefault,
+    PluginManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPolicy {
+    pub tool_name: String,
+    pub tool_source: ToolSource,
+    pub default_action: ToolPermissionAction,
+    pub rememberable: bool,
+    pub origin: ToolPolicyOrigin,
 }
 
 impl PluginToolRegistration {
@@ -295,6 +310,41 @@ impl ToolRegistry {
             Some(RegisteredTool::Plugin(registration)) => Some(registration),
             _ => None,
         }
+    }
+
+    pub fn tool_policy(&self, tool_name: &str) -> Option<ToolPolicy> {
+        match self.tools.get(tool_name) {
+            Some(RegisteredTool::BuiltIn) => Some(built_in_tool_policy(tool_name)),
+            Some(RegisteredTool::Plugin(registration)) => Some(ToolPolicy {
+                tool_name: tool_name.to_string(),
+                tool_source: registration.tool_source(),
+                default_action: if registration.requires_approval {
+                    ToolPermissionAction::Ask
+                } else {
+                    ToolPermissionAction::Allow
+                },
+                rememberable: true,
+                origin: ToolPolicyOrigin::PluginManifest,
+            }),
+            None => None,
+        }
+    }
+}
+
+fn built_in_tool_policy(tool_name: &str) -> ToolPolicy {
+    let (default_action, rememberable) = match tool_name {
+        "task" => (ToolPermissionAction::Ask, false),
+        "uppercase_text" => (ToolPermissionAction::Ask, true),
+        "read" | "glob" | "grep" => (ToolPermissionAction::Ask, true),
+        _ => (ToolPermissionAction::Ask, true),
+    };
+
+    ToolPolicy {
+        tool_name: tool_name.to_string(),
+        tool_source: ToolSource::BuiltIn,
+        default_action,
+        rememberable,
+        origin: ToolPolicyOrigin::BuiltInDefault,
     }
 }
 

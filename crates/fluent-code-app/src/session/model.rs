@@ -16,6 +16,8 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
+    pub permissions: SessionPermissionState,
+    #[serde(default)]
     pub runs: Vec<RunRecord>,
     #[serde(default)]
     pub turns: Vec<Turn>,
@@ -32,10 +34,32 @@ impl Session {
             title: title.into(),
             created_at: now,
             updated_at: now,
+            permissions: SessionPermissionState::default(),
             runs: Vec::new(),
             turns: Vec::new(),
             tool_invocations: Vec::new(),
         }
+    }
+
+    pub fn remember_tool_permission_rule(&mut self, rule: ToolPermissionRule) {
+        self.permissions.rules.retain(|existing| {
+            existing.subject.tool_name != rule.subject.tool_name
+                || existing.subject.tool_scope != rule.subject.tool_scope
+        });
+        self.permissions.rules.push(rule);
+    }
+
+    pub fn remembered_tool_permission_action(
+        &self,
+        tool_name: &str,
+        tool_source: &ToolSource,
+    ) -> Option<ToolPermissionAction> {
+        self.permissions
+            .rules
+            .iter()
+            .rev()
+            .find(|rule| rule.matches(tool_name, tool_source))
+            .map(|rule| rule.action)
     }
 
     pub fn upsert_run(&mut self, run_id: RunId, status: RunStatus) {
@@ -199,6 +223,69 @@ pub enum ToolExecutionState {
     Completed,
     Failed,
     Skipped,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPermissionState {
+    #[serde(default)]
+    pub rules: Vec<ToolPermissionRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolPermissionRule {
+    pub subject: ToolPermissionSubject,
+    pub action: ToolPermissionAction,
+}
+
+impl ToolPermissionRule {
+    pub fn matches(&self, tool_name: &str, tool_source: &ToolSource) -> bool {
+        self.subject.tool_name == tool_name && self.subject.matches(tool_source)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolPermissionSubject {
+    pub tool_name: String,
+    pub tool_scope: ToolPermissionScope,
+}
+
+impl ToolPermissionSubject {
+    pub fn from_tool(tool_name: impl Into<String>, tool_source: &ToolSource) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            tool_scope: ToolPermissionScope::from_tool_source(tool_source),
+        }
+    }
+
+    fn matches(&self, tool_source: &ToolSource) -> bool {
+        self.tool_scope == ToolPermissionScope::from_tool_source(tool_source)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPermissionScope {
+    BuiltIn,
+    Plugin { plugin_id: String },
+}
+
+impl ToolPermissionScope {
+    fn from_tool_source(tool_source: &ToolSource) -> Self {
+        match tool_source {
+            ToolSource::BuiltIn => Self::BuiltIn,
+            ToolSource::Plugin { plugin_id, .. } => Self::Plugin {
+                plugin_id: plugin_id.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPermissionAction {
+    Allow,
+    Ask,
+    Deny,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

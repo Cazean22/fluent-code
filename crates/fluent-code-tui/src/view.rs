@@ -8,8 +8,8 @@ use ratatui::{
 };
 
 use crate::conversation::{
-    ConversationRow, ReasoningRow, RunMarkerKind, RunMarkerRow, ToolGroupKind,
-    ToolGroupRow, ToolRow, TurnRow, derive_conversation_rows,
+    ConversationRow, ReasoningRow, RunMarkerKind, RunMarkerRow, ToolGroupKind, ToolGroupRow,
+    ToolRow, TurnRow, derive_conversation_rows,
 };
 use crate::markdown_render::{render_markdown_lines, render_streaming_markdown_lines};
 use crate::theme::TUI_THEME;
@@ -182,9 +182,9 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("  ↑/↓         scroll transcript"),
         Line::from("  PgUp/PgDn   page scroll"),
         Line::from("  Home/End    jump to top / bottom"),
-        Line::from("  Enter       send prompt / approve tools"),
-        Line::from("  Y           approve pending tool batch"),
-        Line::from("  N           deny one pending tool"),
+        Line::from("  Enter/Y     send prompt / allow once"),
+        Line::from("  A           always allow this tool"),
+        Line::from("  N           deny pending tool batch"),
         Line::from("  Ctrl-N      new session"),
         Line::from("  Esc/Ctrl-C  cancel run or quit"),
     ]))
@@ -279,7 +279,10 @@ fn render_reasoning_row(reasoning: &ReasoningRow) -> Vec<Line<'static>> {
         format_turn_content_lines(&content, TUI_THEME.text_muted)
     };
 
-    let mut lines = vec![Line::from(Span::styled("reasoning", TUI_THEME.system_accent))];
+    let mut lines = vec![Line::from(Span::styled(
+        "reasoning",
+        TUI_THEME.system_accent,
+    ))];
     lines.extend(content_lines);
     lines
 }
@@ -408,7 +411,10 @@ fn render_tool_row(tool: &ToolRow, show_tool_details: bool) -> Vec<Line<'static>
         lines.push(Line::from(vec![
             Span::styled(TOOL_DETAIL_PREFIX, TUI_THEME.text_muted),
             Span::styled("action ", TUI_THEME.text_muted),
-            Span::styled("Enter/Y approve all • N deny one", TUI_THEME.warning),
+            Span::styled(
+                "Enter/Y allow once • A always allow • N deny batch",
+                TUI_THEME.warning,
+            ),
         ]));
     }
 
@@ -658,7 +664,7 @@ fn footer_text_with_ui(state: &AppState, show_tool_details: bool) -> String {
                     })
                     .count();
                 format!(
-                    " {pending_count} tool(s) waiting{} • Enter/Y approve • N deny • Esc cancel",
+                    " {pending_count} tool(s) waiting{} • Enter/Y once • A always • N deny • Esc cancel",
                     run_hint
                         .map(|run_hint| format!(" · {run_hint}"))
                         .unwrap_or_default()
@@ -1109,7 +1115,7 @@ mod tests {
 
         let lines = conversation_lines(&state, false);
 
-        assert!(lines.len() >= 1);
+        assert!(!lines.is_empty());
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("No messages yet"));
     }

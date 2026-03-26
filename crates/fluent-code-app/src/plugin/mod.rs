@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::error::Result;
 
 pub use discovery::DiscoveryScope;
-pub use registry::ToolRegistry;
+pub use registry::{ToolPolicy, ToolPolicyOrigin, ToolRegistry};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PluginLoadSnapshot {

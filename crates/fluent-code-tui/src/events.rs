@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use fluent_code_app::app::permissions::PermissionReply;
 use fluent_code_app::app::{AppStatus, Msg};
 
 pub enum TuiAction {
@@ -168,7 +169,7 @@ pub fn map_event_to_message(event: Event, current_input: &str, status: &AppStatu
             code: KeyCode::Enter,
             ..
         }) => match status {
-            AppStatus::AwaitingToolApproval => Some(Msg::ApprovePendingTool),
+            AppStatus::AwaitingToolApproval => Some(Msg::ReplyToPendingTool(PermissionReply::Once)),
             AppStatus::RunningTool => None,
             _ => Some(Msg::SubmitPrompt),
         },
@@ -177,14 +178,21 @@ pub fn map_event_to_message(event: Event, current_input: &str, status: &AppStatu
             modifiers,
             ..
         }) if modifiers.is_empty() && matches!(status, AppStatus::AwaitingToolApproval) => {
-            Some(Msg::ApprovePendingTool)
+            Some(Msg::ReplyToPendingTool(PermissionReply::Once))
+        }
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers,
+            ..
+        }) if modifiers.is_empty() && matches!(status, AppStatus::AwaitingToolApproval) => {
+            Some(Msg::ReplyToPendingTool(PermissionReply::Always))
         }
         Event::Key(KeyEvent {
             code: KeyCode::Char('n'),
             modifiers,
             ..
         }) if modifiers.is_empty() && matches!(status, AppStatus::AwaitingToolApproval) => {
-            Some(Msg::DenyPendingTool)
+            Some(Msg::ReplyToPendingTool(PermissionReply::Deny))
         }
         Event::Key(KeyEvent {
             code: KeyCode::Backspace,

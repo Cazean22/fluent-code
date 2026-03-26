@@ -1,10 +1,14 @@
 use chrono::Utc;
 use fluent_code_provider::{ProviderMessage, ProviderRequest, ProviderToolCall};
-use tracing::{debug, info, warn};
 use std::collections::HashSet;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::agent::{TASK_TOOL_NAME, parse_task_request};
+use crate::app::permissions::{
+    PermissionDecision, PermissionReply, can_remember_reply, denial_message,
+    evaluate_tool_permission, remember_reply, tool_denied_by_policy_message,
+};
 use crate::app::{AppState, AppStatus, Effect, Msg};
 use crate::session::model::{
     Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationId, ToolInvocationRecord,
@@ -85,11 +89,11 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             ]
         }
         Msg::NewSession => Vec::new(),
-        Msg::ApprovePendingTool => {
+        Msg::ReplyToPendingTool(reply) => {
             let Some(run_id) = state.active_run_id else {
                 debug!(
                     session_id = %state.session.id,
-                    "ignored tool approval because no run is active"
+                    "ignored tool reply because no run is active"
                 );
                 return Vec::new();
             };
@@ -102,9 +106,14 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 return Vec::new();
             };
 
+            if matches!(reply, PermissionReply::Deny) {
+                return deny_pending_tool_batch(state, run_id, preceding_turn_id);
+            }
+
             let approved_at = Utc::now();
             let mut approved_tool_calls = Vec::new();
             let mut delegated_child_start = None;
+            let mut remembered_policies = Vec::new();
 
             for invocation in state
                 .session
@@ -119,6 +128,13 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 invocation.approval_state = ToolApprovalState::Approved;
                 invocation.approved_at = Some(approved_at);
                 invocation.error = None;
+
+                if matches!(reply, PermissionReply::Always)
+                    && let Some(policy) = state.tool_registry.tool_policy(&invocation.tool_name)
+                    && can_remember_reply(&policy, reply)
+                {
+                    remembered_policies.push(policy);
+                }
 
                 if invocation.tool_name == TASK_TOOL_NAME {
                     invocation.execution_state = ToolExecutionState::Running;
@@ -149,6 +165,10 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 return Vec::new();
             }
 
+            for policy in remembered_policies {
+                remember_reply(&mut state.session, &policy, reply);
+            }
+
             state.status = AppStatus::RunningTool;
             state.pending_resume_request = None;
             state.session.updated_at = Utc::now();
@@ -157,7 +177,8 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 session_id = %state.session.id,
                 run_id = %run_id,
                 approved_count = approved_tool_calls.len(),
-                "approved pending tool invocation batch"
+                reply = ?reply,
+                "resolved pending tool invocation batch"
             );
 
             let mut effects = vec![Effect::PersistSession];
@@ -174,88 +195,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                     }),
             );
             effects
-        }
-        Msg::DenyPendingTool => {
-            let Some(run_id) = state.active_run_id else {
-                debug!(
-                    session_id = %state.session.id,
-                    "ignored tool denial because no run is active"
-                );
-                return Vec::new();
-            };
-            let session_id = state.session.id;
-
-            let Some((invocation_id, preceding_turn_id)) = state
-                .session
-                .pending_tool_invocation()
-                .map(|invocation| (invocation.id, invocation.preceding_turn_id))
-            else {
-                return Vec::new();
-            };
-
-            if let Some(invocation) = state.session.find_tool_invocation_mut(invocation_id) {
-                invocation.approval_state = ToolApprovalState::Denied;
-                invocation.execution_state = ToolExecutionState::Skipped;
-                invocation.error = Some("Tool execution denied by user".to_string());
-                invocation.completed_at = Some(Utc::now());
-            }
-
-            state.session.updated_at = Utc::now();
-
-            match tool_batch_progress(state, run_id, preceding_turn_id) {
-                ToolBatchProgress::AwaitingApproval => {
-                    state.status = AppStatus::AwaitingToolApproval;
-                    state.pending_resume_request = None;
-                    info!(
-                        session_id = %session_id,
-                        run_id = %run_id,
-                        invocation_id = %invocation_id,
-                        "denied pending tool invocation and waiting for remaining tool decisions"
-                    );
-                    return vec![Effect::PersistSession];
-                }
-                ToolBatchProgress::Running => {
-                    state.status = AppStatus::RunningTool;
-                    state.pending_resume_request = None;
-                    info!(
-                        session_id = %session_id,
-                        run_id = %run_id,
-                        invocation_id = %invocation_id,
-                        "denied pending tool invocation while another tool is still running"
-                    );
-                    return vec![Effect::PersistSession];
-                }
-                ToolBatchProgress::ReadyToResume => {
-                    state.status = AppStatus::Generating;
-                    state.pending_resume_request = Some(build_provider_request(state, run_id));
-                }
-            }
-
-            let request = state
-                .pending_resume_request
-                .clone()
-                .expect("resume request just prepared");
-
-            if let Some((logged_invocation_id, logged_tool_name)) = state
-                .session
-                .tool_invocations
-                .iter()
-                .find(|invocation| invocation.id == invocation_id)
-                .map(|invocation| (invocation.id, invocation.tool_name.clone()))
-            {
-                info!(
-                    session_id = %session_id,
-                    run_id = %run_id,
-                    invocation_id = %logged_invocation_id,
-                    tool_name = %logged_tool_name,
-                    "denied pending tool invocation and resumed assistant"
-                );
-            }
-
-            vec![
-                Effect::PersistSession,
-                Effect::StartAssistant { run_id, request },
-            ]
         }
         Msg::CancelActiveRun => {
             let Some(run_id) = state.active_run_id.take() else {
@@ -360,6 +299,14 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
 
             let tool_name = tool_call.name.clone();
             let tool_source = state.tool_registry.tool_source(&tool_name);
+            let Some(tool_policy) = state.tool_registry.tool_policy(&tool_name) else {
+                state.status = AppStatus::Error(format!("unsupported tool '{}'", tool_name));
+                state.session.updated_at = Utc::now();
+                state.session.upsert_run(run_id, RunStatus::Failed);
+                state.active_run_id = None;
+                state.pending_resume_request = None;
+                return vec![Effect::PersistSession];
+            };
 
             let invocation = ToolInvocationRecord {
                 id: Uuid::new_v4(),
@@ -380,15 +327,11 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 approved_at: None,
                 completed_at: None,
             };
-            let auto_approve = state
-                .tool_registry
-                .plugin_registration(&invocation.tool_name)
-                .map(|registration| !registration.requires_approval)
-                .unwrap_or(false);
 
             state.session.tool_invocations.push(invocation);
             state.pending_resume_request = None;
             state.session.updated_at = Utc::now();
+            let permission_decision = evaluate_tool_permission(&state.session, &tool_policy);
 
             let invocation = state
                 .session
@@ -396,45 +339,82 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 .last_mut()
                 .expect("tool invocation just pushed");
 
-            if auto_approve {
-                invocation.approval_state = ToolApprovalState::Approved;
-                invocation.execution_state = ToolExecutionState::Running;
-                invocation.approved_at = Some(Utc::now());
-                state.status = AppStatus::RunningTool;
-                info!(
-                    session_id = %state.session.id,
-                    run_id = %run_id,
-                    invocation_id = %invocation.id,
-                    tool_name = %invocation.tool_name,
-                    tool_call_id = %invocation.tool_call_id,
-                    "assistant tool auto-approved by plugin policy"
-                );
+            match permission_decision {
+                PermissionDecision::Allow => {
+                    invocation.approval_state = ToolApprovalState::Approved;
+                    invocation.execution_state = ToolExecutionState::Running;
+                    invocation.approved_at = Some(Utc::now());
+                    state.status = AppStatus::RunningTool;
+                    info!(
+                        session_id = %state.session.id,
+                        run_id = %run_id,
+                        invocation_id = %invocation.id,
+                        tool_name = %invocation.tool_name,
+                        tool_call_id = %invocation.tool_call_id,
+                        "assistant tool auto-approved by permission policy"
+                    );
 
-                return vec![
-                    Effect::PersistSession,
-                    Effect::ExecuteTool {
-                        run_id,
-                        invocation_id: invocation.id,
-                        tool_call: ProviderToolCall {
-                            id: invocation.tool_call_id.clone(),
-                            name: invocation.tool_name.clone(),
-                            arguments: invocation.arguments.clone(),
+                    vec![
+                        Effect::PersistSession,
+                        Effect::ExecuteTool {
+                            run_id,
+                            invocation_id: invocation.id,
+                            tool_call: ProviderToolCall {
+                                id: invocation.tool_call_id.clone(),
+                                name: invocation.tool_name.clone(),
+                                arguments: invocation.arguments.clone(),
+                            },
                         },
-                    },
-                ];
+                    ]
+                }
+                PermissionDecision::Ask => {
+                    state.status = AppStatus::AwaitingToolApproval;
+                    info!(
+                        session_id = %state.session.id,
+                        run_id = %run_id,
+                        invocation_id = %invocation.id,
+                        tool_name = %invocation.tool_name,
+                        tool_call_id = %invocation.tool_call_id,
+                        "assistant entered tool approval state"
+                    );
+
+                    vec![Effect::PersistSession]
+                }
+                PermissionDecision::Deny => {
+                    let preceding_turn_id = invocation.preceding_turn_id;
+                    invocation.approval_state = ToolApprovalState::Denied;
+                    invocation.execution_state = ToolExecutionState::Skipped;
+                    invocation.error = Some(tool_denied_by_policy_message(&invocation.tool_name));
+                    invocation.completed_at = Some(Utc::now());
+                    state.session.updated_at = Utc::now();
+
+                    match tool_batch_progress(state, run_id, preceding_turn_id) {
+                        ToolBatchProgress::AwaitingApproval => {
+                            state.status = AppStatus::AwaitingToolApproval;
+                            state.pending_resume_request = None;
+                            vec![Effect::PersistSession]
+                        }
+                        ToolBatchProgress::Running => {
+                            state.status = AppStatus::RunningTool;
+                            state.pending_resume_request = None;
+                            vec![Effect::PersistSession]
+                        }
+                        ToolBatchProgress::ReadyToResume => {
+                            state.status = AppStatus::Generating;
+                            state.pending_resume_request =
+                                Some(build_provider_request(state, run_id));
+                            let request = state
+                                .pending_resume_request
+                                .clone()
+                                .expect("resume request just prepared");
+                            vec![
+                                Effect::PersistSession,
+                                Effect::StartAssistant { run_id, request },
+                            ]
+                        }
+                    }
+                }
             }
-
-            state.status = AppStatus::AwaitingToolApproval;
-            info!(
-                session_id = %state.session.id,
-                run_id = %run_id,
-                invocation_id = %invocation.id,
-                tool_name = %invocation.tool_name,
-                tool_call_id = %invocation.tool_call_id,
-                "assistant entered tool approval state"
-            );
-
-            vec![Effect::PersistSession]
         }
         Msg::AssistantDone { run_id } => {
             if state.active_run_id == Some(run_id) {
@@ -927,6 +907,84 @@ fn should_resume_after_tool_failure(tool_name: &str, error: &str) -> bool {
     tool_name == READ_TOOL_NAME && error.contains("is not accessible")
 }
 
+fn deny_pending_tool_batch(
+    state: &mut AppState,
+    run_id: Uuid,
+    preceding_turn_id: Option<Uuid>,
+) -> Vec<Effect> {
+    let session_id = state.session.id;
+    let denied_at = Utc::now();
+    let mut denied_invocation_ids = Vec::new();
+
+    for invocation in state
+        .session
+        .tool_invocations
+        .iter_mut()
+        .filter(|invocation| {
+            invocation.run_id == run_id
+                && invocation.preceding_turn_id == preceding_turn_id
+                && invocation.approval_state == ToolApprovalState::Pending
+        })
+    {
+        invocation.approval_state = ToolApprovalState::Denied;
+        invocation.execution_state = ToolExecutionState::Skipped;
+        invocation.error = Some(denial_message(&invocation.tool_name));
+        invocation.completed_at = Some(denied_at);
+        denied_invocation_ids.push(invocation.id);
+    }
+
+    if denied_invocation_ids.is_empty() {
+        return Vec::new();
+    }
+
+    state.session.updated_at = Utc::now();
+
+    match tool_batch_progress(state, run_id, preceding_turn_id) {
+        ToolBatchProgress::AwaitingApproval => {
+            state.status = AppStatus::AwaitingToolApproval;
+            state.pending_resume_request = None;
+            info!(
+                session_id = %session_id,
+                run_id = %run_id,
+                denied_count = denied_invocation_ids.len(),
+                "denied pending tool invocation batch and waiting for remaining tool decisions"
+            );
+            vec![Effect::PersistSession]
+        }
+        ToolBatchProgress::Running => {
+            state.status = AppStatus::RunningTool;
+            state.pending_resume_request = None;
+            info!(
+                session_id = %session_id,
+                run_id = %run_id,
+                denied_count = denied_invocation_ids.len(),
+                "denied pending tool invocation batch while another tool is still running"
+            );
+            vec![Effect::PersistSession]
+        }
+        ToolBatchProgress::ReadyToResume => {
+            state.status = AppStatus::Generating;
+            state.pending_resume_request = Some(build_provider_request(state, run_id));
+            let request = state
+                .pending_resume_request
+                .clone()
+                .expect("resume request just prepared");
+
+            info!(
+                session_id = %session_id,
+                run_id = %run_id,
+                denied_count = denied_invocation_ids.len(),
+                "denied pending tool invocation batch and resumed assistant"
+            );
+
+            vec![
+                Effect::PersistSession,
+                Effect::StartAssistant { run_id, request },
+            ]
+        }
+    }
+}
+
 fn tool_batch_progress(
     state: &AppState,
     run_id: Uuid,
@@ -1051,6 +1109,7 @@ mod tests {
 
     use super::{build_provider_request, update};
     use crate::agent::AgentRegistry;
+    use crate::app::permissions::PermissionReply;
     use crate::app::{AppState, AppStatus, Effect, Msg};
     use crate::config::AgentConfig;
     use crate::session::model::{Role, RunStatus, Session, ToolApprovalState, ToolExecutionState};
@@ -1148,7 +1207,7 @@ mod tests {
             ToolApprovalState::Pending
         );
 
-        let effects = update(&mut state, Msg::ApprovePendingTool);
+        let effects = update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Once));
         assert!(matches!(state.status, AppStatus::RunningTool));
         assert!(matches!(
             effects.last(),
@@ -1213,7 +1272,7 @@ mod tests {
         assert!(matches!(state.status, AppStatus::AwaitingToolApproval));
         assert_eq!(state.session.tool_invocations.len(), 2);
 
-        let effects = update(&mut state, Msg::ApprovePendingTool);
+        let effects = update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Once));
         assert!(matches!(state.status, AppStatus::RunningTool));
         let approved_invocation_ids = effects
             .iter()
@@ -1260,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn approve_pending_tool_approves_all_pending_calls_in_batch() {
+    fn once_reply_approves_all_pending_calls_in_batch() {
         let mut state = AppState::new(Session::new("batch approval flow"));
         state.draft_input = "run multiple tools".to_string();
         let effects = update(&mut state, Msg::SubmitPrompt);
@@ -1292,7 +1351,7 @@ mod tests {
             },
         );
 
-        let effects = update(&mut state, Msg::ApprovePendingTool);
+        let effects = update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Once));
 
         assert!(matches!(state.status, AppStatus::RunningTool));
         assert_eq!(
@@ -1323,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn deny_pending_tool_resumes_with_denial_result() {
+    fn deny_reply_resumes_with_denial_result() {
         let mut state = AppState::new(Session::new("deny tool flow"));
         state.draft_input = "use uppercase_text: deny me".to_string();
         let effects = update(&mut state, Msg::SubmitPrompt);
@@ -1344,7 +1403,7 @@ mod tests {
             },
         );
 
-        let effects = update(&mut state, Msg::DenyPendingTool);
+        let effects = update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Deny));
 
         assert!(matches!(state.status, AppStatus::Generating));
         assert_eq!(
@@ -1354,7 +1413,43 @@ mod tests {
         assert!(matches!(
             effects.last(),
             Some(Effect::StartAssistant { request, .. })
-                if request.messages.iter().any(|message| matches!(message, fluent_code_provider::ProviderMessage::ToolResult { content, .. } if content == "Tool execution denied by user"))
+                if request.messages.iter().any(|message| matches!(message, fluent_code_provider::ProviderMessage::ToolResult { content, .. } if content == "Permission denied for tool 'uppercase_text' by user"))
+        ));
+    }
+
+    #[test]
+    fn always_reply_persists_session_permission_rule() {
+        let mut state = AppState::new(Session::new("remember approval flow"));
+        state.draft_input = "use uppercase_text: remember me".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "tool-call-remember-1".to_string(),
+                    name: "uppercase_text".to_string(),
+                    arguments: serde_json::json!({ "text": "remember me" }),
+                },
+            },
+        );
+
+        let effects = update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Always));
+
+        assert!(matches!(state.status, AppStatus::RunningTool));
+        assert_eq!(state.session.permissions.rules.len(), 1);
+        assert_eq!(
+            state.session.permissions.rules[0].subject.tool_name,
+            "uppercase_text"
+        );
+        assert!(matches!(
+            effects.last(),
+            Some(Effect::ExecuteTool { tool_call, .. }) if tool_call.name == "uppercase_text"
         ));
     }
 
@@ -1380,7 +1475,7 @@ mod tests {
             },
         );
 
-        let effects = update(&mut state, Msg::ApprovePendingTool);
+        let effects = update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Once));
         assert!(matches!(state.status, AppStatus::RunningTool));
         assert!(matches!(
             effects.last(),
@@ -1442,7 +1537,7 @@ mod tests {
             },
         );
 
-        update(&mut state, Msg::ApprovePendingTool);
+        update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Once));
 
         let invocation_id = state.session.tool_invocations[0].id;
         let effects = update(
@@ -1569,7 +1664,7 @@ mod tests {
             },
         );
 
-        update(&mut state, Msg::ApprovePendingTool);
+        update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Once));
 
         let invocation_id = state.session.tool_invocations[0].id;
         let effects = update(
@@ -1705,7 +1800,7 @@ mod tests {
             },
         );
 
-        let effects = update(&mut state, Msg::ApprovePendingTool);
+        let effects = update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Once));
         let child_run_id = state.active_run_id.expect("child run should become active");
         let child_request = match effects.last() {
             Some(Effect::StartAssistant { run_id, request }) if *run_id == child_run_id => request,
@@ -1780,7 +1875,7 @@ mod tests {
             },
         );
 
-        update(&mut state, Msg::ApprovePendingTool);
+        update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Once));
         let child_run_id = state.active_run_id.expect("child run should become active");
 
         update(
@@ -1863,7 +1958,7 @@ mod tests {
             },
         );
 
-        let effects = update(&mut state, Msg::ApprovePendingTool);
+        let effects = update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Once));
         let child_run_id = state.active_run_id.expect("child run should become active");
         let child_request = match effects.last() {
             Some(Effect::StartAssistant { run_id, request }) if *run_id == child_run_id => request,

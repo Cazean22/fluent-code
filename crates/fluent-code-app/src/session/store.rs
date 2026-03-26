@@ -180,6 +180,7 @@ impl SessionStore for FsSessionStore {
             title: metadata.title,
             created_at: metadata.created_at,
             updated_at: metadata.updated_at,
+            permissions: metadata.permissions,
             runs: metadata.runs,
             turns,
             tool_invocations: metadata.tool_invocations,
@@ -251,6 +252,8 @@ struct SessionMetadata {
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
+    permissions: crate::session::model::SessionPermissionState,
+    #[serde(default)]
     runs: Vec<RunRecord>,
     #[serde(default)]
     tool_invocations: Vec<ToolInvocationRecord>,
@@ -263,6 +266,7 @@ impl From<&Session> for SessionMetadata {
             title: session.title.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
+            permissions: session.permissions.clone(),
             runs: session.runs.clone(),
             tool_invocations: session.tool_invocations.clone(),
         }

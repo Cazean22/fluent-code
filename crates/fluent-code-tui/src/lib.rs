@@ -208,9 +208,7 @@ fn adjust_transcript_scroll(
     delta: i16,
 ) -> Result<()> {
     let area = terminal.size()?;
-    let transcript_area = view::transcript_area(
-        Rect::new(0, 0, area.width, area.height),
-    );
+    let transcript_area = view::transcript_area(Rect::new(0, 0, area.width, area.height));
     let max_scroll = view::transcript_max_scroll(
         &view::conversation_lines(state, ui_state.show_tool_details),
         transcript_area.width,
@@ -317,14 +315,10 @@ fn log_tui_message(context: &str, state: &AppState, message: &fluent_code_app::a
             message_kind = "new_session",
             "{context}"
         ),
-        fluent_code_app::app::Msg::ApprovePendingTool => debug!(
+        fluent_code_app::app::Msg::ReplyToPendingTool(reply) => debug!(
             session_id = %state.session.id,
-            message_kind = "approve_pending_tool",
-            "{context}"
-        ),
-        fluent_code_app::app::Msg::DenyPendingTool => debug!(
-            session_id = %state.session.id,
-            message_kind = "deny_pending_tool",
+            message_kind = "reply_to_pending_tool",
+            reply = ?reply,
             "{context}"
         ),
         fluent_code_app::app::Msg::CancelActiveRun => debug!(
@@ -437,6 +431,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use fluent_code_app::app::{AppState, Msg};
+    use fluent_code_app::app::permissions::PermissionReply;
     use fluent_code_app::runtime::Runtime;
     use fluent_code_app::session::model::{Role, Session};
     use fluent_code_app::session::store::{FsSessionStore, SessionStore};
@@ -757,7 +752,7 @@ mod tests {
             &runtime,
             &mut ui_state,
             tx.clone(),
-            Msg::ApprovePendingTool,
+            Msg::ReplyToPendingTool(PermissionReply::Once),
         )
         .await
         .expect("approve pending tool");
@@ -932,7 +927,7 @@ mod tests {
             &runtime,
             &mut ui_state,
             tx.clone(),
-            Msg::ApprovePendingTool,
+            Msg::ReplyToPendingTool(PermissionReply::Once),
         )
         .await
         .expect("approve delegated task");
