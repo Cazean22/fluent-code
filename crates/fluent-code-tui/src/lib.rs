@@ -430,8 +430,8 @@ mod tests {
     use std::sync::OnceLock;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use fluent_code_app::app::{AppState, Msg};
     use fluent_code_app::app::permissions::PermissionReply;
+    use fluent_code_app::app::{AppState, Msg};
     use fluent_code_app::runtime::Runtime;
     use fluent_code_app::session::model::{Role, Session};
     use fluent_code_app::session::store::{FsSessionStore, SessionStore};
@@ -478,7 +478,6 @@ mod tests {
             fluent_code_app::app::AppStatus::Idle
         ));
         assert!(state.active_run_id.is_none());
-        assert!(state.pending_resume_request.is_none());
         assert!(ui_state.transcript_follow_tail);
         assert_eq!(ui_state.transcript_scroll_top, 0);
 
@@ -860,7 +859,6 @@ mod tests {
             fluent_code_app::app::AppStatus::Idle
         ));
         assert!(state.active_run_id.is_none());
-        assert!(state.pending_resume_request.is_none());
         assert!(ui_state.transcript_follow_tail);
         assert_eq!(ui_state.transcript_scroll_top, 0);
         assert_eq!(state.plugin_load_snapshot, plugin_snapshot);
@@ -979,7 +977,7 @@ mod tests {
             .expect("load session after task delegation");
         assert_eq!(persisted.tool_invocations.len(), 1);
         assert_eq!(
-            persisted.tool_invocations[0].child_run_id,
+            persisted.tool_invocations[0].child_run_id(),
             Some(child_run_id)
         );
         assert!(matches!(

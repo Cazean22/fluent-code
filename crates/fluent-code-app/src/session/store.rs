@@ -284,8 +284,8 @@ mod tests {
     use super::{FsSessionStore, SessionStore};
     use crate::error::FluentCodeError;
     use crate::session::model::{
-        Role, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, ToolSource,
-        Turn,
+        Role, Session, TaskDelegationRecord, ToolApprovalState, ToolExecutionState,
+        ToolInvocationRecord, ToolSource, Turn,
     };
 
     #[test]
@@ -458,9 +458,7 @@ mod tests {
             execution_state: ToolExecutionState::Completed,
             result: Some("HELLO".to_string()),
             error: None,
-            child_run_id: None,
-            delegation_agent_name: None,
-            delegation_prompt: None,
+            delegation: None,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -476,6 +474,111 @@ mod tests {
         assert_eq!(loaded.tool_invocations.len(), 1);
         assert_eq!(loaded.tool_invocations[0].tool_name, "uppercase_text");
         assert_eq!(loaded.tool_invocations[0].result.as_deref(), Some("HELLO"));
+        assert!(loaded.tool_invocations[0].task_delegation().is_none());
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn loads_legacy_tool_invocation_delegation_fields() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+        let session = Session::new("legacy tool delegation");
+        let session_dir = root.join("sessions").join(session.id.to_string());
+        let child_run_id = Uuid::new_v4();
+
+        std::fs::create_dir_all(&session_dir).expect("create legacy session dir");
+        std::fs::write(
+            session_dir.join("session.json"),
+            serde_json::json!({
+                "id": session.id,
+                "title": session.title,
+                "created_at": session.created_at,
+                "updated_at": session.updated_at,
+                "permissions": { "rules": [] },
+                "runs": [],
+                "tool_invocations": [
+                    {
+                        "id": Uuid::new_v4(),
+                        "run_id": Uuid::new_v4(),
+                        "tool_call_id": "task-call-1",
+                        "tool_name": "task",
+                        "tool_source": "built_in",
+                        "arguments": { "agent": "explore", "prompt": "Inspect state" },
+                        "approval_state": "approved",
+                        "execution_state": "running",
+                        "result": null,
+                        "error": null,
+                        "child_run_id": child_run_id,
+                        "delegation_agent_name": "explore",
+                        "delegation_prompt": "Inspect state",
+                        "requested_at": Utc::now(),
+                        "approved_at": null,
+                        "completed_at": null
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write legacy session metadata with delegation");
+
+        let loaded = store
+            .load(&session.id)
+            .expect("load legacy delegation metadata");
+
+        assert_eq!(loaded.tool_invocations.len(), 1);
+        let delegation = loaded.tool_invocations[0]
+            .task_delegation()
+            .expect("delegation restored from legacy fields");
+        assert_eq!(delegation.child_run_id, Some(child_run_id));
+        assert_eq!(delegation.agent_name.as_deref(), Some("explore"));
+        assert_eq!(delegation.prompt.as_deref(), Some("Inspect state"));
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn saves_structured_tool_invocation_delegation() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+
+        let mut session = Session::new("delegated tool session");
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            tool_call_id: "task-call-1".to_string(),
+            tool_name: "task".to_string(),
+            tool_source: ToolSource::BuiltIn,
+            arguments: serde_json::json!({ "agent": "explore", "prompt": "Inspect state" }),
+            preceding_turn_id: None,
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Running,
+            result: None,
+            error: None,
+            delegation: Some(TaskDelegationRecord {
+                child_run_id: Some(Uuid::new_v4()),
+                agent_name: Some("explore".to_string()),
+                prompt: Some("Inspect state".to_string()),
+            }),
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: None,
+        });
+
+        store
+            .create(&session)
+            .expect("create session with structured delegation");
+        let saved = std::fs::read_to_string(
+            root.join("sessions")
+                .join(session.id.to_string())
+                .join("session.json"),
+        )
+        .expect("read saved session metadata");
+
+        assert!(saved.contains("\"delegation\""));
+        assert!(!saved.contains("\"delegation_agent_name\""));
+        assert!(!saved.contains("\"delegation_prompt\""));
+        assert!(saved.contains("\"child_run_id\":"));
 
         cleanup(root);
     }

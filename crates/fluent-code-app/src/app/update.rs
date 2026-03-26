@@ -1,18 +1,18 @@
 use chrono::Utc;
-use fluent_code_provider::{ProviderMessage, ProviderRequest, ProviderToolCall};
-use std::collections::HashSet;
+use fluent_code_provider::ProviderToolCall;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::agent::{TASK_TOOL_NAME, parse_task_request};
+use crate::agent::TASK_TOOL_NAME;
+use crate::app::delegation::{ChildRunOutcome, complete_child_run, start_child_run};
 use crate::app::permissions::{
     PermissionDecision, PermissionReply, can_remember_reply, denial_message,
     evaluate_tool_permission, remember_reply, tool_denied_by_policy_message,
 };
+use crate::app::request_builder::build_provider_request;
 use crate::app::{AppState, AppStatus, Effect, Msg};
 use crate::session::model::{
-    Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationId, ToolInvocationRecord,
-    Turn,
+    Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, Turn,
 };
 
 const READ_TOOL_NAME: &str = "read";
@@ -22,12 +22,6 @@ enum ToolBatchProgress {
     AwaitingApproval,
     Running,
     ReadyToResume,
-}
-
-#[derive(Debug, Clone)]
-enum ChildRunOutcome {
-    Completed,
-    Failed { error: String },
 }
 
 pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
@@ -170,7 +164,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             }
 
             state.status = AppStatus::RunningTool;
-            state.pending_resume_request = None;
             state.session.updated_at = Utc::now();
 
             info!(
@@ -206,7 +199,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             };
 
             state.status = AppStatus::Idle;
-            state.pending_resume_request = None;
             state.session.updated_at = Utc::now();
             state.session.upsert_run(run_id, RunStatus::Cancelled);
 
@@ -230,7 +222,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             }
 
             state.status = AppStatus::Generating;
-            state.pending_resume_request = None;
             let should_checkpoint = state.should_checkpoint_now();
             let chunk_bytes = delta.len();
 
@@ -262,7 +253,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             }
 
             state.status = AppStatus::Generating;
-            state.pending_resume_request = None;
             let should_checkpoint = state.should_checkpoint_now();
             let chunk_bytes = delta.len();
             let existing_turn = active_assistant_turn_mut(state, run_id).is_some();
@@ -304,7 +294,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 state.session.updated_at = Utc::now();
                 state.session.upsert_run(run_id, RunStatus::Failed);
                 state.active_run_id = None;
-                state.pending_resume_request = None;
                 return vec![Effect::PersistSession];
             };
 
@@ -320,16 +309,13 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 execution_state: ToolExecutionState::NotStarted,
                 result: None,
                 error: None,
-                child_run_id: None,
-                delegation_agent_name: None,
-                delegation_prompt: None,
+                delegation: None,
                 requested_at: Utc::now(),
                 approved_at: None,
                 completed_at: None,
             };
 
             state.session.tool_invocations.push(invocation);
-            state.pending_resume_request = None;
             state.session.updated_at = Utc::now();
             let permission_decision = evaluate_tool_permission(&state.session, &tool_policy);
 
@@ -391,22 +377,15 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                     match tool_batch_progress(state, run_id, preceding_turn_id) {
                         ToolBatchProgress::AwaitingApproval => {
                             state.status = AppStatus::AwaitingToolApproval;
-                            state.pending_resume_request = None;
                             vec![Effect::PersistSession]
                         }
                         ToolBatchProgress::Running => {
                             state.status = AppStatus::RunningTool;
-                            state.pending_resume_request = None;
                             vec![Effect::PersistSession]
                         }
                         ToolBatchProgress::ReadyToResume => {
                             state.status = AppStatus::Generating;
-                            state.pending_resume_request =
-                                Some(build_provider_request(state, run_id));
-                            let request = state
-                                .pending_resume_request
-                                .clone()
-                                .expect("resume request just prepared");
+                            let request = build_provider_request(state, run_id);
                             vec![
                                 Effect::PersistSession,
                                 Effect::StartAssistant { run_id, request },
@@ -425,7 +404,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 }
 
                 state.active_run_id = None;
-                state.pending_resume_request = None;
                 state.status = AppStatus::Idle;
                 state.session.updated_at = Utc::now();
                 state.session.upsert_run(run_id, RunStatus::Completed);
@@ -467,7 +445,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 }
 
                 state.active_run_id = None;
-                state.pending_resume_request = None;
                 state.status = AppStatus::Error(error);
                 state.session.updated_at = Utc::now();
                 state.session.upsert_run(run_id, RunStatus::Failed);
@@ -559,7 +536,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                         state.session.updated_at = Utc::now();
                         state.session.upsert_run(run_id, RunStatus::Failed);
                         state.active_run_id = None;
-                        state.pending_resume_request = None;
                         if let AppStatus::Error(message) = &state.status {
                             warn!(
                                 session_id = %session_id,
@@ -591,7 +567,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             match tool_batch_progress(state, run_id, preceding_turn_id) {
                 ToolBatchProgress::AwaitingApproval => {
                     state.status = AppStatus::AwaitingToolApproval;
-                    state.pending_resume_request = None;
                     info!(
                         session_id = %session_id,
                         run_id = %run_id,
@@ -602,7 +577,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 }
                 ToolBatchProgress::Running => {
                     state.status = AppStatus::RunningTool;
-                    state.pending_resume_request = None;
                     info!(
                         session_id = %session_id,
                         run_id = %run_id,
@@ -613,14 +587,10 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 }
                 ToolBatchProgress::ReadyToResume => {
                     state.status = AppStatus::Generating;
-                    state.pending_resume_request = Some(build_provider_request(state, run_id));
                 }
             }
 
-            let request = state
-                .pending_resume_request
-                .clone()
-                .expect("resume request just prepared");
+            let request = build_provider_request(state, run_id);
 
             vec![
                 Effect::PersistSession,
@@ -632,234 +602,6 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
     }
-}
-
-fn build_provider_request(state: &AppState, run_id: Uuid) -> ProviderRequest {
-    let root_run_ids: HashSet<Uuid> = state
-        .session
-        .runs
-        .iter()
-        .filter(|run| run.parent_run_id.is_none())
-        .map(|run| run.id)
-        .collect();
-
-    let is_root_run = root_run_ids.contains(&run_id);
-
-    let messages = state
-        .session
-        .turns
-        .iter()
-        .filter(|turn| {
-            if is_root_run {
-                root_run_ids.contains(&turn.run_id)
-            } else {
-                turn.run_id == run_id
-            }
-        })
-        .flat_map(|turn| {
-            let mut messages = vec![turn_to_provider_message(turn)];
-            append_tool_messages_after_turn(&mut messages, state, turn.run_id, turn.id);
-            messages
-        })
-        .collect();
-
-    ProviderRequest::new(messages, state.tool_registry.provider_tools())
-}
-
-fn start_child_run(
-    state: &mut AppState,
-    parent_run_id: Uuid,
-    invocation_id: ToolInvocationId,
-    tool_call: &ProviderToolCall,
-) -> Vec<Effect> {
-    let session_id = state.session.id;
-    let task_request = match parse_task_request(&state.agent_registry, &tool_call.arguments) {
-        Ok(task_request) => task_request,
-        Err(error) => {
-            finish_task_invocation_with_error(state, invocation_id, &error.to_string());
-            state.status = AppStatus::Generating;
-            state.pending_resume_request = Some(build_provider_request(state, parent_run_id));
-            let request = state
-                .pending_resume_request
-                .clone()
-                .expect("resume request after task parse failure");
-            warn!(
-                session_id = %session_id,
-                run_id = %parent_run_id,
-                invocation_id = %invocation_id,
-                error = %error,
-                "task invocation could not be delegated"
-            );
-            return vec![
-                Effect::PersistSession,
-                Effect::StartAssistant {
-                    run_id: parent_run_id,
-                    request,
-                },
-            ];
-        }
-    };
-
-    let Some(agent) = state.agent_registry.get(&task_request.agent) else {
-        let error_message = format!("task requested unknown agent '{}'", task_request.agent);
-        finish_task_invocation_with_error(state, invocation_id, &error_message);
-        state.status = AppStatus::Generating;
-        state.pending_resume_request = Some(build_provider_request(state, parent_run_id));
-        let request = state
-            .pending_resume_request
-            .clone()
-            .expect("resume request after missing agent");
-        warn!(
-            session_id = %session_id,
-            run_id = %parent_run_id,
-            invocation_id = %invocation_id,
-            agent = %task_request.agent,
-            "task invocation referenced an unknown agent"
-        );
-        return vec![
-            Effect::PersistSession,
-            Effect::StartAssistant {
-                run_id: parent_run_id,
-                request,
-            },
-        ];
-    };
-
-    let child_run_id = Uuid::new_v4();
-    if let Some(invocation) = state.session.find_tool_invocation_mut(invocation_id) {
-        invocation.child_run_id = Some(child_run_id);
-        invocation.delegation_agent_name = Some(task_request.agent.clone());
-        invocation.delegation_prompt = Some(task_request.prompt.clone());
-    }
-
-    state.session.upsert_run_with_parent(
-        child_run_id,
-        RunStatus::InProgress,
-        Some(parent_run_id),
-        Some(invocation_id),
-    );
-    state.active_run_id = Some(child_run_id);
-    state.status = AppStatus::Generating;
-    state.pending_resume_request = None;
-
-    state.session.turns.push(Turn {
-        id: Uuid::new_v4(),
-        run_id: child_run_id,
-        role: Role::User,
-        content: task_request.prompt.clone(),
-        reasoning: String::new(),
-        timestamp: Utc::now(),
-    });
-    state.session.updated_at = Utc::now();
-
-    let child_request = ProviderRequest::new(
-        vec![ProviderMessage::UserText {
-            text: task_request.prompt,
-        }],
-        child_provider_tools(state),
-    )
-    .with_system_prompt_override(Some(agent.system_prompt.clone()));
-
-    info!(
-        session_id = %session_id,
-        parent_run_id = %parent_run_id,
-        child_run_id = %child_run_id,
-        invocation_id = %invocation_id,
-        agent = %agent.name,
-        "started delegated child run in foreground"
-    );
-
-    vec![
-        Effect::PersistSession,
-        Effect::StartAssistant {
-            run_id: child_run_id,
-            request: child_request,
-        },
-    ]
-}
-
-fn complete_child_run(
-    state: &mut AppState,
-    child_run_id: Uuid,
-    outcome: ChildRunOutcome,
-) -> Option<Vec<Effect>> {
-    let parent_link = state
-        .session
-        .find_run(child_run_id)
-        .and_then(|run| Some((run.parent_run_id?, run.parent_tool_invocation_id?)));
-
-    let (parent_run_id, parent_tool_invocation_id) = parent_link?;
-    let session_id = state.session.id;
-
-    let (child_status, synthetic_result) = match outcome {
-        ChildRunOutcome::Completed => {
-            let final_text = latest_assistant_text_for_run(state, child_run_id).unwrap_or_default();
-            (RunStatus::Completed, summarize_child_result(&final_text))
-        }
-        ChildRunOutcome::Failed { error } => {
-            let final_text = latest_assistant_text_for_run(state, child_run_id).unwrap_or_default();
-            let message = if final_text.trim().is_empty() {
-                format!("Subagent failed: {error}")
-            } else {
-                format!(
-                    "Subagent failed after replying: {}",
-                    summarize_child_result(&final_text)
-                )
-            };
-            (RunStatus::Failed, message)
-        }
-    };
-
-    if let Some(run) = state.session.find_run_mut(child_run_id) {
-        run.status = child_status;
-        run.updated_at = Utc::now();
-    }
-
-    state.active_run_id = Some(parent_run_id);
-    state.status = AppStatus::Generating;
-    state.pending_resume_request = None;
-
-    let result_effects = update(
-        state,
-        Msg::ToolExecutionFinished {
-            run_id: parent_run_id,
-            invocation_id: parent_tool_invocation_id,
-            result: Ok(synthetic_result),
-        },
-    );
-
-    info!(
-        session_id = %session_id,
-        parent_run_id = %parent_run_id,
-        child_run_id = %child_run_id,
-        invocation_id = %parent_tool_invocation_id,
-        "child run reached terminal state and parent resumed"
-    );
-
-    Some(result_effects)
-}
-
-fn finish_task_invocation_with_error(
-    state: &mut AppState,
-    invocation_id: ToolInvocationId,
-    error: &str,
-) {
-    if let Some(invocation) = state.session.find_tool_invocation_mut(invocation_id) {
-        invocation.execution_state = ToolExecutionState::Failed;
-        invocation.error = Some(error.to_string());
-        invocation.completed_at = Some(Utc::now());
-    }
-    state.session.updated_at = Utc::now();
-}
-
-fn latest_assistant_text_for_run(state: &AppState, run_id: Uuid) -> Option<String> {
-    state
-        .session
-        .turns
-        .iter()
-        .rev()
-        .find(|turn| turn.run_id == run_id && matches!(turn.role, Role::Assistant))
-        .map(|turn| turn.content.clone())
 }
 
 fn active_assistant_turn_mut(state: &mut AppState, run_id: Uuid) -> Option<&mut Turn> {
@@ -883,24 +625,6 @@ fn ensure_active_assistant_turn(state: &mut AppState, run_id: Uuid) -> &mut Turn
     }
 
     active_assistant_turn_mut(state, run_id).expect("assistant turn just ensured")
-}
-
-fn summarize_child_result(text: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        "Subagent finished without a final text response.".to_string()
-    } else {
-        format!("Subagent finished: {trimmed}")
-    }
-}
-
-fn child_provider_tools(state: &AppState) -> Vec<fluent_code_provider::ProviderTool> {
-    state
-        .tool_registry
-        .provider_tools()
-        .into_iter()
-        .filter(|tool| tool.name != TASK_TOOL_NAME)
-        .collect()
 }
 
 fn should_resume_after_tool_failure(tool_name: &str, error: &str) -> bool {
@@ -942,7 +666,6 @@ fn deny_pending_tool_batch(
     match tool_batch_progress(state, run_id, preceding_turn_id) {
         ToolBatchProgress::AwaitingApproval => {
             state.status = AppStatus::AwaitingToolApproval;
-            state.pending_resume_request = None;
             info!(
                 session_id = %session_id,
                 run_id = %run_id,
@@ -953,7 +676,6 @@ fn deny_pending_tool_batch(
         }
         ToolBatchProgress::Running => {
             state.status = AppStatus::RunningTool;
-            state.pending_resume_request = None;
             info!(
                 session_id = %session_id,
                 run_id = %run_id,
@@ -964,11 +686,7 @@ fn deny_pending_tool_batch(
         }
         ToolBatchProgress::ReadyToResume => {
             state.status = AppStatus::Generating;
-            state.pending_resume_request = Some(build_provider_request(state, run_id));
-            let request = state
-                .pending_resume_request
-                .clone()
-                .expect("resume request just prepared");
+            let request = build_provider_request(state, run_id);
 
             info!(
                 session_id = %session_id,
@@ -1023,93 +741,14 @@ fn tool_batch_progress(
     }
 }
 
-fn append_tool_messages_after_turn(
-    messages: &mut Vec<ProviderMessage>,
-    state: &AppState,
-    run_id: Uuid,
-    turn_id: Uuid,
-) {
-    let mut invocations = state
-        .session
-        .tool_invocations
-        .iter()
-        .filter(|invocation| {
-            invocation.run_id == run_id && invocation.preceding_turn_id == Some(turn_id)
-        })
-        .collect::<Vec<_>>();
-    invocations.sort_by_key(|invocation| invocation.requested_at);
-
-    for invocation in invocations {
-        if invocation.tool_call_id.trim().is_empty() {
-            warn!(
-                run_id = %run_id,
-                invocation_id = %invocation.id,
-                tool_name = %invocation.tool_name,
-                "skipping tool invocation replay because tool_call_id is empty"
-            );
-            continue;
-        }
-
-        messages.push(ProviderMessage::AssistantToolCall {
-            id: invocation.tool_call_id.clone(),
-            name: invocation.tool_name.clone(),
-            arguments: invocation.arguments.clone(),
-        });
-
-        match invocation.approval_state {
-            ToolApprovalState::Pending => {}
-            ToolApprovalState::Approved => match invocation.execution_state {
-                ToolExecutionState::Completed => messages.push(ProviderMessage::ToolResult {
-                    tool_call_id: invocation.tool_call_id.clone(),
-                    content: invocation.result.clone().unwrap_or_default(),
-                }),
-                ToolExecutionState::Failed => messages.push(ProviderMessage::ToolResult {
-                    tool_call_id: invocation.tool_call_id.clone(),
-                    content: invocation
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "Tool execution failed".to_string()),
-                }),
-                ToolExecutionState::Running
-                | ToolExecutionState::NotStarted
-                | ToolExecutionState::Skipped => {}
-            },
-            ToolApprovalState::Denied => messages.push(ProviderMessage::ToolResult {
-                tool_call_id: invocation.tool_call_id.clone(),
-                content: invocation
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "Tool execution denied by user".to_string()),
-            }),
-        }
-    }
-}
-
-fn turn_to_provider_message(turn: &Turn) -> ProviderMessage {
-    match turn.role {
-        Role::User => ProviderMessage::UserText {
-            text: turn.content.clone(),
-        },
-        Role::Assistant => ProviderMessage::AssistantText {
-            text: turn.content.clone(),
-        },
-        Role::Tool => ProviderMessage::ToolResult {
-            tool_call_id: turn.id.to_string(),
-            content: turn.content.clone(),
-        },
-        Role::System => ProviderMessage::AssistantText {
-            text: turn.content.clone(),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::{build_provider_request, update};
+    use super::update;
     use crate::agent::AgentRegistry;
     use crate::app::permissions::PermissionReply;
+    use crate::app::request_builder::build_provider_request;
     use crate::app::{AppState, AppStatus, Effect, Msg};
     use crate::config::AgentConfig;
     use crate::session::model::{Role, RunStatus, Session, ToolApprovalState, ToolExecutionState};
@@ -1818,19 +1457,15 @@ mod tests {
             Some("Inspect the runtime orchestrator")
         );
         assert_eq!(
-            state.session.tool_invocations[0].child_run_id,
+            state.session.tool_invocations[0].child_run_id(),
             Some(child_run_id)
         );
         assert_eq!(
-            state.session.tool_invocations[0]
-                .delegation_agent_name
-                .as_deref(),
+            state.session.tool_invocations[0].delegation_agent_name(),
             Some("explore")
         );
         assert_eq!(
-            state.session.tool_invocations[0]
-                .delegation_prompt
-                .as_deref(),
+            state.session.tool_invocations[0].delegation_prompt(),
             Some("Inspect the runtime orchestrator")
         );
         assert_eq!(
@@ -1967,9 +1602,7 @@ mod tests {
 
         assert_ne!(child_run_id, parent_run_id);
         assert_eq!(
-            state.session.tool_invocations[0]
-                .delegation_agent_name
-                .as_deref(),
+            state.session.tool_invocations[0].delegation_agent_name(),
             Some("oracle")
         );
         assert_eq!(

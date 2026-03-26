@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fluent_code_provider::ProviderRequest;
 use uuid::Uuid;
 
 use crate::agent::AgentRegistry;
@@ -20,7 +19,6 @@ pub struct AppState {
     pub status: AppStatus,
     pub should_quit: bool,
     pub active_run_id: Option<Uuid>,
-    pub pending_resume_request: Option<ProviderRequest>,
     last_checkpoint_at: Option<Instant>,
     checkpoint_interval: Duration,
 }
@@ -96,7 +94,6 @@ impl AppState {
             status: AppStatus::Idle,
             should_quit: false,
             active_run_id: None,
-            pending_resume_request: None,
             last_checkpoint_at: None,
             checkpoint_interval,
         }
@@ -119,7 +116,6 @@ impl AppState {
         self.status = AppStatus::Idle;
         self.should_quit = false;
         self.active_run_id = None;
-        self.pending_resume_request = None;
         self.last_checkpoint_at = None;
     }
 }

@@ -236,13 +236,12 @@ fn format_run_marker_label(base: &str, child_suffix: Option<&str>) -> String {
 fn active_child_run_suffix(state: &AppState) -> Option<String> {
     let active_run_id = state.active_run_id?;
     let invocation = state.session.tool_invocations.iter().find(|invocation| {
-        invocation.tool_name == "task" && invocation.child_run_id == Some(active_run_id)
+        invocation.tool_name == "task" && invocation.child_run_id() == Some(active_run_id)
     })?;
 
     Some(
         match invocation
-            .delegation_agent_name
-            .as_deref()
+            .delegation_agent_name()
             .map(str::trim)
             .filter(|agent| !agent.is_empty())
         {
@@ -348,19 +347,17 @@ fn derive_delegated_task_row(
     }
 
     let agent_name = invocation
-        .delegation_agent_name
-        .as_deref()
+        .delegation_agent_name()
         .map(str::trim)
         .filter(|agent| !agent.is_empty())
         .map(str::to_owned);
     let prompt_preview = invocation
-        .delegation_prompt
-        .as_deref()
+        .delegation_prompt()
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
         .map(summarize_text);
     let child_run_status = invocation
-        .child_run_id
+        .child_run_id()
         .and_then(|child_run_id| session.find_run(child_run_id).map(|run| run.status));
 
     if agent_name.is_none() && prompt_preview.is_none() && child_run_status.is_none() {
@@ -370,7 +367,7 @@ fn derive_delegated_task_row(
     Some(DelegatedTaskRow {
         agent_name,
         prompt_preview,
-        child_run_id: invocation.child_run_id,
+        child_run_id: invocation.child_run_id(),
         child_run_status,
     })
 }
@@ -486,8 +483,8 @@ mod tests {
     use chrono::{Duration, Utc};
     use fluent_code_app::app::{AppState, AppStatus};
     use fluent_code_app::session::model::{
-        Role, RunStatus, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
-        ToolSource, Turn,
+        Role, RunStatus, Session, TaskDelegationRecord, ToolApprovalState, ToolExecutionState,
+        ToolInvocationRecord, ToolSource, Turn,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -819,9 +816,11 @@ mod tests {
             json!({"agent": "explore", "prompt": "Inspect session persistence state"}),
             Utc::now(),
         );
-        invocation.delegation_agent_name = Some("explore".to_string());
-        invocation.delegation_prompt = Some("Inspect session persistence state".to_string());
-        invocation.child_run_id = Some(child_run_id);
+        invocation.delegation = Some(TaskDelegationRecord {
+            child_run_id: Some(child_run_id),
+            agent_name: Some("explore".to_string()),
+            prompt: Some("Inspect session persistence state".to_string()),
+        });
         invocation.approval_state = ToolApprovalState::Approved;
         invocation.execution_state = ToolExecutionState::Running;
 
@@ -870,9 +869,11 @@ mod tests {
             json!({"agent": "explore", "prompt": "Inspect child flow"}),
             Utc::now(),
         );
-        invocation.delegation_agent_name = Some("explore".to_string());
-        invocation.delegation_prompt = Some("Inspect child flow".to_string());
-        invocation.child_run_id = Some(child_run_id);
+        invocation.delegation = Some(TaskDelegationRecord {
+            child_run_id: Some(child_run_id),
+            agent_name: Some("explore".to_string()),
+            prompt: Some("Inspect child flow".to_string()),
+        });
         invocation.approval_state = ToolApprovalState::Approved;
         invocation.execution_state = ToolExecutionState::Running;
 
@@ -930,9 +931,7 @@ mod tests {
             execution_state: ToolExecutionState::NotStarted,
             result: None,
             error: None,
-            child_run_id: None,
-            delegation_agent_name: None,
-            delegation_prompt: None,
+            delegation: None,
             requested_at,
             approved_at: None,
             completed_at: None,

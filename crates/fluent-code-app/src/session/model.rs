@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use crate::plugin::DiscoveryScope;
@@ -160,7 +160,7 @@ pub enum RunStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolInvocationRecord {
     pub id: ToolInvocationId,
     pub run_id: RunId,
@@ -179,17 +179,168 @@ pub struct ToolInvocationRecord {
     pub result: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
-    #[serde(default)]
-    pub child_run_id: Option<RunId>,
-    #[serde(default)]
-    pub delegation_agent_name: Option<String>,
-    #[serde(default)]
-    pub delegation_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<TaskDelegationRecord>,
     pub requested_at: DateTime<Utc>,
     #[serde(default)]
     pub approved_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl ToolInvocationRecord {
+    pub fn task_delegation(&self) -> Option<&TaskDelegationRecord> {
+        self.delegation.as_ref()
+    }
+
+    pub fn child_run_id(&self) -> Option<RunId> {
+        self.delegation
+            .as_ref()
+            .and_then(|delegation| delegation.child_run_id)
+    }
+
+    pub fn delegation_agent_name(&self) -> Option<&str> {
+        self.delegation
+            .as_ref()
+            .and_then(|delegation| delegation.agent_name.as_deref())
+    }
+
+    pub fn delegation_prompt(&self) -> Option<&str> {
+        self.delegation
+            .as_ref()
+            .and_then(|delegation| delegation.prompt.as_deref())
+    }
+
+    pub fn set_task_delegation(
+        &mut self,
+        child_run_id: RunId,
+        agent_name: impl Into<String>,
+        prompt: impl Into<String>,
+    ) {
+        self.delegation = Some(TaskDelegationRecord {
+            child_run_id: Some(child_run_id),
+            agent_name: Some(agent_name.into()),
+            prompt: Some(prompt.into()),
+        });
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolInvocationRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let compat = ToolInvocationRecordCompat::deserialize(deserializer)?;
+
+        Ok(Self {
+            id: compat.id,
+            run_id: compat.run_id,
+            tool_call_id: compat.tool_call_id,
+            tool_name: compat.tool_name,
+            tool_source: compat.tool_source,
+            arguments: compat.arguments,
+            preceding_turn_id: compat.preceding_turn_id,
+            approval_state: compat.approval_state,
+            execution_state: compat.execution_state,
+            result: compat.result,
+            error: compat.error,
+            delegation: TaskDelegationRecord::from_compat(
+                compat.delegation,
+                compat.child_run_id,
+                compat.delegation_agent_name,
+                compat.delegation_prompt,
+            ),
+            requested_at: compat.requested_at,
+            approved_at: compat.approved_at,
+            completed_at: compat.completed_at,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskDelegationRecord {
+    #[serde(default)]
+    pub child_run_id: Option<RunId>,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+impl TaskDelegationRecord {
+    fn from_compat(
+        delegation: Option<Self>,
+        legacy_child_run_id: Option<RunId>,
+        legacy_agent_name: Option<String>,
+        legacy_prompt: Option<String>,
+    ) -> Option<Self> {
+        let delegation = match delegation {
+            Some(delegation) => {
+                delegation.with_legacy_fields(legacy_child_run_id, legacy_agent_name, legacy_prompt)
+            }
+            None => Self {
+                child_run_id: legacy_child_run_id,
+                agent_name: legacy_agent_name,
+                prompt: legacy_prompt,
+            },
+        };
+
+        delegation.into_option()
+    }
+
+    fn with_legacy_fields(
+        mut self,
+        legacy_child_run_id: Option<RunId>,
+        legacy_agent_name: Option<String>,
+        legacy_prompt: Option<String>,
+    ) -> Self {
+        self.child_run_id = self.child_run_id.or(legacy_child_run_id);
+        self.agent_name = self.agent_name.or(legacy_agent_name);
+        self.prompt = self.prompt.or(legacy_prompt);
+        self
+    }
+
+    fn into_option(self) -> Option<Self> {
+        if self.child_run_id.is_none() && self.agent_name.is_none() && self.prompt.is_none() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolInvocationRecordCompat {
+    id: ToolInvocationId,
+    run_id: RunId,
+    tool_call_id: String,
+    tool_name: String,
+    #[serde(default)]
+    tool_source: ToolSource,
+    arguments: serde_json::Value,
+    #[serde(default)]
+    preceding_turn_id: Option<TurnId>,
+    #[serde(default)]
+    approval_state: ToolApprovalState,
+    #[serde(default)]
+    execution_state: ToolExecutionState,
+    #[serde(default)]
+    result: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    delegation: Option<TaskDelegationRecord>,
+    #[serde(default)]
+    child_run_id: Option<RunId>,
+    #[serde(default)]
+    delegation_agent_name: Option<String>,
+    #[serde(default)]
+    delegation_prompt: Option<String>,
+    requested_at: DateTime<Utc>,
+    #[serde(default)]
+    approved_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

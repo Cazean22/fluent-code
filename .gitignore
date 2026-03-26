@@ -1,3 +1,4 @@
 /target
 *.log
 /.fluent-code/
+.DS_Store
