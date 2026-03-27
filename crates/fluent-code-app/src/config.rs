@@ -66,6 +66,9 @@ pub struct AgentConfig {
     pub name: String,
     pub description: String,
     pub system_prompt: String,
+    pub tools_allowed: Option<Vec<String>>,
+    pub tools_denied: Option<Vec<String>>,
+    pub delegation_targets: Option<Vec<String>>,
 }
 
 impl Config {
@@ -207,6 +210,12 @@ struct RawAgentConfig {
     name: String,
     description: String,
     system_prompt: String,
+    #[serde(default)]
+    tools_allowed: Option<Vec<String>>,
+    #[serde(default)]
+    tools_denied: Option<Vec<String>>,
+    #[serde(default)]
+    delegation_targets: Option<Vec<String>>,
 }
 
 impl LoggingConfig {
@@ -285,6 +294,9 @@ impl AgentConfig {
             name: raw.name,
             description: raw.description,
             system_prompt: raw.system_prompt,
+            tools_allowed: raw.tools_allowed,
+            tools_denied: raw.tools_denied,
+            delegation_targets: raw.delegation_targets,
         }
     }
 }
@@ -469,11 +481,17 @@ system_prompt = "You are the reviewer subagent."
                     name: "oracle".to_string(),
                     description: "Answer architecture questions.".to_string(),
                     system_prompt: "You are the oracle subagent.".to_string(),
+                    tools_allowed: None,
+                    tools_denied: None,
+                    delegation_targets: None,
                 },
                 AgentConfig {
                     name: "reviewer".to_string(),
                     description: "Review code changes.".to_string(),
                     system_prompt: "You are the reviewer subagent.".to_string(),
+                    tools_allowed: None,
+                    tools_denied: None,
+                    delegation_targets: None,
                 },
             ])
         );

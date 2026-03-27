@@ -313,6 +313,11 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 return vec![Effect::PersistSession];
             };
 
+            // Check agent-level tool permissions: if the active agent disallows
+            // this tool, deny it immediately without creating an approval prompt.
+            let agent_denied = active_agent_for_run(state, run_id)
+                .is_some_and(|agent| !agent.tool_permissions.is_tool_permitted(&tool_name));
+
             let invocation = ToolInvocationRecord {
                 id: Uuid::new_v4(),
                 run_id,
@@ -333,7 +338,11 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
 
             state.session.tool_invocations.push(invocation);
             state.session.updated_at = Utc::now();
-            let permission_decision = evaluate_tool_permission(&state.session, &tool_policy);
+            let permission_decision = if agent_denied {
+                PermissionDecision::Deny
+            } else {
+                evaluate_tool_permission(&state.session, &tool_policy)
+            };
 
             match permission_decision {
                 PermissionDecision::Allow => {
@@ -816,6 +825,26 @@ fn tool_batch_progress(
     } else {
         ToolBatchProgress::ReadyToResume
     }
+}
+
+/// Look up the agent definition for the run that owns `run_id`.
+///
+/// For child (delegated) runs we inspect the parent's task invocation to find
+/// which agent was delegated. For root runs we return `None` because the
+/// primary orchestrator is not constrained by agent-level tool permissions.
+fn active_agent_for_run<'a>(
+    state: &'a AppState,
+    run_id: Uuid,
+) -> Option<&'a crate::agent::AgentDefinition> {
+    let run = state.session.find_run(run_id)?;
+    let parent_invocation_id = run.parent_tool_invocation_id?;
+    let invocation = state
+        .session
+        .tool_invocations
+        .iter()
+        .find(|inv| inv.id == parent_invocation_id)?;
+    let agent_name = invocation.delegation_agent_name()?;
+    state.agent_registry.get(agent_name)
 }
 
 #[cfg(test)]
@@ -1709,6 +1738,9 @@ mod tests {
                 name: "oracle".to_string(),
                 description: "Answer architecture questions.".to_string(),
                 system_prompt: "You are the oracle subagent.".to_string(),
+                tools_allowed: None,
+                tools_denied: None,
+                delegation_targets: None,
             }])
             .expect("custom agent registry"),
         );

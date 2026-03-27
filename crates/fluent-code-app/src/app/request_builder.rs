@@ -4,7 +4,7 @@ use fluent_code_provider::{ProviderMessage, ProviderRequest};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::agent::TASK_TOOL_NAME;
+use crate::agent::AgentToolPermissions;
 use crate::app::AppState;
 use crate::session::model::{Role, Turn};
 
@@ -44,15 +44,13 @@ pub fn child_provider_request(
     state: &AppState,
     prompt: String,
     system_prompt: String,
+    agent_tool_permissions: &AgentToolPermissions,
 ) -> ProviderRequest {
     ProviderRequest::new(
         vec![ProviderMessage::UserText { text: prompt }],
         state
             .tool_registry
-            .provider_tools()
-            .into_iter()
-            .filter(|tool| tool.name != TASK_TOOL_NAME)
-            .collect(),
+            .provider_tools_for_agent(agent_tool_permissions),
     )
     .with_system_prompt_override(Some(system_prompt))
 }

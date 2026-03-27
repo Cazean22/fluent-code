@@ -11,11 +11,117 @@ use crate::error::{FluentCodeError, Result};
 
 pub const TASK_TOOL_NAME: &str = "task";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Structural role in the delegation graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentTier {
+    Planner,
+    Orchestrator,
+    Specialist,
+    #[default]
+    Utility,
+}
+
+/// Functional classification of what the agent does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentCapability {
+    Exploration,
+    Research,
+    Advisory,
+    Implementation,
+    Creative,
+    Perception,
+    Orchestration,
+    #[default]
+    Planning,
+}
+
+/// Economic governance hint for delegation decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentCostClass {
+    Free,
+    #[default]
+    Cheap,
+    Standard,
+    Expensive,
+}
+
+/// Runtime context: who can invoke this agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentMode {
+    Primary,
+    #[default]
+    Subagent,
+    Dual,
+}
+
+/// Per-agent tool permission ruleset. Controls which tools an agent may use.
+///
+/// Resolution order:
+/// 1. If `tools_denied` contains the tool name or a wildcard match, **deny**.
+/// 2. If `tools_allowed` is non-empty and does not contain the tool name or a
+///    wildcard match, **deny**.
+/// 3. Otherwise **allow**.
+///
+/// Wildcard patterns: `"*"` matches all tools, `"mcp(*)"` matches all MCP
+/// tools, `"task(*)"` matches all task delegations. Exact names match only
+/// themselves.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentToolPermissions {
+    pub tools_allowed: Vec<String>,
+    pub tools_denied: Vec<String>,
+}
+
+impl AgentToolPermissions {
+    /// Returns `true` when the agent is permitted to invoke `tool_name`.
+    pub fn is_tool_permitted(&self, tool_name: &str) -> bool {
+        if pattern_list_matches(&self.tools_denied, tool_name) {
+            return false;
+        }
+        if self.tools_allowed.is_empty() {
+            return true;
+        }
+        pattern_list_matches(&self.tools_allowed, tool_name)
+    }
+}
+
+/// Check whether any pattern in `patterns` matches `tool_name`.
+fn pattern_list_matches(patterns: &[String], tool_name: &str) -> bool {
+    patterns.iter().any(|pattern| tool_pattern_matches(pattern, tool_name))
+}
+
+/// Evaluate a single tool permission pattern against a tool name.
+///
+/// Supported patterns:
+/// - `"*"` — matches everything
+/// - `"all"` — matches everything
+/// - `"task(*)"` — matches any tool starting with `task`
+/// - `"mcp(*)"` — matches any tool starting with `mcp`
+/// - exact name — literal equality
+fn tool_pattern_matches(pattern: &str, tool_name: &str) -> bool {
+    match pattern {
+        "*" | "all" => true,
+        p if p.ends_with("(*)") => {
+            let prefix = &p[..p.len() - 3];
+            tool_name == prefix || tool_name.starts_with(&format!("{prefix}_"))
+                || tool_name.starts_with(&format!("{prefix}("))
+        }
+        p => p == tool_name,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentDefinition {
     pub name: String,
     pub description: String,
     pub system_prompt: String,
+    pub tier: AgentTier,
+    pub capability: AgentCapability,
+    pub cost_class: AgentCostClass,
+    pub mode: AgentMode,
+    pub temperature: Option<f32>,
+    pub tool_permissions: AgentToolPermissions,
+    /// Which agents this agent may delegate to via the task tool.
+    pub delegation_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,35 +141,53 @@ struct TaskArguments {
     prompt: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BuiltInAgentDefinition {
-    name: &'static str,
-    description: &'static str,
-    system_prompt: &'static str,
-}
-
-const BUILT_IN_AGENTS: &[BuiltInAgentDefinition] = &[
-    BuiltInAgentDefinition {
-        name: "explore",
-        description: "Investigate the repository, trace implementations, and report precise findings.",
-        system_prompt: "You are the explore subagent. Investigate the repository carefully, follow existing code patterns, and answer with concrete findings grounded in the code you read. Focus on discovery, not implementation.",
-    },
-    BuiltInAgentDefinition {
-        name: "librarian",
-        description: "Gather code-oriented reference material and summarize the most relevant details.",
-        system_prompt: "You are the librarian subagent. Read the available project context carefully and return a concise, well-organized reference summary that helps the parent agent continue implementation accurately.",
-    },
-];
-
-static BUILT_IN_REGISTRY: LazyLock<AgentRegistry> = LazyLock::new(|| AgentRegistry {
-    agents: BUILT_IN_AGENTS
-        .iter()
-        .map(|agent| AgentDefinition {
-            name: agent.name.to_string(),
-            description: agent.description.to_string(),
-            system_prompt: agent.system_prompt.to_string(),
-        })
-        .collect(),
+static BUILT_IN_REGISTRY: LazyLock<AgentRegistry> = LazyLock::new(|| {
+    AgentRegistry {
+        agents: vec![
+            AgentDefinition {
+                name: "explore".to_string(),
+                description: "Investigate the repository, trace implementations, and report precise findings.".to_string(),
+                system_prompt: "You are the explore subagent. Investigate the repository carefully, follow existing code patterns, and answer with concrete findings grounded in the code you read. Focus on discovery, not implementation.".to_string(),
+                tier: AgentTier::Utility,
+                capability: AgentCapability::Exploration,
+                cost_class: AgentCostClass::Free,
+                mode: AgentMode::Subagent,
+                temperature: Some(0.1),
+                tool_permissions: AgentToolPermissions {
+                    tools_allowed: vec![
+                        "read".to_string(),
+                        "glob".to_string(),
+                        "grep".to_string(),
+                    ],
+                    tools_denied: vec![
+                        "task".to_string(),
+                    ],
+                },
+                delegation_targets: vec![],
+            },
+            AgentDefinition {
+                name: "librarian".to_string(),
+                description: "Gather code-oriented reference material and summarize the most relevant details.".to_string(),
+                system_prompt: "You are the librarian subagent. Read the available project context carefully and return a concise, well-organized reference summary that helps the parent agent continue implementation accurately.".to_string(),
+                tier: AgentTier::Utility,
+                capability: AgentCapability::Research,
+                cost_class: AgentCostClass::Cheap,
+                mode: AgentMode::Subagent,
+                temperature: Some(0.1),
+                tool_permissions: AgentToolPermissions {
+                    tools_allowed: vec![
+                        "read".to_string(),
+                        "glob".to_string(),
+                        "grep".to_string(),
+                    ],
+                    tools_denied: vec![
+                        "task".to_string(),
+                    ],
+                },
+                delegation_targets: vec![],
+            },
+        ],
+    }
 });
 
 impl AgentRegistry {
@@ -135,6 +259,16 @@ impl AgentRegistry {
             name: name.to_string(),
             description: description.to_string(),
             system_prompt: system_prompt.to_string(),
+            tier: AgentTier::default(),
+            capability: AgentCapability::default(),
+            cost_class: AgentCostClass::default(),
+            mode: AgentMode::default(),
+            temperature: None,
+            tool_permissions: AgentToolPermissions {
+                tools_allowed: agent.tools_allowed.clone().unwrap_or_default(),
+                tools_denied: agent.tools_denied.clone().unwrap_or_default(),
+            },
+            delegation_targets: agent.delegation_targets.clone().unwrap_or_default(),
         })
     }
 }
@@ -241,6 +375,9 @@ mod tests {
             name: "oracle".to_string(),
             description: "Answer architecture questions.".to_string(),
             system_prompt: "You are the oracle subagent.".to_string(),
+            tools_allowed: None,
+            tools_denied: None,
+            delegation_targets: None,
         }]))
         .expect("custom registry");
 
@@ -260,11 +397,17 @@ mod tests {
                 name: "oracle".to_string(),
                 description: "Answer architecture questions.".to_string(),
                 system_prompt: "You are the oracle subagent.".to_string(),
+                tools_allowed: None,
+                tools_denied: None,
+                delegation_targets: None,
             },
             AgentConfig {
                 name: "oracle".to_string(),
                 description: "Review changes.".to_string(),
                 system_prompt: "You are the reviewer subagent.".to_string(),
+                tools_allowed: None,
+                tools_denied: None,
+                delegation_targets: None,
             },
         ]))
         .expect_err("duplicate names should fail");
@@ -274,11 +417,7 @@ mod tests {
 
     #[test]
     fn task_tool_exposes_configured_agents() {
-        let registry = AgentRegistry::from_configured(Some(&[AgentConfig {
-            name: "oracle".to_string(),
-            description: "Answer architecture questions.".to_string(),
-            system_prompt: "You are the oracle subagent.".to_string(),
-        }]))
+        let registry = AgentRegistry::from_configured(Some(&[test_agent_config("oracle")]))
         .expect("custom registry");
         let tool = task_tool(&registry);
 
@@ -293,11 +432,7 @@ mod tests {
 
     #[test]
     fn parse_task_request_accepts_known_agent_from_registry() {
-        let registry = AgentRegistry::from_configured(Some(&[AgentConfig {
-            name: "oracle".to_string(),
-            description: "Answer architecture questions.".to_string(),
-            system_prompt: "You are the oracle subagent.".to_string(),
-        }]))
+        let registry = AgentRegistry::from_configured(Some(&[test_agent_config("oracle")]))
         .expect("custom registry");
         let request = parse_task_request(
             &registry,
@@ -314,11 +449,7 @@ mod tests {
 
     #[test]
     fn parse_task_request_rejects_unknown_agent_from_registry() {
-        let registry = AgentRegistry::from_configured(Some(&[AgentConfig {
-            name: "oracle".to_string(),
-            description: "Answer architecture questions.".to_string(),
-            system_prompt: "You are the oracle subagent.".to_string(),
-        }]))
+        let registry = AgentRegistry::from_configured(Some(&[test_agent_config("oracle")]))
         .expect("custom registry");
         let error = parse_task_request(
             &registry,
@@ -330,5 +461,16 @@ mod tests {
         .expect_err("unknown agent should fail");
 
         assert!(error.to_string().contains("unknown agent 'explore'"));
+    }
+
+    fn test_agent_config(name: &str) -> AgentConfig {
+        AgentConfig {
+            name: name.to_string(),
+            description: "Answer architecture questions.".to_string(),
+            system_prompt: format!("You are the {name} subagent."),
+            tools_allowed: None,
+            tools_denied: None,
+            delegation_targets: None,
+        }
     }
 }

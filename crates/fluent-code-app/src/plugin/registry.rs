@@ -285,6 +285,18 @@ impl ToolRegistry {
         self.provider_tools.clone()
     }
 
+    /// Return the subset of provider tools that `agent_permissions` permits.
+    pub fn provider_tools_for_agent(
+        &self,
+        agent_permissions: &crate::agent::AgentToolPermissions,
+    ) -> Vec<ProviderTool> {
+        self.provider_tools
+            .iter()
+            .filter(|tool| agent_permissions.is_tool_permitted(&tool.name))
+            .cloned()
+            .collect()
+    }
+
     pub fn execute(&self, tool_call: &ProviderToolCall) -> Result<String> {
         match self.tools.get(&tool_call.name) {
             Some(RegisteredTool::BuiltIn) => execute_built_in_tool(tool_call),
@@ -465,6 +477,9 @@ mod tests {
             name: "oracle".to_string(),
             description: "Answer architecture questions.".to_string(),
             system_prompt: "You are the oracle subagent.".to_string(),
+            tools_allowed: None,
+            tools_denied: None,
+            delegation_targets: None,
         }])
         .expect("custom agent registry");
 

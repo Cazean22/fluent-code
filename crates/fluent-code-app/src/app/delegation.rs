@@ -63,8 +63,8 @@ pub fn start_child_run(
     let delegated_agent = state
         .agent_registry
         .get(&task_request.agent)
-        .map(|agent| (agent.name.clone(), agent.system_prompt.clone()));
-    let Some((agent_name, agent_system_prompt)) = delegated_agent else {
+        .map(|agent| (agent.name.clone(), agent.system_prompt.clone(), agent.tool_permissions.clone()));
+    let Some((agent_name, agent_system_prompt, agent_tool_permissions)) = delegated_agent else {
         let error_message = format!("task requested unknown agent '{}'", task_request.agent);
         finish_task_invocation_with_error(state, invocation_id, &error_message);
         state.status = AppStatus::Generating;
@@ -112,7 +112,7 @@ pub fn start_child_run(
     });
     state.session.updated_at = Utc::now();
 
-    let child_request = child_provider_request(state, task_request.prompt, agent_system_prompt);
+    let child_request = child_provider_request(state, task_request.prompt, agent_system_prompt, &agent_tool_permissions);
 
     info!(
         session_id = %session_id,
