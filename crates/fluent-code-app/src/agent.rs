@@ -124,7 +124,7 @@ pub struct AgentDefinition {
     pub delegation_targets: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentRegistry {
     agents: Vec<AgentDefinition>,
 }

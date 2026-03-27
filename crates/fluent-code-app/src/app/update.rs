@@ -1739,7 +1739,7 @@ mod tests {
                 description: "Answer architecture questions.".to_string(),
                 system_prompt: "You are the oracle subagent.".to_string(),
                 tools_allowed: None,
-                tools_denied: None,
+                tools_denied: Some(vec!["task".to_string()]),
                 delegation_targets: None,
             }])
             .expect("custom agent registry"),
