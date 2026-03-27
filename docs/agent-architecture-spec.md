@@ -462,6 +462,8 @@ interface DelegationRequest {
 
 ### 4.3 Delegation Principles
 
+For the concrete phase-1 implementation of delegated child-run scheduling in this repo, see [OpenCode-Style Delegated Scheduling in This Repo](opencode-delegated-scheduling.md).
+
 1. **Intent Gate first.** The orchestrator verbalizes its interpretation of the user's request before any delegation.
 2. **Parallel by default.** Independent tasks are dispatched concurrently. Sequential only when outputs feed inputs.
 3. **Anti-duplication.** Once exploration is delegated, the orchestrator must not perform redundant searches.
@@ -527,6 +529,8 @@ Orchestrator                     Subagent
 ```
 
 Maximum concurrent background tasks: configurable (default 10).
+
+This spec describes the broader delegation model. For the current local Rust implementation details and its foreground child-run handoff semantics, see [OpenCode-Style Delegated Scheduling in This Repo](opencode-delegated-scheduling.md).
 
 ---
 

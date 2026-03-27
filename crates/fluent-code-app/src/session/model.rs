@@ -23,6 +23,8 @@ pub struct Session {
     pub turns: Vec<Turn>,
     #[serde(default)]
     pub tool_invocations: Vec<ToolInvocationRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_owner: Option<ForegroundOwnerRecord>,
 }
 
 impl Session {
@@ -38,6 +40,7 @@ impl Session {
             runs: Vec::new(),
             turns: Vec::new(),
             tool_invocations: Vec::new(),
+            foreground_owner: None,
         }
     }
 
@@ -130,6 +133,35 @@ impl Session {
             .find(|invocation| invocation.approval_state == ToolApprovalState::Pending)
     }
 
+    pub fn pending_tool_invocation_for_batch(
+        &self,
+        run_id: RunId,
+        preceding_turn_id: Option<TurnId>,
+    ) -> Option<&ToolInvocationRecord> {
+        self.tool_invocations.iter().rev().find(|invocation| {
+            invocation.run_id == run_id
+                && invocation.preceding_turn_id == preceding_turn_id
+                && invocation.approval_state == ToolApprovalState::Pending
+        })
+    }
+
+    pub fn set_foreground_owner(
+        &mut self,
+        run_id: RunId,
+        phase: ForegroundPhase,
+        batch_anchor_turn_id: Option<TurnId>,
+    ) {
+        self.foreground_owner = Some(ForegroundOwnerRecord {
+            run_id,
+            phase,
+            batch_anchor_turn_id,
+        });
+    }
+
+    pub fn clear_foreground_owner(&mut self) {
+        self.foreground_owner = None;
+    }
+
     pub fn find_tool_invocation_mut(
         &mut self,
         invocation_id: ToolInvocationId,
@@ -158,6 +190,22 @@ pub enum RunStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForegroundPhase {
+    Generating,
+    AwaitingToolApproval,
+    RunningTool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForegroundOwnerRecord {
+    pub run_id: RunId,
+    pub phase: ForegroundPhase,
+    #[serde(default)]
+    pub batch_anchor_turn_id: Option<TurnId>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +259,10 @@ impl ToolInvocationRecord {
             .and_then(|delegation| delegation.prompt.as_deref())
     }
 
+    pub fn delegation_status(&self) -> Option<TaskDelegationStatus> {
+        self.delegation.as_ref().map(|delegation| delegation.status)
+    }
+
     pub fn set_task_delegation(
         &mut self,
         child_run_id: RunId,
@@ -221,7 +273,14 @@ impl ToolInvocationRecord {
             child_run_id: Some(child_run_id),
             agent_name: Some(agent_name.into()),
             prompt: Some(prompt.into()),
+            status: TaskDelegationStatus::Running,
         });
+    }
+
+    pub fn set_task_delegation_status(&mut self, status: TaskDelegationStatus) {
+        if let Some(delegation) = self.delegation.as_mut() {
+            delegation.status = status;
+        }
     }
 }
 
@@ -265,6 +324,8 @@ pub struct TaskDelegationRecord {
     pub agent_name: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
+    #[serde(default)]
+    pub status: TaskDelegationStatus,
 }
 
 impl TaskDelegationRecord {
@@ -282,10 +343,11 @@ impl TaskDelegationRecord {
                 child_run_id: legacy_child_run_id,
                 agent_name: legacy_agent_name,
                 prompt: legacy_prompt,
+                status: TaskDelegationStatus::default(),
             },
         };
 
-        delegation.into_option()
+        delegation.normalize_legacy_status().into_option()
     }
 
     fn with_legacy_fields(
@@ -307,6 +369,25 @@ impl TaskDelegationRecord {
             Some(self)
         }
     }
+
+    fn normalize_legacy_status(mut self) -> Self {
+        if self.status == TaskDelegationStatus::Pending && self.child_run_id.is_some() {
+            self.status = TaskDelegationStatus::Running;
+        }
+
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskDelegationStatus {
+    #[default]
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Deserialize)]

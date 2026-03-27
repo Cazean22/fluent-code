@@ -12,7 +12,8 @@ use crate::app::permissions::{
 use crate::app::request_builder::build_provider_request;
 use crate::app::{AppState, AppStatus, Effect, Msg};
 use crate::session::model::{
-    Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord, Turn,
+    ForegroundPhase, Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
+    Turn,
 };
 
 const READ_TOOL_NAME: &str = "read";
@@ -64,8 +65,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             state.session.updated_at = Utc::now();
             state.session.upsert_run(run_id, RunStatus::InProgress);
             state.draft_input.clear();
-            state.status = AppStatus::Generating;
-            state.active_run_id = Some(run_id);
+            state.set_foreground(run_id, ForegroundPhase::Generating, None);
 
             let request = build_provider_request(state, run_id);
 
@@ -92,10 +92,14 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 return Vec::new();
             };
 
-            let Some(preceding_turn_id) = state
-                .session
-                .pending_tool_invocation()
-                .map(|invocation| invocation.preceding_turn_id)
+            let Some(preceding_turn_id) =
+                current_foreground_batch_anchor(state, run_id).or_else(|| {
+                    state
+                        .session
+                        .pending_tool_invocation()
+                        .filter(|invocation| invocation.run_id == run_id)
+                        .map(|invocation| invocation.preceding_turn_id)
+                })
             else {
                 return Vec::new();
             };
@@ -163,7 +167,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 remember_reply(&mut state.session, &policy, reply);
             }
 
-            state.status = AppStatus::RunningTool;
+            state.set_foreground(run_id, ForegroundPhase::RunningTool, preceding_turn_id);
             state.session.updated_at = Utc::now();
 
             info!(
@@ -190,7 +194,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             effects
         }
         Msg::CancelActiveRun => {
-            let Some(run_id) = state.active_run_id.take() else {
+            let Some(run_id) = state.active_run_id else {
                 debug!(
                     session_id = %state.session.id,
                     "ignored cancel because no run is active"
@@ -198,6 +202,18 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 return Vec::new();
             };
 
+            if state
+                .session
+                .find_run(run_id)
+                .is_some_and(|run| run.parent_run_id.is_some())
+                && let Some(mut parent_effects) =
+                    complete_child_run(state, run_id, ChildRunOutcome::Cancelled)
+            {
+                parent_effects.insert(0, Effect::CancelAssistant { run_id });
+                return parent_effects;
+            }
+
+            state.clear_foreground();
             state.status = AppStatus::Idle;
             state.session.updated_at = Utc::now();
             state.session.upsert_run(run_id, RunStatus::Cancelled);
@@ -293,7 +309,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 state.status = AppStatus::Error(format!("unsupported tool '{}'", tool_name));
                 state.session.updated_at = Utc::now();
                 state.session.upsert_run(run_id, RunStatus::Failed);
-                state.active_run_id = None;
+                state.clear_foreground();
                 return vec![Effect::PersistSession];
             };
 
@@ -319,24 +335,36 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             state.session.updated_at = Utc::now();
             let permission_decision = evaluate_tool_permission(&state.session, &tool_policy);
 
-            let invocation = state
-                .session
-                .tool_invocations
-                .last_mut()
-                .expect("tool invocation just pushed");
-
             match permission_decision {
                 PermissionDecision::Allow => {
-                    invocation.approval_state = ToolApprovalState::Approved;
-                    invocation.execution_state = ToolExecutionState::Running;
-                    invocation.approved_at = Some(Utc::now());
-                    state.status = AppStatus::RunningTool;
+                    let (invocation_id, tool_name, tool_call_id, arguments, batch_anchor_turn_id) = {
+                        let invocation = state
+                            .session
+                            .tool_invocations
+                            .last_mut()
+                            .expect("tool invocation just pushed");
+                        invocation.approval_state = ToolApprovalState::Approved;
+                        invocation.execution_state = ToolExecutionState::Running;
+                        invocation.approved_at = Some(Utc::now());
+                        (
+                            invocation.id,
+                            invocation.tool_name.clone(),
+                            invocation.tool_call_id.clone(),
+                            invocation.arguments.clone(),
+                            invocation.preceding_turn_id,
+                        )
+                    };
+                    state.set_foreground(
+                        run_id,
+                        ForegroundPhase::RunningTool,
+                        batch_anchor_turn_id,
+                    );
                     info!(
                         session_id = %state.session.id,
                         run_id = %run_id,
-                        invocation_id = %invocation.id,
-                        tool_name = %invocation.tool_name,
-                        tool_call_id = %invocation.tool_call_id,
+                        invocation_id = %invocation_id,
+                        tool_name = %tool_name,
+                        tool_call_id = %tool_call_id,
                         "assistant tool auto-approved by permission policy"
                     );
 
@@ -344,29 +372,51 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                         Effect::PersistSession,
                         Effect::ExecuteTool {
                             run_id,
-                            invocation_id: invocation.id,
+                            invocation_id,
                             tool_call: ProviderToolCall {
-                                id: invocation.tool_call_id.clone(),
-                                name: invocation.tool_name.clone(),
-                                arguments: invocation.arguments.clone(),
+                                id: tool_call_id,
+                                name: tool_name,
+                                arguments,
                             },
                         },
                     ]
                 }
                 PermissionDecision::Ask => {
-                    state.status = AppStatus::AwaitingToolApproval;
+                    let (invocation_id, tool_name, tool_call_id, batch_anchor_turn_id) = {
+                        let invocation = state
+                            .session
+                            .tool_invocations
+                            .last_mut()
+                            .expect("tool invocation just pushed");
+                        (
+                            invocation.id,
+                            invocation.tool_name.clone(),
+                            invocation.tool_call_id.clone(),
+                            invocation.preceding_turn_id,
+                        )
+                    };
+                    state.set_foreground(
+                        run_id,
+                        ForegroundPhase::AwaitingToolApproval,
+                        batch_anchor_turn_id,
+                    );
                     info!(
                         session_id = %state.session.id,
                         run_id = %run_id,
-                        invocation_id = %invocation.id,
-                        tool_name = %invocation.tool_name,
-                        tool_call_id = %invocation.tool_call_id,
+                        invocation_id = %invocation_id,
+                        tool_name = %tool_name,
+                        tool_call_id = %tool_call_id,
                         "assistant entered tool approval state"
                     );
 
                     vec![Effect::PersistSession]
                 }
                 PermissionDecision::Deny => {
+                    let invocation = state
+                        .session
+                        .tool_invocations
+                        .last_mut()
+                        .expect("tool invocation just pushed");
                     let preceding_turn_id = invocation.preceding_turn_id;
                     invocation.approval_state = ToolApprovalState::Denied;
                     invocation.execution_state = ToolExecutionState::Skipped;
@@ -376,15 +426,23 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
 
                     match tool_batch_progress(state, run_id, preceding_turn_id) {
                         ToolBatchProgress::AwaitingApproval => {
-                            state.status = AppStatus::AwaitingToolApproval;
+                            state.set_foreground(
+                                run_id,
+                                ForegroundPhase::AwaitingToolApproval,
+                                preceding_turn_id,
+                            );
                             vec![Effect::PersistSession]
                         }
                         ToolBatchProgress::Running => {
-                            state.status = AppStatus::RunningTool;
+                            state.set_foreground(
+                                run_id,
+                                ForegroundPhase::RunningTool,
+                                preceding_turn_id,
+                            );
                             vec![Effect::PersistSession]
                         }
                         ToolBatchProgress::ReadyToResume => {
-                            state.status = AppStatus::Generating;
+                            state.set_foreground(run_id, ForegroundPhase::Generating, None);
                             let request = build_provider_request(state, run_id);
                             vec![
                                 Effect::PersistSession,
@@ -403,7 +461,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                     return parent_effects;
                 }
 
-                state.active_run_id = None;
+                state.clear_foreground();
                 state.status = AppStatus::Idle;
                 state.session.updated_at = Utc::now();
                 state.session.upsert_run(run_id, RunStatus::Completed);
@@ -444,7 +502,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                     return parent_effects;
                 }
 
-                state.active_run_id = None;
+                state.clear_foreground();
                 state.status = AppStatus::Error(error);
                 state.session.updated_at = Utc::now();
                 state.session.upsert_run(run_id, RunStatus::Failed);
@@ -535,7 +593,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                         state.status = AppStatus::Error(error);
                         state.session.updated_at = Utc::now();
                         state.session.upsert_run(run_id, RunStatus::Failed);
-                        state.active_run_id = None;
+                        state.clear_foreground();
                         if let AppStatus::Error(message) = &state.status {
                             warn!(
                                 session_id = %session_id,
@@ -566,7 +624,11 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
 
             match tool_batch_progress(state, run_id, preceding_turn_id) {
                 ToolBatchProgress::AwaitingApproval => {
-                    state.status = AppStatus::AwaitingToolApproval;
+                    state.set_foreground(
+                        run_id,
+                        ForegroundPhase::AwaitingToolApproval,
+                        preceding_turn_id,
+                    );
                     info!(
                         session_id = %session_id,
                         run_id = %run_id,
@@ -576,7 +638,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                     return vec![Effect::PersistSession];
                 }
                 ToolBatchProgress::Running => {
-                    state.status = AppStatus::RunningTool;
+                    state.set_foreground(run_id, ForegroundPhase::RunningTool, preceding_turn_id);
                     info!(
                         session_id = %session_id,
                         run_id = %run_id,
@@ -586,7 +648,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                     return vec![Effect::PersistSession];
                 }
                 ToolBatchProgress::ReadyToResume => {
-                    state.status = AppStatus::Generating;
+                    state.set_foreground(run_id, ForegroundPhase::Generating, None);
                 }
             }
 
@@ -631,6 +693,17 @@ fn should_resume_after_tool_failure(tool_name: &str, error: &str) -> bool {
     tool_name == READ_TOOL_NAME && error.contains("is not accessible")
 }
 
+fn current_foreground_batch_anchor(state: &AppState, run_id: Uuid) -> Option<Option<Uuid>> {
+    state
+        .session
+        .foreground_owner
+        .as_ref()
+        .filter(|owner| {
+            owner.run_id == run_id && owner.phase == ForegroundPhase::AwaitingToolApproval
+        })
+        .map(|owner| owner.batch_anchor_turn_id)
+}
+
 fn deny_pending_tool_batch(
     state: &mut AppState,
     run_id: Uuid,
@@ -665,7 +738,11 @@ fn deny_pending_tool_batch(
 
     match tool_batch_progress(state, run_id, preceding_turn_id) {
         ToolBatchProgress::AwaitingApproval => {
-            state.status = AppStatus::AwaitingToolApproval;
+            state.set_foreground(
+                run_id,
+                ForegroundPhase::AwaitingToolApproval,
+                preceding_turn_id,
+            );
             info!(
                 session_id = %session_id,
                 run_id = %run_id,
@@ -675,7 +752,7 @@ fn deny_pending_tool_batch(
             vec![Effect::PersistSession]
         }
         ToolBatchProgress::Running => {
-            state.status = AppStatus::RunningTool;
+            state.set_foreground(run_id, ForegroundPhase::RunningTool, preceding_turn_id);
             info!(
                 session_id = %session_id,
                 run_id = %run_id,
@@ -685,7 +762,7 @@ fn deny_pending_tool_batch(
             vec![Effect::PersistSession]
         }
         ToolBatchProgress::ReadyToResume => {
-            state.status = AppStatus::Generating;
+            state.set_foreground(run_id, ForegroundPhase::Generating, None);
             let request = build_provider_request(state, run_id);
 
             info!(
@@ -751,7 +828,9 @@ mod tests {
     use crate::app::request_builder::build_provider_request;
     use crate::app::{AppState, AppStatus, Effect, Msg};
     use crate::config::AgentConfig;
-    use crate::session::model::{Role, RunStatus, Session, ToolApprovalState, ToolExecutionState};
+    use crate::session::model::{
+        Role, RunStatus, Session, TaskDelegationStatus, ToolApprovalState, ToolExecutionState,
+    };
 
     #[test]
     fn new_session_message_is_ignored_by_reducer() {
@@ -1469,6 +1548,10 @@ mod tests {
             Some("Inspect the runtime orchestrator")
         );
         assert_eq!(
+            state.session.tool_invocations[0].delegation_status(),
+            Some(TaskDelegationStatus::Running)
+        );
+        assert_eq!(
             state
                 .session
                 .find_run(child_run_id)
@@ -1542,6 +1625,10 @@ mod tests {
             state.session.tool_invocations[0].result.as_deref(),
             Some("Subagent finished: Provider layer summary")
         );
+        assert_eq!(
+            state.session.tool_invocations[0].delegation_status(),
+            Some(TaskDelegationStatus::Completed)
+        );
         assert!(matches!(
             state.session.find_run(child_run_id).map(|run| run.status),
             Some(RunStatus::Completed)
@@ -1551,6 +1638,68 @@ mod tests {
             fluent_code_provider::ProviderMessage::ToolResult { content, .. }
                 if content == "Subagent finished: Provider layer summary"
         )));
+    }
+
+    #[test]
+    fn cancelling_child_run_marks_delegation_cancelled_and_resumes_parent() {
+        let mut state = AppState::new(Session::new("task cancel flow"));
+        state.draft_input = "delegate work".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let parent_run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id: parent_run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "task-call-1".to_string(),
+                    name: "task".to_string(),
+                    arguments: serde_json::json!({
+                        "agent": "explore",
+                        "prompt": "Inspect cancellation flow"
+                    }),
+                },
+            },
+        );
+
+        update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Once));
+        let child_run_id = state.active_run_id.expect("child run should become active");
+
+        let effects = update(&mut state, Msg::CancelActiveRun);
+
+        assert!(
+            matches!(effects.first(), Some(Effect::CancelAssistant { run_id }) if *run_id == child_run_id)
+        );
+        assert_eq!(state.active_run_id, Some(parent_run_id));
+        assert!(matches!(state.status, AppStatus::Generating));
+        assert_eq!(
+            state.session.tool_invocations[0].execution_state,
+            ToolExecutionState::Completed
+        );
+        assert_eq!(
+            state.session.tool_invocations[0].result.as_deref(),
+            Some("Subagent cancelled by user.")
+        );
+        assert_eq!(
+            state.session.tool_invocations[0].delegation_status(),
+            Some(TaskDelegationStatus::Cancelled)
+        );
+        assert!(matches!(
+            state.session.find_run(child_run_id).map(|run| run.status),
+            Some(RunStatus::Cancelled)
+        ));
+        assert!(matches!(
+            effects.last(),
+            Some(Effect::StartAssistant { run_id, request }) if *run_id == parent_run_id
+                && request.messages.iter().any(|message| matches!(
+                    message,
+                    fluent_code_provider::ProviderMessage::ToolResult { content, .. }
+                        if content == "Subagent cancelled by user."
+                ))
+        ));
     }
 
     #[test]

@@ -2080,6 +2080,7 @@ mod tests {
                 child_run_id: Some(child_run_id),
                 agent_name: Some("explore".to_string()),
                 prompt: Some("Inspect session persistence state".to_string()),
+                status: fluent_code_app::session::model::TaskDelegationStatus::Running,
             }),
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),

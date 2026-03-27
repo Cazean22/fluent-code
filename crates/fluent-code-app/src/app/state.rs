@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::agent::AgentRegistry;
 use crate::plugin::{PluginLoadSnapshot, ToolRegistry};
-use crate::session::model::Session;
+use crate::session::model::{ForegroundPhase, Session};
 
 const CHECKPOINT_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -117,6 +117,27 @@ impl AppState {
         self.should_quit = false;
         self.active_run_id = None;
         self.last_checkpoint_at = None;
+    }
+
+    pub fn set_foreground(
+        &mut self,
+        run_id: Uuid,
+        phase: ForegroundPhase,
+        batch_anchor_turn_id: Option<Uuid>,
+    ) {
+        self.active_run_id = Some(run_id);
+        self.status = match phase {
+            ForegroundPhase::Generating => AppStatus::Generating,
+            ForegroundPhase::AwaitingToolApproval => AppStatus::AwaitingToolApproval,
+            ForegroundPhase::RunningTool => AppStatus::RunningTool,
+        };
+        self.session
+            .set_foreground_owner(run_id, phase, batch_anchor_turn_id);
+    }
+
+    pub fn clear_foreground(&mut self) {
+        self.active_run_id = None;
+        self.session.clear_foreground_owner();
     }
 }
 

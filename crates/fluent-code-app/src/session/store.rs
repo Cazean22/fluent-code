@@ -7,7 +7,9 @@ use tracing::{debug, info, warn};
 
 use crate::error::{FluentCodeError, Result};
 use crate::logging::path_for_log;
-use crate::session::model::{RunRecord, Session, SessionId, ToolInvocationRecord, Turn};
+use crate::session::model::{
+    ForegroundOwnerRecord, RunRecord, Session, SessionId, ToolInvocationRecord, Turn,
+};
 
 pub trait SessionStore {
     fn create(&self, session: &Session) -> Result<()>;
@@ -184,6 +186,7 @@ impl SessionStore for FsSessionStore {
             runs: metadata.runs,
             turns,
             tool_invocations: metadata.tool_invocations,
+            foreground_owner: metadata.foreground_owner,
         };
 
         info!(
@@ -257,6 +260,8 @@ struct SessionMetadata {
     runs: Vec<RunRecord>,
     #[serde(default)]
     tool_invocations: Vec<ToolInvocationRecord>,
+    #[serde(default)]
+    foreground_owner: Option<ForegroundOwnerRecord>,
 }
 
 impl From<&Session> for SessionMetadata {
@@ -269,6 +274,7 @@ impl From<&Session> for SessionMetadata {
             permissions: session.permissions.clone(),
             runs: session.runs.clone(),
             tool_invocations: session.tool_invocations.clone(),
+            foreground_owner: session.foreground_owner.clone(),
         }
     }
 }
@@ -284,8 +290,9 @@ mod tests {
     use super::{FsSessionStore, SessionStore};
     use crate::error::FluentCodeError;
     use crate::session::model::{
-        Role, Session, TaskDelegationRecord, ToolApprovalState, ToolExecutionState,
-        ToolInvocationRecord, ToolSource, Turn,
+        ForegroundOwnerRecord, ForegroundPhase, Role, Session, TaskDelegationRecord,
+        TaskDelegationStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
+        ToolSource, Turn,
     };
 
     #[test]
@@ -342,6 +349,39 @@ mod tests {
 
         assert_eq!(loaded.turns.len(), 1);
         assert_eq!(loaded.turns[0].content, "hello");
+        cleanup(root);
+    }
+
+    #[test]
+    fn saves_and_restores_foreground_owner() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+
+        let mut session = Session::new("foreground owner session");
+        let run_id = Uuid::new_v4();
+        let batch_anchor_turn_id = Uuid::new_v4();
+        session.foreground_owner = Some(ForegroundOwnerRecord {
+            run_id,
+            phase: ForegroundPhase::AwaitingToolApproval,
+            batch_anchor_turn_id: Some(batch_anchor_turn_id),
+        });
+
+        store
+            .create(&session)
+            .expect("create session with foreground owner");
+        let loaded = store
+            .load(&session.id)
+            .expect("load session with foreground owner");
+
+        assert_eq!(
+            loaded.foreground_owner,
+            Some(ForegroundOwnerRecord {
+                run_id,
+                phase: ForegroundPhase::AwaitingToolApproval,
+                batch_anchor_turn_id: Some(batch_anchor_turn_id),
+            })
+        );
+
         cleanup(root);
     }
 
@@ -533,6 +573,7 @@ mod tests {
         assert_eq!(delegation.child_run_id, Some(child_run_id));
         assert_eq!(delegation.agent_name.as_deref(), Some("explore"));
         assert_eq!(delegation.prompt.as_deref(), Some("Inspect state"));
+        assert_eq!(delegation.status, TaskDelegationStatus::Running);
 
         cleanup(root);
     }
@@ -559,6 +600,7 @@ mod tests {
                 child_run_id: Some(Uuid::new_v4()),
                 agent_name: Some("explore".to_string()),
                 prompt: Some("Inspect state".to_string()),
+                status: TaskDelegationStatus::Running,
             }),
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
@@ -579,6 +621,7 @@ mod tests {
         assert!(!saved.contains("\"delegation_agent_name\""));
         assert!(!saved.contains("\"delegation_prompt\""));
         assert!(saved.contains("\"child_run_id\":"));
+        assert!(saved.contains("\"status\": \"running\""));
 
         cleanup(root);
     }

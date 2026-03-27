@@ -39,6 +39,8 @@ pub async fn run_app(
     let mut ui_state = UiState::default();
     let (runtime_sender, mut runtime_receiver) = tokio::sync::mpsc::unbounded_channel();
 
+    recover_startup_state(&mut state, &store, &runtime, runtime_sender.clone()).await?;
+
     let app_result = run_loop(
         &mut terminal,
         &mut state,
@@ -54,6 +56,28 @@ pub async fn run_app(
     info!(session_id = %state.session.id, "tui application finished");
     app_result?;
     restore_result
+}
+
+async fn recover_startup_state(
+    state: &mut AppState,
+    store: &FsSessionStore,
+    runtime: &Runtime,
+    runtime_sender: tokio::sync::mpsc::UnboundedSender<fluent_code_app::app::Msg>,
+) -> Result<()> {
+    let effects = fluent_code_app::app::recover_startup_foreground(state);
+    if effects.is_empty() {
+        return Ok(());
+    }
+
+    apply_effects(
+        state,
+        store,
+        runtime,
+        runtime_sender,
+        effects,
+        &mut std::collections::VecDeque::new(),
+    )
+    .await
 }
 
 async fn run_loop(
@@ -430,16 +454,28 @@ mod tests {
     use std::sync::OnceLock;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use chrono::Utc;
     use fluent_code_app::app::permissions::PermissionReply;
-    use fluent_code_app::app::{AppState, Msg};
+    use fluent_code_app::app::{AppState, AppStatus, Msg, RESTART_INTERRUPTED_TASK_RESULT};
     use fluent_code_app::runtime::Runtime;
-    use fluent_code_app::session::model::{Role, Session};
+    use fluent_code_app::session::model::{
+        ForegroundOwnerRecord, ForegroundPhase, Role, RunRecord, RunStatus, Session,
+        TaskDelegationRecord, TaskDelegationStatus, ToolApprovalState, ToolExecutionState,
+        ToolInvocationRecord, ToolSource, Turn,
+    };
     use fluent_code_app::session::store::{FsSessionStore, SessionStore};
     use fluent_code_provider::{MockProvider, ProviderClient};
     use tokio::sync::Mutex;
 
-    use super::{drain_runtime_messages, handle_message};
+    use super::{drain_runtime_messages, handle_message, recover_startup_state};
     use crate::ui_state::UiState;
+
+    struct StartupRecoveryFixture {
+        session: Session,
+        parent_run_id: uuid::Uuid,
+        child_run_id: uuid::Uuid,
+        preceding_turn_id: uuid::Uuid,
+    }
 
     #[tokio::test]
     async fn new_session_swaps_app_state_and_updates_latest_pointer() {
@@ -993,6 +1029,402 @@ mod tests {
         cleanup(store_root(&store));
     }
 
+    #[tokio::test]
+    async fn cancelling_child_run_resumes_parent_with_cancelled_task_result() {
+        let _guard = test_lock().lock().await;
+        let store = FsSessionStore::new(unique_test_dir());
+        let session = Session::new("task cancel flow");
+        let mut state = AppState::new_with_checkpoint_interval(session, Duration::from_millis(10));
+        state.draft_input = "delegate".to_string();
+
+        let runtime = Runtime::new(ProviderClient::Mock(MockProvider::with_chunk_delay(
+            Duration::from_millis(5),
+        )));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ui_state = UiState::default();
+
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx.clone(),
+            Msg::SubmitPrompt,
+        )
+        .await
+        .expect("submit prompt");
+
+        let parent_run_id = state.active_run_id.expect("parent run should be active");
+
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx.clone(),
+            Msg::AssistantToolCall {
+                run_id: parent_run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "task-call-1".to_string(),
+                    name: "task".to_string(),
+                    arguments: serde_json::json!({
+                        "agent": "explore",
+                        "prompt": "Inspect cancellation flow"
+                    }),
+                },
+            },
+        )
+        .await
+        .expect("inject task tool call");
+
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx.clone(),
+            Msg::ReplyToPendingTool(PermissionReply::Once),
+        )
+        .await
+        .expect("approve delegated task");
+
+        let child_run_id = state
+            .active_run_id
+            .expect("child run should become foreground");
+        assert_ne!(child_run_id, parent_run_id);
+
+        handle_message(
+            &mut state,
+            &store,
+            &runtime,
+            &mut ui_state,
+            tx.clone(),
+            Msg::CancelActiveRun,
+        )
+        .await
+        .expect("cancel child run");
+
+        assert_eq!(state.active_run_id, Some(parent_run_id));
+        assert!(matches!(
+            state.status,
+            fluent_code_app::app::AppStatus::Generating
+        ));
+        assert_eq!(
+            state.session.tool_invocations[0].result.as_deref(),
+            Some("Subagent cancelled by user.")
+        );
+
+        let persisted = store
+            .load(&state.session.id)
+            .expect("load session after child cancel");
+        assert_eq!(persisted.tool_invocations.len(), 1);
+        assert_eq!(
+            persisted.tool_invocations[0].result.as_deref(),
+            Some("Subagent cancelled by user.")
+        );
+        assert!(matches!(
+            persisted
+                .runs
+                .iter()
+                .find(|run| run.id == child_run_id)
+                .map(|run| run.status),
+            Some(fluent_code_app::session::model::RunStatus::Cancelled)
+        ));
+
+        drop(rx);
+        cleanup(store_root(&store));
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_resumes_parent_and_persists_terminalized_child() {
+        let _guard = test_lock().lock().await;
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+        let fixture = interrupted_delegation_fixture();
+        store
+            .create(&fixture.session)
+            .expect("persist startup fixture");
+
+        let mut state = AppState::new(fixture.session);
+        let runtime = Runtime::new(ProviderClient::Mock(MockProvider::with_chunk_delay(
+            Duration::from_millis(5),
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        recover_startup_state(&mut state, &store, &runtime, tx)
+            .await
+            .expect("recover interrupted delegated child on startup");
+
+        assert_eq!(state.active_run_id, Some(fixture.parent_run_id));
+        assert!(matches!(state.status, AppStatus::Generating));
+        assert_eq!(
+            state.session.tool_invocations[0].result.as_deref(),
+            Some(RESTART_INTERRUPTED_TASK_RESULT)
+        );
+        assert_eq!(
+            state.session.tool_invocations[0].delegation_status(),
+            Some(TaskDelegationStatus::Failed)
+        );
+        assert!(matches!(
+            state
+                .session
+                .find_run(fixture.child_run_id)
+                .map(|run| run.status),
+            Some(RunStatus::Failed)
+        ));
+
+        let persisted = store
+            .load(&state.session.id)
+            .expect("load recovered session");
+        assert_eq!(
+            persisted.tool_invocations[0].result.as_deref(),
+            Some(RESTART_INTERRUPTED_TASK_RESULT)
+        );
+        assert!(matches!(
+            persisted.runs.iter().find(|run| run.id == fixture.child_run_id),
+            Some(run) if run.status == RunStatus::Failed
+        ));
+
+        let message = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .expect("receive resumed parent runtime message")
+            .expect("runtime message after startup recovery");
+        assert!(matches!(message, Msg::AssistantChunk { .. }));
+
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_restarts_root_generating_owner() {
+        let _guard = test_lock().lock().await;
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+        let session = root_generating_session();
+        let run_id = session
+            .foreground_owner
+            .as_ref()
+            .expect("foreground owner")
+            .run_id;
+        store
+            .create(&session)
+            .expect("persist root generating session");
+
+        let mut state = AppState::new(session);
+        let runtime = Runtime::new(ProviderClient::Mock(MockProvider::with_chunk_delay(
+            Duration::from_millis(5),
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        recover_startup_state(&mut state, &store, &runtime, tx)
+            .await
+            .expect("restart root generating foreground owner");
+
+        assert_eq!(state.active_run_id, Some(run_id));
+        assert!(matches!(state.status, AppStatus::Generating));
+
+        let message = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .expect("receive resumed root runtime message")
+            .expect("runtime message after root generating recovery");
+        assert!(
+            matches!(message, Msg::AssistantChunk { run_id: resumed_run_id, .. } if resumed_run_id == run_id)
+        );
+
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_is_noop_when_no_interrupted_child_exists() {
+        let _guard = test_lock().lock().await;
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+        let session = Session::new("startup no-op");
+        store.create(&session).expect("persist clean session");
+
+        let mut state = AppState::new(session);
+        let runtime = Runtime::new(ProviderClient::Mock(MockProvider::new(None)));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        recover_startup_state(&mut state, &store, &runtime, tx)
+            .await
+            .expect("startup recovery no-op");
+
+        assert!(matches!(state.status, AppStatus::Idle));
+        assert!(state.active_run_id.is_none());
+        assert!(!matches!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv()).await,
+            Ok(Some(_))
+        ));
+
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_fails_closed_for_malformed_lineage() {
+        let _guard = test_lock().lock().await;
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+        let mut fixture = interrupted_delegation_fixture();
+        fixture
+            .session
+            .runs
+            .retain(|run| run.id != fixture.child_run_id);
+        store
+            .create(&fixture.session)
+            .expect("persist malformed startup fixture");
+
+        let mut state = AppState::new(fixture.session.clone());
+        let runtime = Runtime::new(ProviderClient::Mock(MockProvider::new(None)));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        recover_startup_state(&mut state, &store, &runtime, tx)
+            .await
+            .expect("startup recovery fail-closed handling");
+
+        assert!(matches!(state.status, AppStatus::Error(_)));
+        assert!(state.active_run_id.is_none());
+        assert_eq!(
+            state.session.tool_invocations[0].delegation_status(),
+            Some(TaskDelegationStatus::Running)
+        );
+        assert!(!matches!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv()).await,
+            Ok(Some(_))
+        ));
+
+        let persisted = store
+            .load(&state.session.id)
+            .expect("reload malformed session");
+        assert_eq!(
+            persisted.tool_invocations[0].delegation_status(),
+            Some(TaskDelegationStatus::Running)
+        );
+
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_fails_closed_for_ambiguous_lineage() {
+        let _guard = test_lock().lock().await;
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+        let mut fixture = interrupted_delegation_fixture();
+        let second_child_run_id = uuid::Uuid::new_v4();
+        let second_invocation_id = uuid::Uuid::new_v4();
+
+        fixture.session.tool_invocations.push(ToolInvocationRecord {
+            id: second_invocation_id,
+            run_id: fixture.parent_run_id,
+            tool_call_id: "task-call-2".to_string(),
+            tool_name: "task".to_string(),
+            tool_source: ToolSource::BuiltIn,
+            arguments: serde_json::json!({ "agent": "explore", "prompt": "Inspect another file" }),
+            preceding_turn_id: Some(fixture.preceding_turn_id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Running,
+            result: None,
+            error: None,
+            delegation: Some(TaskDelegationRecord {
+                child_run_id: Some(second_child_run_id),
+                agent_name: Some("explore".to_string()),
+                prompt: Some("Inspect another file".to_string()),
+                status: TaskDelegationStatus::Running,
+            }),
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: None,
+        });
+        fixture.session.runs.push(RunRecord {
+            id: second_child_run_id,
+            status: RunStatus::InProgress,
+            parent_run_id: Some(fixture.parent_run_id),
+            parent_tool_invocation_id: Some(second_invocation_id),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        store
+            .create(&fixture.session)
+            .expect("persist ambiguous startup fixture");
+
+        let mut state = AppState::new(fixture.session);
+        let runtime = Runtime::new(ProviderClient::Mock(MockProvider::new(None)));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        recover_startup_state(&mut state, &store, &runtime, tx)
+            .await
+            .expect("startup recovery ambiguous handling");
+
+        assert!(matches!(state.status, AppStatus::Error(_)));
+        assert!(state.active_run_id.is_none());
+        assert!(!matches!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv()).await,
+            Ok(Some(_))
+        ));
+
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_preserves_batch_barrier_when_another_tool_is_still_running() {
+        let _guard = test_lock().lock().await;
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+        let mut fixture = interrupted_delegation_fixture();
+        fixture.session.tool_invocations.push(ToolInvocationRecord {
+            id: uuid::Uuid::new_v4(),
+            run_id: fixture.parent_run_id,
+            tool_call_id: "read-call-1".to_string(),
+            tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
+            arguments: serde_json::json!({ "path": "Cargo.toml" }),
+            preceding_turn_id: Some(fixture.preceding_turn_id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Running,
+            result: None,
+            error: None,
+            delegation: None,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: None,
+        });
+        store
+            .create(&fixture.session)
+            .expect("persist batch-barrier startup fixture");
+
+        let mut state = AppState::new(fixture.session);
+        let runtime = Runtime::new(ProviderClient::Mock(MockProvider::new(None)));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        recover_startup_state(&mut state, &store, &runtime, tx)
+            .await
+            .expect("startup recovery batch barrier handling");
+
+        assert_eq!(state.active_run_id, Some(fixture.parent_run_id));
+        assert!(matches!(state.status, AppStatus::RunningTool));
+        assert_eq!(
+            state.session.tool_invocations[0].result.as_deref(),
+            Some(RESTART_INTERRUPTED_TASK_RESULT)
+        );
+        assert!(!matches!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv()).await,
+            Ok(Some(_))
+        ));
+
+        let persisted = store
+            .load(&state.session.id)
+            .expect("reload batch-barrier session");
+        assert_eq!(
+            persisted.tool_invocations[0].result.as_deref(),
+            Some(RESTART_INTERRUPTED_TASK_RESULT)
+        );
+        assert_eq!(
+            persisted.tool_invocations[1].execution_state,
+            ToolExecutionState::Running
+        );
+
+        cleanup(root);
+    }
+
     fn unique_test_dir() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1015,5 +1447,122 @@ mod tests {
 
     fn cleanup(path: PathBuf) {
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    fn interrupted_delegation_fixture() -> StartupRecoveryFixture {
+        let mut session = Session::new("startup recovery");
+        let parent_run_id = uuid::Uuid::new_v4();
+        let child_run_id = uuid::Uuid::new_v4();
+        let task_invocation_id = uuid::Uuid::new_v4();
+        let user_turn_id = uuid::Uuid::new_v4();
+        let preceding_turn_id = uuid::Uuid::new_v4();
+
+        session.runs.push(RunRecord {
+            id: parent_run_id,
+            status: RunStatus::InProgress,
+            parent_run_id: None,
+            parent_tool_invocation_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        session.runs.push(RunRecord {
+            id: child_run_id,
+            status: RunStatus::InProgress,
+            parent_run_id: Some(parent_run_id),
+            parent_tool_invocation_id: Some(task_invocation_id),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        session.turns.push(Turn {
+            id: user_turn_id,
+            run_id: parent_run_id,
+            role: Role::User,
+            content: "delegate work".to_string(),
+            reasoning: String::new(),
+            timestamp: Utc::now(),
+        });
+        session.turns.push(Turn {
+            id: preceding_turn_id,
+            run_id: parent_run_id,
+            role: Role::Assistant,
+            content: "I will delegate that task.".to_string(),
+            reasoning: String::new(),
+            timestamp: Utc::now(),
+        });
+        session.turns.push(Turn {
+            id: uuid::Uuid::new_v4(),
+            run_id: child_run_id,
+            role: Role::User,
+            content: "Inspect startup recovery".to_string(),
+            reasoning: String::new(),
+            timestamp: Utc::now(),
+        });
+        session.turns.push(Turn {
+            id: uuid::Uuid::new_v4(),
+            run_id: child_run_id,
+            role: Role::Assistant,
+            content: "Partial child output that should not be summarized".to_string(),
+            reasoning: String::new(),
+            timestamp: Utc::now(),
+        });
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: task_invocation_id,
+            run_id: parent_run_id,
+            tool_call_id: "task-call-1".to_string(),
+            tool_name: "task".to_string(),
+            tool_source: ToolSource::BuiltIn,
+            arguments: serde_json::json!({
+                "agent": "explore",
+                "prompt": "Inspect startup recovery"
+            }),
+            preceding_turn_id: Some(preceding_turn_id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Running,
+            result: None,
+            error: None,
+            delegation: Some(TaskDelegationRecord {
+                child_run_id: Some(child_run_id),
+                agent_name: Some("explore".to_string()),
+                prompt: Some("Inspect startup recovery".to_string()),
+                status: TaskDelegationStatus::Running,
+            }),
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: None,
+        });
+
+        StartupRecoveryFixture {
+            session,
+            parent_run_id,
+            child_run_id,
+            preceding_turn_id,
+        }
+    }
+
+    fn root_generating_session() -> Session {
+        let mut session = Session::new("root generating startup");
+        let run_id = uuid::Uuid::new_v4();
+        session.runs.push(RunRecord {
+            id: run_id,
+            status: RunStatus::InProgress,
+            parent_run_id: None,
+            parent_tool_invocation_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        session.turns.push(Turn {
+            id: uuid::Uuid::new_v4(),
+            run_id,
+            role: Role::User,
+            content: "resume the root run".to_string(),
+            reasoning: String::new(),
+            timestamp: Utc::now(),
+        });
+        session.foreground_owner = Some(ForegroundOwnerRecord {
+            run_id,
+            phase: ForegroundPhase::Generating,
+            batch_anchor_turn_id: None,
+        });
+        session
     }
 }

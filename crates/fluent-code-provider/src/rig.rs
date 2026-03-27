@@ -16,6 +16,8 @@ use super::{
 };
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const OPENAI_STARTUP_STREAM_MAX_ATTEMPTS: usize = 2;
+const OPENAI_EMPTY_STARTUP_STREAM_MESSAGE: &str = "openai provider stream ended before first event";
 
 #[derive(Debug, Clone)]
 pub struct RigOpenAiProvider {
@@ -83,74 +85,204 @@ impl RigOpenAiProvider {
             .system_prompt_override
             .clone()
             .unwrap_or_else(|| self.system_prompt.clone());
+        let reasoning_params = reasoning_effort_additional_params(self.reasoning_effort.as_deref());
 
-        let mut completion_request =
-            RigCompletionModel::completion_request(&model, to_rig_message(prompt))
-                .preamble(system_prompt)
-                .messages(history.iter().map(to_rig_message).collect())
-                .tools(tool_definitions);
+        'attempts: for attempt in 0..OPENAI_STARTUP_STREAM_MAX_ATTEMPTS {
+            let mut completion_request =
+                RigCompletionModel::completion_request(&model, to_rig_message(prompt))
+                    .preamble(system_prompt.clone())
+                    .messages(history.iter().map(to_rig_message).collect())
+                    .tools(tool_definitions.clone());
 
-        if let Some(params) = reasoning_effort_additional_params(self.reasoning_effort.as_deref()) {
-            completion_request = completion_request.additional_params(params);
-        }
+            if let Some(params) = reasoning_params.clone() {
+                completion_request = completion_request.additional_params(params);
+            }
 
-        let mut stream = completion_request
-            .stream()
-            .await
-            .map_err(|error| ProviderError::Message(error.to_string()))?;
-
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(StreamedAssistantContent::Text(text)) => {
-                    debug!(
-                        provider = "openai",
-                        chunk_bytes = text.text.len(),
-                        "openai provider emitted text delta"
-                    );
-                    on_event(ProviderEvent::TextDelta(text.text))
-                }
-                Ok(StreamedAssistantContent::Reasoning(reasoning)) => {
-                    let summary = reasoning.display_text();
-                    if !summary.is_empty() {
-                        debug!(
-                            provider = "openai",
-                            chunk_bytes = summary.len(),
-                            "openai provider emitted reasoning delta"
-                        );
-                        on_event(ProviderEvent::ReasoningDelta(summary));
-                    }
-                }
-                Ok(StreamedAssistantContent::ReasoningDelta { reasoning, .. }) => {
-                    if !reasoning.is_empty() {
-                        debug!(
-                            provider = "openai",
-                            chunk_bytes = reasoning.len(),
-                            "openai provider emitted reasoning delta"
-                        );
-                        on_event(ProviderEvent::ReasoningDelta(reasoning));
-                    }
-                }
-                Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
-                    validate_openai_tool_call_id(&tool_call.function.name, &tool_call.id)?;
-                    info!(provider = "openai", tool_name = %tool_call.function.name, tool_call_id = %tool_call.id, "openai provider emitted tool call");
-                    on_event(ProviderEvent::ToolCall(ProviderToolCall {
-                        id: tool_call.id,
-                        name: tool_call.function.name,
-                        arguments: tool_call.function.arguments,
-                    }));
-                }
-                Ok(StreamedAssistantContent::ToolCallDelta { .. })
-                | Ok(StreamedAssistantContent::Final(_)) => {}
+            let mut stream = match completion_request.stream().await {
+                Ok(stream) => stream,
                 Err(error) => {
-                    warn!(provider = "openai", error = %error, "openai provider stream failed");
-                    return Err(ProviderError::Message(error.to_string()));
+                    let message = error.to_string();
+                    if should_retry_openai_startup_failure(attempt, false, &message) {
+                        warn!(
+                            provider = "openai",
+                            attempt = attempt + 1,
+                            max_attempts = OPENAI_STARTUP_STREAM_MAX_ATTEMPTS,
+                            error = %message,
+                            "openai provider stream startup failed before first event; retrying"
+                        );
+                        continue;
+                    }
+
+                    let surfaced_error = format_openai_stream_failure(attempt, false, &message);
+                    warn!(
+                        provider = "openai",
+                        attempt = attempt + 1,
+                        max_attempts = OPENAI_STARTUP_STREAM_MAX_ATTEMPTS,
+                        error = %surfaced_error,
+                        "openai provider stream failed"
+                    );
+                    return Err(ProviderError::Message(surfaced_error));
+                }
+            };
+
+            let mut forwarded_event = false;
+
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(StreamedAssistantContent::Text(text)) => {
+                        forwarded_event = true;
+                        debug!(
+                            provider = "openai",
+                            chunk_bytes = text.text.len(),
+                            "openai provider emitted text delta"
+                        );
+                        on_event(ProviderEvent::TextDelta(text.text))
+                    }
+                    Ok(StreamedAssistantContent::Reasoning(reasoning)) => {
+                        let summary = reasoning.display_text();
+                        if !summary.is_empty() {
+                            forwarded_event = true;
+                            debug!(
+                                provider = "openai",
+                                chunk_bytes = summary.len(),
+                                "openai provider emitted reasoning delta"
+                            );
+                            on_event(ProviderEvent::ReasoningDelta(summary));
+                        }
+                    }
+                    Ok(StreamedAssistantContent::ReasoningDelta { reasoning, .. }) => {
+                        if !reasoning.is_empty() {
+                            forwarded_event = true;
+                            debug!(
+                                provider = "openai",
+                                chunk_bytes = reasoning.len(),
+                                "openai provider emitted reasoning delta"
+                            );
+                            on_event(ProviderEvent::ReasoningDelta(reasoning));
+                        }
+                    }
+                    Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
+                        validate_openai_tool_call_id(&tool_call.function.name, &tool_call.id)?;
+                        forwarded_event = true;
+                        info!(provider = "openai", tool_name = %tool_call.function.name, tool_call_id = %tool_call.id, "openai provider emitted tool call");
+                        on_event(ProviderEvent::ToolCall(ProviderToolCall {
+                            id: tool_call.id,
+                            name: tool_call.function.name,
+                            arguments: tool_call.function.arguments,
+                        }));
+                    }
+                    Ok(StreamedAssistantContent::ToolCallDelta { .. })
+                    | Ok(StreamedAssistantContent::Final(_)) => {}
+                    Err(error) => {
+                        let message = error.to_string();
+                        if should_retry_openai_startup_failure(attempt, forwarded_event, &message) {
+                            warn!(
+                                    provider = "openai",
+                                    attempt = attempt + 1,
+                                    max_attempts = OPENAI_STARTUP_STREAM_MAX_ATTEMPTS,
+                                    error = %message,
+                                    "openai provider stream failed before first event; retrying"
+                            );
+                            continue 'attempts;
+                        }
+
+                        let surfaced_error =
+                            format_openai_stream_failure(attempt, forwarded_event, &message);
+                        warn!(
+                            provider = "openai",
+                            attempt = attempt + 1,
+                            max_attempts = OPENAI_STARTUP_STREAM_MAX_ATTEMPTS,
+                            error = %surfaced_error,
+                            "openai provider stream failed"
+                        );
+                        return Err(ProviderError::Message(surfaced_error));
+                    }
                 }
             }
+
+            if !forwarded_event {
+                let message = OPENAI_EMPTY_STARTUP_STREAM_MESSAGE.to_string();
+                if should_retry_empty_startup_stream(attempt, forwarded_event) {
+                    warn!(
+                        provider = "openai",
+                        attempt = attempt + 1,
+                        max_attempts = OPENAI_STARTUP_STREAM_MAX_ATTEMPTS,
+                        error = %message,
+                        "openai provider stream finished before first event; retrying"
+                    );
+                    continue;
+                }
+
+                let surfaced_error = format_openai_stream_failure(attempt, false, &message);
+                warn!(
+                    provider = "openai",
+                    attempt = attempt + 1,
+                    max_attempts = OPENAI_STARTUP_STREAM_MAX_ATTEMPTS,
+                    error = %surfaced_error,
+                    "openai provider stream failed"
+                );
+                return Err(ProviderError::Message(surfaced_error));
+            }
+
+            info!(provider = "openai", model = %self.model, "openai provider stream finished successfully");
+            return Ok(());
         }
 
-        info!(provider = "openai", model = %self.model, "openai provider stream finished successfully");
-        Ok(())
+        unreachable!("openai startup retry loop should return or retry within max attempts")
     }
+}
+
+fn should_retry_openai_startup_failure(
+    attempt: usize,
+    forwarded_event: bool,
+    message: &str,
+) -> bool {
+    should_retry_empty_startup_stream(attempt, forwarded_event)
+        && is_retryable_openai_startup_error(message)
+}
+
+fn should_retry_empty_startup_stream(attempt: usize, forwarded_event: bool) -> bool {
+    !forwarded_event && attempt + 1 < OPENAI_STARTUP_STREAM_MAX_ATTEMPTS
+}
+
+fn format_openai_stream_failure(attempt: usize, forwarded_event: bool, message: &str) -> String {
+    let phase = if forwarded_event {
+        "after first event"
+    } else {
+        "before first event"
+    };
+
+    format!(
+        "openai provider stream failed on attempt {}/{} {}: {}",
+        attempt + 1,
+        OPENAI_STARTUP_STREAM_MAX_ATTEMPTS,
+        phase,
+        message
+    )
+}
+
+fn is_retryable_openai_startup_error(message: &str) -> bool {
+    let normalized = message.trim().to_ascii_lowercase();
+
+    normalized.contains("empty_stream")
+        || normalized.contains("empty stream")
+        || normalized.contains("internal server error")
+        || normalized.contains("bad gateway")
+        || normalized.contains("service unavailable")
+        || normalized.contains("gateway timeout")
+        || is_http_5xx_status_error(&normalized)
+}
+
+fn is_http_5xx_status_error(message: &str) -> bool {
+    if !message.contains("http") && !message.contains("status") {
+        return false;
+    }
+
+    message
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|token| token.len() == 3)
+        .filter_map(|token| token.parse::<u16>().ok())
+        .any(|status| (500..600).contains(&status))
 }
 
 fn validate_openai_tool_call_id(tool_name: &str, id: &str) -> Result<()> {
@@ -250,7 +382,10 @@ fn resolve_api_key(provider_config: &ProviderConfig) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_reasoning_effort, reasoning_effort_additional_params, validate_openai_tool_call_id,
+        OPENAI_EMPTY_STARTUP_STREAM_MESSAGE, format_openai_stream_failure,
+        is_retryable_openai_startup_error, parse_reasoning_effort,
+        reasoning_effort_additional_params, should_retry_empty_startup_stream,
+        should_retry_openai_startup_failure, validate_openai_tool_call_id,
     };
     use crate::ProviderError;
     use rig::providers::openai;
@@ -337,5 +472,83 @@ mod tests {
     fn reasoning_effort_additional_params_returns_none_for_none_or_invalid_value() {
         assert!(reasoning_effort_additional_params(None).is_none());
         assert!(reasoning_effort_additional_params(Some("unknown")).is_none());
+    }
+
+    #[test]
+    fn is_retryable_openai_startup_error_accepts_narrow_transient_failures() {
+        assert!(is_retryable_openai_startup_error("empty_stream"));
+        assert!(is_retryable_openai_startup_error(
+            "OpenAI request failed with HTTP 503 Service Unavailable"
+        ));
+        assert!(is_retryable_openai_startup_error(
+            "response status code: 502 bad gateway"
+        ));
+    }
+
+    #[test]
+    fn is_retryable_openai_startup_error_rejects_non_transient_failures() {
+        assert!(!is_retryable_openai_startup_error(
+            "OpenAI request failed with HTTP 401 Unauthorized"
+        ));
+        assert!(!is_retryable_openai_startup_error(
+            "OpenAI request failed with status 429 Too Many Requests"
+        ));
+        assert!(!is_retryable_openai_startup_error(
+            "openai stream emitted tool call 'read' with empty id"
+        ));
+        assert!(!is_retryable_openai_startup_error(
+            "invalid tool schema for function read"
+        ));
+    }
+
+    #[test]
+    fn should_retry_openai_startup_failure_only_before_first_forwarded_event() {
+        assert!(should_retry_openai_startup_failure(
+            0,
+            false,
+            "empty_stream"
+        ));
+        assert!(!should_retry_openai_startup_failure(
+            0,
+            true,
+            "empty_stream"
+        ));
+    }
+
+    #[test]
+    fn should_retry_openai_startup_failure_only_once() {
+        assert!(should_retry_openai_startup_failure(
+            0,
+            false,
+            "HTTP 500 Internal Server Error"
+        ));
+        assert!(!should_retry_openai_startup_failure(
+            1,
+            false,
+            "HTTP 500 Internal Server Error"
+        ));
+    }
+
+    #[test]
+    fn empty_startup_stream_completion_is_treated_as_failure() {
+        assert!(should_retry_empty_startup_stream(0, false));
+        assert!(!should_retry_empty_startup_stream(0, true));
+        assert!(!should_retry_empty_startup_stream(1, false));
+        assert_eq!(
+            OPENAI_EMPTY_STARTUP_STREAM_MESSAGE,
+            "openai provider stream ended before first event"
+        );
+    }
+
+    #[test]
+    fn format_openai_stream_failure_includes_attempt_context() {
+        assert_eq!(
+            format_openai_stream_failure(1, false, "empty_stream"),
+            "openai provider stream failed on attempt 2/2 before first event: empty_stream"
+        );
+        assert_eq!(
+            format_openai_stream_failure(0, true, "stream interrupted"),
+            "openai provider stream failed on attempt 1/2 after first event: stream interrupted"
+        );
     }
 }

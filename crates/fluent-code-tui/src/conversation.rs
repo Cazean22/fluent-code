@@ -820,6 +820,7 @@ mod tests {
             child_run_id: Some(child_run_id),
             agent_name: Some("explore".to_string()),
             prompt: Some("Inspect session persistence state".to_string()),
+            status: fluent_code_app::session::model::TaskDelegationStatus::Running,
         });
         invocation.approval_state = ToolApprovalState::Approved;
         invocation.execution_state = ToolExecutionState::Running;
@@ -873,6 +874,7 @@ mod tests {
             child_run_id: Some(child_run_id),
             agent_name: Some("explore".to_string()),
             prompt: Some("Inspect child flow".to_string()),
+            status: fluent_code_app::session::model::TaskDelegationStatus::Running,
         });
         invocation.approval_state = ToolApprovalState::Approved;
         invocation.execution_state = ToolExecutionState::Running;

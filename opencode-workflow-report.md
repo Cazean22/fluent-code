@@ -303,6 +303,8 @@ Docs-backed agent model:
 
 That means subagent work is not just conceptual. It is represented in the runtime as structured, persisted workflow steps.
 
+For the concrete phase-1 Rust adaptation in this repo, see [OpenCode-Style Delegated Scheduling in This Repo](docs/opencode-delegated-scheduling.md).
+
 ## 8. Provider and model invocation workflow
 
 ### 8.1 Provider registry
@@ -590,6 +592,8 @@ If you want the shortest high-signal reading path through the actual code, read 
 9. `packages/opencode/src/session/message-v2.ts`
 10. `packages/opencode/src/provider/provider.ts`
 
+For the local implementation counterpart, continue with [docs/opencode-delegated-scheduling.md](docs/opencode-delegated-scheduling.md).
+
 ## 16. Sources used
 
 This report is grounded in:
@@ -622,3 +626,7 @@ The best follow-up would be a strict **OpenCode vs `fluent-code` architecture co
 - OpenCode file/module
 - current `fluent-code` equivalent
 - gaps / mismatches / opportunities
+
+That comparison now lives in [docs/opencode-vs-fluent-code-architecture.md](docs/opencode-vs-fluent-code-architecture.md).
+
+If you want the most directly relevant local follow-up first, read [docs/opencode-delegated-scheduling.md](docs/opencode-delegated-scheduling.md), then [docs/agent-architecture-spec.md](docs/agent-architecture-spec.md).
