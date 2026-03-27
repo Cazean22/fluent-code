@@ -266,43 +266,52 @@ async fn apply_effects(
     pending_messages: &mut std::collections::VecDeque<fluent_code_app::app::Msg>,
 ) -> Result<()> {
     for effect in effects {
-        match effect {
-            Effect::PersistSession => persist_session(state, store)?,
-            Effect::PersistSessionIfDue => persist_session_if_due(state, store)?,
-            Effect::StartAssistant { .. }
-            | Effect::ExecuteTool { .. }
-            | Effect::CancelAssistant { .. } => {
-                log_tui_effect(
-                    "forwarding async effect from tui to runtime",
-                    state,
-                    &effect,
-                );
-                runtime.spawn_effect(effect, runtime_sender.clone());
-            }
-        }
+        apply_effect(
+            state,
+            store,
+            runtime,
+            &runtime_sender,
+            effect,
+            "forwarding async effect from tui to runtime",
+        )?;
     }
 
     while let Some(message) = pending_messages.pop_front() {
         let effects = update(state, message);
         for effect in effects {
-            match effect {
-                Effect::PersistSession => persist_session(state, store)?,
-                Effect::PersistSessionIfDue => persist_session_if_due(state, store)?,
-                Effect::StartAssistant { .. }
-                | Effect::ExecuteTool { .. }
-                | Effect::CancelAssistant { .. } => {
-                    log_tui_effect(
-                        "forwarding queued async effect from tui to runtime",
-                        state,
-                        &effect,
-                    );
-                    runtime.spawn_effect(effect, runtime_sender.clone())
-                }
-            }
+            apply_effect(
+                state,
+                store,
+                runtime,
+                &runtime_sender,
+                effect,
+                "forwarding queued async effect from tui to runtime",
+            )?;
         }
     }
 
     Ok(())
+}
+
+fn apply_effect(
+    state: &mut AppState,
+    store: &FsSessionStore,
+    runtime: &Runtime,
+    runtime_sender: &tokio::sync::mpsc::UnboundedSender<fluent_code_app::app::Msg>,
+    effect: Effect,
+    async_effect_log_context: &str,
+) -> Result<()> {
+    match effect {
+        Effect::PersistSession => persist_session(state, store),
+        Effect::PersistSessionIfDue => persist_session_if_due(state, store),
+        Effect::StartAssistant { .. }
+        | Effect::ExecuteTool { .. }
+        | Effect::CancelAssistant { .. } => {
+            log_tui_effect(async_effect_log_context, state, &effect);
+            runtime.spawn_effect(effect, runtime_sender.clone());
+            Ok(())
+        }
+    }
 }
 
 fn persist_session(state: &mut AppState, store: &FsSessionStore) -> Result<()> {
