@@ -59,6 +59,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 role: Role::User,
                 content: prompt,
                 reasoning: String::new(),
+                sequence_number: state.session.allocate_replay_sequence(),
                 timestamp: Utc::now(),
             };
             state.session.turns.push(turn);
@@ -331,6 +332,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 result: None,
                 error: None,
                 delegation: None,
+                sequence_number: state.session.allocate_replay_sequence(),
                 requested_at: Utc::now(),
                 approved_at: None,
                 completed_at: None,
@@ -554,6 +556,22 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             invocation_id,
             result,
         } => {
+            if state.active_run_id != Some(run_id)
+                && state
+                    .session
+                    .find_run(run_id)
+                    .is_some_and(|run| run.status.is_terminal())
+            {
+                debug!(
+                    session_id = %state.session.id,
+                    run_id = %run_id,
+                    invocation_id = %invocation_id,
+                    active_run_id = ?state.active_run_id,
+                    "ignored stale tool result for terminal run"
+                );
+                return Vec::new();
+            }
+
             let session_id = state.session.id;
             let Some(preceding_turn_id) = state
                 .session
@@ -685,12 +703,14 @@ fn active_assistant_turn_mut(state: &mut AppState, run_id: Uuid) -> Option<&mut 
 
 fn ensure_active_assistant_turn(state: &mut AppState, run_id: Uuid) -> &mut Turn {
     if active_assistant_turn_mut(state, run_id).is_none() {
+        let sequence_number = state.session.allocate_replay_sequence();
         state.session.turns.push(Turn {
             id: Uuid::new_v4(),
             run_id,
             role: Role::Assistant,
             content: String::new(),
             reasoning: String::new(),
+            sequence_number,
             timestamp: Utc::now(),
         });
     }
@@ -832,10 +852,7 @@ fn tool_batch_progress(
 /// For child (delegated) runs we inspect the parent's task invocation to find
 /// which agent was delegated. For root runs we return `None` because the
 /// primary orchestrator is not constrained by agent-level tool permissions.
-fn active_agent_for_run<'a>(
-    state: &'a AppState,
-    run_id: Uuid,
-) -> Option<&'a crate::agent::AgentDefinition> {
+fn active_agent_for_run(state: &AppState, run_id: Uuid) -> Option<&crate::agent::AgentDefinition> {
     let run = state.session.find_run(run_id)?;
     let parent_invocation_id = run.parent_tool_invocation_id?;
     let invocation = state
@@ -1728,6 +1745,59 @@ mod tests {
                     fluent_code_provider::ProviderMessage::ToolResult { content, .. }
                         if content == "Subagent cancelled by user."
                 ))
+        ));
+    }
+
+    #[test]
+    fn stale_tool_result_is_ignored_after_run_is_cancelled() {
+        let mut state = AppState::new(Session::new("cancelled tool result"));
+        state.draft_input = "run a tool".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "uppercase-call-1".to_string(),
+                    name: "uppercase_text".to_string(),
+                    arguments: serde_json::json!({ "text": "hello" }),
+                },
+            },
+        );
+
+        assert!(matches!(state.status, AppStatus::AwaitingToolApproval));
+
+        update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Once));
+        assert!(matches!(state.status, AppStatus::RunningTool));
+
+        update(&mut state, Msg::CancelActiveRun);
+        let invocation_id = state.session.tool_invocations[0].id;
+
+        let effects = update(
+            &mut state,
+            Msg::ToolExecutionFinished {
+                run_id,
+                invocation_id,
+                result: Ok("HELLO".to_string()),
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert!(state.active_run_id.is_none());
+        assert!(matches!(state.status, AppStatus::Idle));
+        assert_eq!(state.session.tool_invocations[0].result, None);
+        assert_eq!(
+            state.session.tool_invocations[0].execution_state,
+            ToolExecutionState::Running
+        );
+        assert!(matches!(
+            state.session.find_run(run_id).map(|run| run.status),
+            Some(RunStatus::Cancelled)
         ));
     }
 

@@ -1339,6 +1339,7 @@ mod tests {
                 prompt: Some("Inspect another file".to_string()),
                 status: TaskDelegationStatus::Running,
             }),
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: None,
@@ -1348,6 +1349,9 @@ mod tests {
             status: RunStatus::InProgress,
             parent_run_id: Some(fixture.parent_run_id),
             parent_tool_invocation_id: Some(second_invocation_id),
+            created_sequence: 1,
+            terminal_sequence: None,
+            terminal_stop_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
@@ -1392,6 +1396,7 @@ mod tests {
             result: None,
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: None,
@@ -1471,6 +1476,9 @@ mod tests {
             status: RunStatus::InProgress,
             parent_run_id: None,
             parent_tool_invocation_id: None,
+            created_sequence: 1,
+            terminal_sequence: None,
+            terminal_stop_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
@@ -1479,6 +1487,9 @@ mod tests {
             status: RunStatus::InProgress,
             parent_run_id: Some(parent_run_id),
             parent_tool_invocation_id: Some(task_invocation_id),
+            created_sequence: 2,
+            terminal_sequence: None,
+            terminal_stop_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
@@ -1488,6 +1499,7 @@ mod tests {
             role: Role::User,
             content: "delegate work".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         });
         session.turns.push(Turn {
@@ -1496,6 +1508,7 @@ mod tests {
             role: Role::Assistant,
             content: "I will delegate that task.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         });
         session.turns.push(Turn {
@@ -1504,6 +1517,7 @@ mod tests {
             role: Role::User,
             content: "Inspect startup recovery".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         });
         session.turns.push(Turn {
@@ -1512,6 +1526,7 @@ mod tests {
             role: Role::Assistant,
             content: "Partial child output that should not be summarized".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         });
         session.tool_invocations.push(ToolInvocationRecord {
@@ -1535,6 +1550,7 @@ mod tests {
                 prompt: Some("Inspect startup recovery".to_string()),
                 status: TaskDelegationStatus::Running,
             }),
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: None,
@@ -1556,6 +1572,9 @@ mod tests {
             status: RunStatus::InProgress,
             parent_run_id: None,
             parent_tool_invocation_id: None,
+            created_sequence: 1,
+            terminal_sequence: None,
+            terminal_stop_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
@@ -1565,6 +1584,7 @@ mod tests {
             role: Role::User,
             content: "resume the root run".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         });
         session.foreground_owner = Some(ForegroundOwnerRecord {

@@ -8,8 +8,8 @@ use crate::agent::parse_task_request;
 use crate::app::request_builder::{build_provider_request, child_provider_request};
 use crate::app::{AppState, AppStatus, Effect, Msg};
 use crate::session::model::{
-    ForegroundPhase, Role, RunStatus, TaskDelegationStatus, ToolApprovalState, ToolExecutionState,
-    ToolInvocationId, Turn,
+    ForegroundPhase, Role, RunStatus, RunTerminalStopReason, TaskDelegationStatus,
+    ToolApprovalState, ToolExecutionState, ToolInvocationId, Turn,
 };
 
 pub const RESTART_INTERRUPTED_TASK_RESULT: &str =
@@ -60,10 +60,13 @@ pub fn start_child_run(
         }
     };
 
-    let delegated_agent = state
-        .agent_registry
-        .get(&task_request.agent)
-        .map(|agent| (agent.name.clone(), agent.system_prompt.clone(), agent.tool_permissions.clone()));
+    let delegated_agent = state.agent_registry.get(&task_request.agent).map(|agent| {
+        (
+            agent.name.clone(),
+            agent.system_prompt.clone(),
+            agent.tool_permissions.clone(),
+        )
+    });
     let Some((agent_name, agent_system_prompt, agent_tool_permissions)) = delegated_agent else {
         let error_message = format!("task requested unknown agent '{}'", task_request.agent);
         finish_task_invocation_with_error(state, invocation_id, &error_message);
@@ -102,17 +105,24 @@ pub fn start_child_run(
     );
     state.set_foreground(child_run_id, ForegroundPhase::Generating, None);
 
+    let sequence_number = state.session.allocate_replay_sequence();
     state.session.turns.push(Turn {
         id: Uuid::new_v4(),
         run_id: child_run_id,
         role: Role::User,
         content: task_request.prompt.clone(),
         reasoning: String::new(),
+        sequence_number,
         timestamp: Utc::now(),
     });
     state.session.updated_at = Utc::now();
 
-    let child_request = child_provider_request(state, task_request.prompt, agent_system_prompt, &agent_tool_permissions);
+    let child_request = child_provider_request(
+        state,
+        task_request.prompt,
+        agent_system_prompt,
+        &agent_tool_permissions,
+    );
 
     info!(
         session_id = %session_id,
@@ -145,11 +155,12 @@ pub fn complete_child_run(
     let (parent_run_id, parent_tool_invocation_id) = parent_link?;
     let session_id = state.session.id;
 
-    let (child_status, delegation_status, synthetic_result) = match outcome {
+    let (child_status, child_stop_reason, delegation_status, synthetic_result) = match outcome {
         ChildRunOutcome::Completed => {
             let final_text = latest_assistant_text_for_run(state, child_run_id).unwrap_or_default();
             (
                 RunStatus::Completed,
+                Some(RunTerminalStopReason::Completed),
                 TaskDelegationStatus::Completed,
                 summarize_child_result(&final_text),
             )
@@ -164,24 +175,30 @@ pub fn complete_child_run(
                     summarize_child_result(&final_text)
                 )
             };
-            (RunStatus::Failed, TaskDelegationStatus::Failed, message)
+            (
+                RunStatus::Failed,
+                Some(RunTerminalStopReason::Failed),
+                TaskDelegationStatus::Failed,
+                message,
+            )
         }
         ChildRunOutcome::Cancelled => (
             RunStatus::Cancelled,
+            Some(RunTerminalStopReason::Cancelled),
             TaskDelegationStatus::Cancelled,
             "Subagent cancelled by user.".to_string(),
         ),
         ChildRunOutcome::InterruptedByRestart => (
             RunStatus::Failed,
+            Some(RunTerminalStopReason::Interrupted),
             TaskDelegationStatus::Failed,
             RESTART_INTERRUPTED_TASK_RESULT.to_string(),
         ),
     };
 
-    if let Some(run) = state.session.find_run_mut(child_run_id) {
-        run.status = child_status;
-        run.updated_at = Utc::now();
-    }
+    state
+        .session
+        .upsert_run_with_stop_reason(child_run_id, child_status, child_stop_reason);
 
     if let Some(invocation) = state
         .session
@@ -563,6 +580,8 @@ mod tests {
         let mut fixture = interrupted_delegation_fixture();
         let second_child_run_id = Uuid::new_v4();
         let second_invocation_id = Uuid::new_v4();
+        let second_invocation_sequence = fixture.state.session.allocate_replay_sequence();
+        let second_run_sequence = fixture.state.session.allocate_replay_sequence();
 
         fixture.state.session.tool_invocations.push(ToolInvocationRecord {
             id: second_invocation_id,
@@ -582,6 +601,7 @@ mod tests {
                 prompt: Some("Inspect another file".to_string()),
                 status: TaskDelegationStatus::Running,
             }),
+            sequence_number: second_invocation_sequence,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: None,
@@ -591,6 +611,9 @@ mod tests {
             status: RunStatus::InProgress,
             parent_run_id: Some(fixture.parent_run_id),
             parent_tool_invocation_id: Some(second_invocation_id),
+            created_sequence: second_run_sequence,
+            terminal_sequence: None,
+            terminal_stop_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
@@ -605,6 +628,7 @@ mod tests {
     #[test]
     fn startup_recovery_preserves_batch_barrier_when_sibling_tool_is_still_nonterminal() {
         let mut fixture = interrupted_delegation_fixture();
+        let sibling_invocation_sequence = fixture.state.session.allocate_replay_sequence();
 
         fixture
             .state
@@ -623,6 +647,7 @@ mod tests {
                 result: None,
                 error: None,
                 delegation: None,
+                sequence_number: sibling_invocation_sequence,
                 requested_at: Utc::now(),
                 approved_at: Some(Utc::now()),
                 completed_at: None,
@@ -652,12 +677,22 @@ mod tests {
         let task_invocation_id = Uuid::new_v4();
         let user_turn_id = Uuid::new_v4();
         let preceding_turn_id = Uuid::new_v4();
+        let parent_run_sequence = session.allocate_replay_sequence();
+        let child_run_sequence = session.allocate_replay_sequence();
+        let user_turn_sequence = session.allocate_replay_sequence();
+        let assistant_turn_sequence = session.allocate_replay_sequence();
+        let child_prompt_sequence = session.allocate_replay_sequence();
+        let child_assistant_sequence = session.allocate_replay_sequence();
+        let task_invocation_sequence = session.allocate_replay_sequence();
 
         session.runs.push(RunRecord {
             id: parent_run_id,
             status: RunStatus::InProgress,
             parent_run_id: None,
             parent_tool_invocation_id: None,
+            created_sequence: parent_run_sequence,
+            terminal_sequence: None,
+            terminal_stop_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
@@ -666,6 +701,9 @@ mod tests {
             status: RunStatus::InProgress,
             parent_run_id: Some(parent_run_id),
             parent_tool_invocation_id: Some(task_invocation_id),
+            created_sequence: child_run_sequence,
+            terminal_sequence: None,
+            terminal_stop_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
@@ -675,6 +713,7 @@ mod tests {
             role: Role::User,
             content: "delegate work".to_string(),
             reasoning: String::new(),
+            sequence_number: user_turn_sequence,
             timestamp: Utc::now(),
         });
         session.turns.push(Turn {
@@ -683,6 +722,7 @@ mod tests {
             role: Role::Assistant,
             content: "I will delegate that task.".to_string(),
             reasoning: String::new(),
+            sequence_number: assistant_turn_sequence,
             timestamp: Utc::now(),
         });
         session.turns.push(Turn {
@@ -691,6 +731,7 @@ mod tests {
             role: Role::User,
             content: "Inspect startup recovery".to_string(),
             reasoning: String::new(),
+            sequence_number: child_prompt_sequence,
             timestamp: Utc::now(),
         });
         session.turns.push(Turn {
@@ -699,6 +740,7 @@ mod tests {
             role: Role::Assistant,
             content: "Partial child output that should not be summarized".to_string(),
             reasoning: String::new(),
+            sequence_number: child_assistant_sequence,
             timestamp: Utc::now(),
         });
         session.tool_invocations.push(ToolInvocationRecord {
@@ -722,6 +764,7 @@ mod tests {
                 prompt: Some("Inspect startup recovery".to_string()),
                 status: TaskDelegationStatus::Running,
             }),
+            sequence_number: task_invocation_sequence,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: None,

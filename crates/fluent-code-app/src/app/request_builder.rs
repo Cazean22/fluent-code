@@ -69,7 +69,7 @@ fn append_tool_messages_after_turn(
             invocation.run_id == run_id && invocation.preceding_turn_id == Some(turn_id)
         })
         .collect::<Vec<_>>();
-    invocations.sort_by_key(|invocation| invocation.requested_at);
+    invocations.sort_by_key(|invocation| invocation.sequence_number);
 
     for invocation in invocations {
         if invocation.tool_call_id.trim().is_empty() {

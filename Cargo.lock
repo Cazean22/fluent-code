@@ -831,11 +831,23 @@ dependencies = [
 name = "fluent-code"
 version = "0.1.0"
 dependencies = [
+ "fluent-code-acp",
+ "tokio",
+]
+
+[[package]]
+name = "fluent-code-acp"
+version = "0.1.0"
+dependencies = [
+ "chrono",
  "fluent-code-app",
  "fluent-code-provider",
- "fluent-code-tui",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

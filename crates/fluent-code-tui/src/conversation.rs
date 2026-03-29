@@ -1,8 +1,7 @@
-use chrono::{DateTime, Utc};
 use fluent_code_app::app::{AppState, AppStatus};
 use fluent_code_app::session::model::{
-    Role, RunStatus, Session, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
-    ToolSource,
+    ReplaySequence, Role, RunStatus, RunTerminalStopReason, Session, ToolApprovalState,
+    ToolExecutionState, ToolInvocationRecord, ToolSource,
 };
 use uuid::Uuid;
 
@@ -72,6 +71,7 @@ pub(crate) enum RunMarkerKind {
     Completed,
     Failed,
     Cancelled,
+    Interrupted,
 }
 
 #[derive(Debug, Clone)]
@@ -83,9 +83,6 @@ pub(crate) struct RunMarkerRow {
 pub(crate) fn derive_conversation_rows(state: &AppState) -> Vec<ConversationRow> {
     let session = &state.session;
 
-    // Build a flat timeline of all events sorted by timestamp so that
-    // reasoning, turns, and tool calls appear in the order they actually
-    // happened rather than being grouped by turn.
     let mut timeline = build_timeline(state);
     timeline.sort_by_key(|e| e.sort_key);
 
@@ -137,7 +134,6 @@ pub(crate) fn derive_conversation_rows(state: &AppState) -> Vec<ConversationRow>
 // Timeline construction
 // ---------------------------------------------------------------------------
 
-/// Priority within the same timestamp: reasoning (0) < turn content (1) < tool (2).
 const PRIORITY_REASONING: u8 = 0;
 const PRIORITY_TURN: u8 = 1;
 const PRIORITY_TOOL: u8 = 2;
@@ -149,38 +145,32 @@ enum TimelineKind {
 }
 
 struct TimelineEntry {
-    /// `(timestamp, priority, sequence)` – used for a single `sort_by_key`.
-    sort_key: (DateTime<Utc>, u8, usize),
+    sort_key: (ReplaySequence, u8),
     kind: TimelineKind,
 }
 
 fn build_timeline(state: &AppState) -> Vec<TimelineEntry> {
     let session = &state.session;
     let mut entries = Vec::new();
-    let mut seq = 0usize;
-
     for (i, turn) in session.turns.iter().enumerate() {
         if matches!(turn.role, Role::Assistant) && !turn.reasoning.is_empty() {
             entries.push(TimelineEntry {
-                sort_key: (turn.timestamp, PRIORITY_REASONING, seq),
+                sort_key: (turn.sequence_number, PRIORITY_REASONING),
                 kind: TimelineKind::Reasoning(i),
             });
-            seq += 1;
         }
 
         entries.push(TimelineEntry {
-            sort_key: (turn.timestamp, PRIORITY_TURN, seq),
+            sort_key: (turn.sequence_number, PRIORITY_TURN),
             kind: TimelineKind::Turn(i),
         });
-        seq += 1;
     }
 
     for (i, invocation) in session.tool_invocations.iter().enumerate() {
         entries.push(TimelineEntry {
-            sort_key: (invocation.requested_at, PRIORITY_TOOL, seq),
+            sort_key: (invocation.sequence_number, PRIORITY_TOOL),
             kind: TimelineKind::Tool(i),
         });
-        seq += 1;
     }
 
     entries
@@ -209,21 +199,38 @@ fn derive_run_marker(state: &AppState) -> Option<RunMarkerRow> {
         };
     }
 
-    match state.session.latest_run_status() {
-        Some(RunStatus::Completed) => Some(RunMarkerRow {
+    latest_root_run_marker(state)
+}
+
+fn latest_root_run_marker(state: &AppState) -> Option<RunMarkerRow> {
+    let latest_root_run = state
+        .session
+        .runs
+        .iter()
+        .filter(|run| run.parent_run_id.is_none())
+        .max_by_key(|run| run.latest_replay_sequence())?;
+    let stop_reason = latest_root_run
+        .terminal_stop_reason
+        .or_else(|| latest_root_run.status.default_terminal_stop_reason())?;
+
+    Some(match stop_reason {
+        RunTerminalStopReason::Completed => RunMarkerRow {
             kind: RunMarkerKind::Completed,
             label: "completed".to_string(),
-        }),
-        Some(RunStatus::Failed) => Some(RunMarkerRow {
+        },
+        RunTerminalStopReason::Failed => RunMarkerRow {
             kind: RunMarkerKind::Failed,
             label: "failed".to_string(),
-        }),
-        Some(RunStatus::Cancelled) => Some(RunMarkerRow {
+        },
+        RunTerminalStopReason::Cancelled => RunMarkerRow {
             kind: RunMarkerKind::Cancelled,
             label: "cancelled".to_string(),
-        }),
-        _ => None,
-    }
+        },
+        RunTerminalStopReason::Interrupted => RunMarkerRow {
+            kind: RunMarkerKind::Interrupted,
+            label: "interrupted".to_string(),
+        },
+    })
 }
 
 fn format_run_marker_label(base: &str, child_suffix: Option<&str>) -> String {
@@ -483,8 +490,8 @@ mod tests {
     use chrono::{Duration, Utc};
     use fluent_code_app::app::{AppState, AppStatus};
     use fluent_code_app::session::model::{
-        Role, RunStatus, Session, TaskDelegationRecord, ToolApprovalState, ToolExecutionState,
-        ToolInvocationRecord, ToolSource, Turn,
+        Role, RunStatus, RunTerminalStopReason, Session, TaskDelegationRecord, ToolApprovalState,
+        ToolExecutionState, ToolInvocationRecord, ToolSource, Turn,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -495,8 +502,10 @@ mod tests {
     fn derive_conversation_rows_keeps_turn_order() {
         let run_id = Uuid::new_v4();
         let mut session = Session::new("ordered turns");
-        let first_turn = make_turn(run_id, Role::User, "first");
-        let second_turn = make_turn(run_id, Role::Assistant, "second");
+        let mut first_turn = make_turn(run_id, Role::User, "first");
+        first_turn.sequence_number = 1;
+        let mut second_turn = make_turn(run_id, Role::Assistant, "second");
+        second_turn.sequence_number = 2;
 
         session.turns = vec![first_turn.clone(), second_turn.clone()];
 
@@ -520,6 +529,7 @@ mod tests {
         let mut session = Session::new("assistant reasoning");
         let mut turn = make_turn(run_id, Role::Assistant, "answer");
         turn.reasoning = "plan".to_string();
+        turn.sequence_number = 1;
 
         session.turns = vec![turn.clone()];
 
@@ -538,31 +548,35 @@ mod tests {
     }
 
     #[test]
-    fn derive_conversation_rows_interleaves_turns_and_tools_chronologically() {
+    fn derive_conversation_rows_interleaves_turns_and_tools_by_replay_sequence() {
         let run_id = Uuid::new_v4();
         let base = Utc::now();
         let mut session = Session::new("chronological tools");
 
         let mut first_turn = make_turn(run_id, Role::User, "inspect");
-        first_turn.timestamp = base;
+        first_turn.timestamp = base + Duration::seconds(3);
+        first_turn.sequence_number = 1;
 
         let mut second_turn = make_turn(run_id, Role::Assistant, "working");
-        second_turn.timestamp = base + Duration::seconds(3);
+        second_turn.timestamp = base - Duration::seconds(10);
+        second_turn.sequence_number = 4;
 
-        let early = make_tool_invocation(
+        let mut early = make_tool_invocation(
             run_id,
             Some(first_turn.id),
             "search",
             json!({"query": "PersistSession"}),
-            base + Duration::seconds(1),
+            base - Duration::seconds(20),
         );
-        let later = make_tool_invocation(
+        early.sequence_number = 2;
+        let mut later = make_tool_invocation(
             run_id,
             Some(first_turn.id),
             "read",
             json!({"path": "src/main.rs"}),
-            base + Duration::seconds(2),
+            base - Duration::seconds(30),
         );
+        later.sequence_number = 3;
 
         session.turns = vec![first_turn.clone(), second_turn.clone()];
         session.tool_invocations = vec![later.clone(), early.clone()];
@@ -593,14 +607,16 @@ mod tests {
     fn derive_conversation_rows_preserves_orphan_tools() {
         let run_id = Uuid::new_v4();
         let mut session = Session::new("orphan tools");
-        let turn = make_turn(run_id, Role::User, "hello");
-        let orphan = make_tool_invocation(
+        let mut turn = make_turn(run_id, Role::User, "hello");
+        turn.sequence_number = 1;
+        let mut orphan = make_tool_invocation(
             run_id,
             None,
             "read",
             json!({"filePath": "README.md"}),
             Utc::now(),
         );
+        orphan.sequence_number = 2;
 
         session.turns = vec![turn.clone()];
         session.tool_invocations = vec![orphan.clone()];
@@ -623,25 +639,27 @@ mod tests {
     fn derive_conversation_rows_groups_same_kind_tools_for_same_turn() {
         let run_id = Uuid::new_v4();
         let mut session = Session::new("grouped tools");
-        let turn = make_turn(run_id, Role::Assistant, "reading files");
+        let mut turn = make_turn(run_id, Role::Assistant, "reading files");
+        turn.sequence_number = 1;
 
         session.turns = vec![turn.clone()];
-        session.tool_invocations = vec![
-            make_tool_invocation(
-                run_id,
-                Some(turn.id),
-                "read",
-                json!({"path": "src/main.rs"}),
-                Utc::now(),
-            ),
-            make_tool_invocation(
-                run_id,
-                Some(turn.id),
-                "read",
-                json!({"path": "src/lib.rs"}),
-                Utc::now() + Duration::seconds(1),
-            ),
-        ];
+        let mut first_invocation = make_tool_invocation(
+            run_id,
+            Some(turn.id),
+            "read",
+            json!({"path": "src/main.rs"}),
+            Utc::now(),
+        );
+        first_invocation.sequence_number = 2;
+        let mut second_invocation = make_tool_invocation(
+            run_id,
+            Some(turn.id),
+            "read",
+            json!({"path": "src/lib.rs"}),
+            Utc::now() + Duration::seconds(1),
+        );
+        second_invocation.sequence_number = 3;
+        session.tool_invocations = vec![first_invocation, second_invocation];
 
         let state = AppState::new(session);
         let rows = derive_conversation_rows(&state);
@@ -659,25 +677,27 @@ mod tests {
     fn derive_conversation_rows_does_not_group_mixed_tool_kinds() {
         let run_id = Uuid::new_v4();
         let mut session = Session::new("mixed tools");
-        let turn = make_turn(run_id, Role::Assistant, "mixed work");
+        let mut turn = make_turn(run_id, Role::Assistant, "mixed work");
+        turn.sequence_number = 1;
 
         session.turns = vec![turn.clone()];
-        session.tool_invocations = vec![
-            make_tool_invocation(
-                run_id,
-                Some(turn.id),
-                "read",
-                json!({"path": "src/main.rs"}),
-                Utc::now(),
-            ),
-            make_tool_invocation(
-                run_id,
-                Some(turn.id),
-                "search",
-                json!({"query": "main"}),
-                Utc::now() + Duration::seconds(1),
-            ),
-        ];
+        let mut first_invocation = make_tool_invocation(
+            run_id,
+            Some(turn.id),
+            "read",
+            json!({"path": "src/main.rs"}),
+            Utc::now(),
+        );
+        first_invocation.sequence_number = 2;
+        let mut second_invocation = make_tool_invocation(
+            run_id,
+            Some(turn.id),
+            "search",
+            json!({"query": "main"}),
+            Utc::now() + Duration::seconds(1),
+        );
+        second_invocation.sequence_number = 3;
+        session.tool_invocations = vec![first_invocation, second_invocation];
 
         let state = AppState::new(session);
         let rows = derive_conversation_rows(&state);
@@ -692,24 +712,26 @@ mod tests {
     fn derive_conversation_rows_inserts_approval_marker_after_grouped_tool_batch() {
         let run_id = Uuid::new_v4();
         let mut session = Session::new("approval marker");
-        let turn = make_turn(run_id, Role::Assistant, "checking files");
+        let mut turn = make_turn(run_id, Role::Assistant, "checking files");
+        turn.sequence_number = 1;
         session.turns = vec![turn.clone()];
-        session.tool_invocations = vec![
-            make_tool_invocation(
-                run_id,
-                Some(turn.id),
-                "read",
-                json!({"path": "src/main.rs"}),
-                Utc::now(),
-            ),
-            make_tool_invocation(
-                run_id,
-                Some(turn.id),
-                "read",
-                json!({"path": "src/lib.rs"}),
-                Utc::now() + Duration::seconds(1),
-            ),
-        ];
+        let mut first_invocation = make_tool_invocation(
+            run_id,
+            Some(turn.id),
+            "read",
+            json!({"path": "src/main.rs"}),
+            Utc::now(),
+        );
+        first_invocation.sequence_number = 2;
+        let mut second_invocation = make_tool_invocation(
+            run_id,
+            Some(turn.id),
+            "read",
+            json!({"path": "src/lib.rs"}),
+            Utc::now() + Duration::seconds(1),
+        );
+        second_invocation.sequence_number = 3;
+        session.tool_invocations = vec![first_invocation, second_invocation];
 
         let mut state = AppState::new(session);
         state.active_run_id = Some(run_id);
@@ -730,7 +752,9 @@ mod tests {
     fn derive_conversation_rows_inserts_running_marker_for_active_run_tail() {
         let run_id = Uuid::new_v4();
         let mut session = Session::new("running marker");
-        session.turns = vec![make_turn(run_id, Role::Assistant, "working")];
+        let mut turn = make_turn(run_id, Role::Assistant, "working");
+        turn.sequence_number = 1;
+        session.turns = vec![turn];
 
         let mut state = AppState::new(session);
         state.active_run_id = Some(run_id);
@@ -749,7 +773,9 @@ mod tests {
     fn derive_conversation_rows_inserts_completed_marker_for_terminal_run_tail() {
         let run_id = Uuid::new_v4();
         let mut session = Session::new("completed marker");
-        session.turns = vec![make_turn(run_id, Role::Assistant, "done")];
+        let mut turn = make_turn(run_id, Role::Assistant, "done");
+        turn.sequence_number = 1;
+        session.turns = vec![turn];
         session.upsert_run(run_id, RunStatus::Completed);
 
         let state = AppState::new(session);
@@ -766,7 +792,9 @@ mod tests {
     fn derive_conversation_rows_inserts_failed_marker_for_terminal_run_tail() {
         let run_id = Uuid::new_v4();
         let mut session = Session::new("failed marker");
-        session.turns = vec![make_turn(run_id, Role::Assistant, "boom")];
+        let mut turn = make_turn(run_id, Role::Assistant, "boom");
+        turn.sequence_number = 1;
+        session.turns = vec![turn];
         session.upsert_run(run_id, RunStatus::Failed);
 
         let state = AppState::new(session);
@@ -780,18 +808,70 @@ mod tests {
     }
 
     #[test]
+    fn derive_conversation_rows_inserts_interrupted_marker_for_terminal_run_tail() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("interrupted marker");
+        let mut turn = make_turn(run_id, Role::Assistant, "stopped");
+        turn.sequence_number = 1;
+        session.turns = vec![turn];
+        session.upsert_run_with_stop_reason(
+            run_id,
+            RunStatus::Failed,
+            Some(RunTerminalStopReason::Interrupted),
+        );
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert!(matches!(
+            rows.last(),
+            Some(ConversationRow::RunMarker(marker))
+                if marker.kind == RunMarkerKind::Interrupted && marker.label == "interrupted"
+        ));
+    }
+
+    #[test]
+    fn derive_conversation_rows_prefers_latest_root_terminal_marker_over_child_run_status() {
+        let parent_run_id = Uuid::new_v4();
+        let child_run_id = Uuid::new_v4();
+        let mut session = Session::new("root marker wins");
+        let mut parent_turn = make_turn(parent_run_id, Role::Assistant, "parent failed");
+        parent_turn.sequence_number = 1;
+        session.turns = vec![parent_turn];
+        session.upsert_run(parent_run_id, RunStatus::Failed);
+        session.upsert_run_with_parent(
+            child_run_id,
+            RunStatus::Completed,
+            Some(parent_run_id),
+            None,
+        );
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert!(matches!(
+            rows.last(),
+            Some(ConversationRow::RunMarker(marker))
+                if marker.kind == RunMarkerKind::Failed && marker.label == "failed"
+        ));
+    }
+
+    #[test]
     fn derive_conversation_rows_does_not_emit_markers_for_historical_inferred_states() {
         let run_id = Uuid::new_v4();
         let mut session = Session::new("no inferred marker");
-        let turn = make_turn(run_id, Role::Assistant, "pending tool snapshot");
+        let mut turn = make_turn(run_id, Role::Assistant, "pending tool snapshot");
+        turn.sequence_number = 1;
         session.turns = vec![turn.clone()];
-        session.tool_invocations = vec![make_tool_invocation(
+        let mut invocation = make_tool_invocation(
             run_id,
             Some(turn.id),
             "read",
             json!({"path": "src/main.rs"}),
             Utc::now(),
-        )];
+        );
+        invocation.sequence_number = 2;
+        session.tool_invocations = vec![invocation];
 
         let state = AppState::new(session);
         let rows = derive_conversation_rows(&state);
@@ -808,7 +888,8 @@ mod tests {
         let parent_run_id = Uuid::new_v4();
         let child_run_id = Uuid::new_v4();
         let mut session = Session::new("delegated task summary");
-        let turn = make_turn(parent_run_id, Role::Assistant, "delegating now");
+        let mut turn = make_turn(parent_run_id, Role::Assistant, "delegating now");
+        turn.sequence_number = 1;
         let mut invocation = make_tool_invocation(
             parent_run_id,
             Some(turn.id),
@@ -816,6 +897,7 @@ mod tests {
             json!({"agent": "explore", "prompt": "Inspect session persistence state"}),
             Utc::now(),
         );
+        invocation.sequence_number = 2;
         invocation.delegation = Some(TaskDelegationRecord {
             child_run_id: Some(child_run_id),
             agent_name: Some("explore".to_string()),
@@ -862,7 +944,8 @@ mod tests {
         let parent_run_id = Uuid::new_v4();
         let child_run_id = Uuid::new_v4();
         let mut session = Session::new("child marker label");
-        let turn = make_turn(parent_run_id, Role::Assistant, "delegating now");
+        let mut turn = make_turn(parent_run_id, Role::Assistant, "delegating now");
+        turn.sequence_number = 1;
         let mut invocation = make_tool_invocation(
             parent_run_id,
             Some(turn.id),
@@ -870,6 +953,7 @@ mod tests {
             json!({"agent": "explore", "prompt": "Inspect child flow"}),
             Utc::now(),
         );
+        invocation.sequence_number = 2;
         invocation.delegation = Some(TaskDelegationRecord {
             child_run_id: Some(child_run_id),
             agent_name: Some("explore".to_string()),
@@ -910,6 +994,7 @@ mod tests {
             role,
             content: content.to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         }
     }
@@ -934,6 +1019,7 @@ mod tests {
             result: None,
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at,
             approved_at: None,
             completed_at: None,

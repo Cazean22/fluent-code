@@ -164,7 +164,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::agent::AgentRegistry;
-    use crate::config::{Config, LoggingConfig, ModelConfig, PluginConfig};
+    use crate::config::{
+        AcpConfig, AcpSessionDefaultsConfig, Config, LoggingConfig, ModelConfig, PluginConfig,
+    };
     use crate::plugin::discovery::{DiscoveredPlugin, PluginDiscovery};
     use crate::plugin::manifest::{
         FilesystemCapability, PluginCapabilities, PluginHostRequirements, PluginManifest,
@@ -281,6 +283,14 @@ mod tests {
                 enable_global_plugins: true,
                 project_dir,
                 global_dir,
+            },
+            acp: AcpConfig {
+                protocol_version: 1,
+                auth_methods: Vec::new(),
+                session_defaults: AcpSessionDefaultsConfig {
+                    system_prompt: "test".to_string(),
+                    reasoning_effort: None,
+                },
             },
             model_providers: std::collections::HashMap::new(),
         }

@@ -78,14 +78,15 @@ fn uppercase_text_tool() -> ProviderTool {
 fn read_tool() -> ProviderTool {
     ProviderTool {
         name: READ_TOOL_NAME.to_string(),
-        description: "Read a file with line numbers or list a directory within the workspace."
-            .to_string(),
+        description:
+            "Read an absolute file path or list an absolute directory path within the workspace."
+                .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative file or directory path"
+                    "description": "Absolute file or directory path within the workspace"
                 },
                 "offset": {
                     "type": "integer",
@@ -107,7 +108,8 @@ fn read_tool() -> ProviderTool {
 fn glob_tool() -> ProviderTool {
     ProviderTool {
         name: GLOB_TOOL_NAME.to_string(),
-        description: "Find files by glob pattern within the workspace.".to_string(),
+        description: "Find files by glob pattern within an absolute workspace directory."
+            .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -117,7 +119,7 @@ fn glob_tool() -> ProviderTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Optional workspace-relative directory to search within"
+                    "description": "Optional absolute directory path within the workspace to search within"
                 }
             },
             "required": ["pattern"],
@@ -129,7 +131,8 @@ fn glob_tool() -> ProviderTool {
 fn grep_tool() -> ProviderTool {
     ProviderTool {
         name: GREP_TOOL_NAME.to_string(),
-        description: "Search file contents with a regex inside the workspace.".to_string(),
+        description: "Search file contents with a regex inside an absolute workspace directory."
+            .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -143,7 +146,7 @@ fn grep_tool() -> ProviderTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Optional workspace-relative directory to search within"
+                    "description": "Optional absolute directory path within the workspace to search within"
                 },
                 "output_mode": {
                     "type": "string",
@@ -173,7 +176,7 @@ fn execute_read(workspace_root: &Path, arguments: &Value) -> Result<String> {
     let metadata = fs::metadata(&target).map_err(FluentCodeError::Io)?;
 
     if metadata.is_dir() {
-        return read_directory(workspace_root, &target);
+        return read_directory(&target);
     }
 
     let offset = get_optional_usize(arguments, "offset")?.unwrap_or(DEFAULT_READ_OFFSET);
@@ -183,12 +186,12 @@ fn execute_read(workspace_root: &Path, arguments: &Value) -> Result<String> {
     let content = fs::read_to_string(&target).map_err(|error| {
         FluentCodeError::Provider(format!(
             "read could not open '{}' as UTF-8 text: {error}",
-            display_relative(workspace_root, &target)
+            display_path(&target)
         ))
     })?;
 
     Ok(format_file_slice(
-        &display_relative(workspace_root, &target),
+        &display_path(&target),
         &content,
         offset,
         limit,
@@ -220,7 +223,7 @@ fn execute_glob(workspace_root: &Path, arguments: &Value) -> Result<String> {
 
     let mut lines = vec![format!("Found {} path(s)", matches.len())];
     for path in matches {
-        let mut display = display_relative(workspace_root, &path);
+        let mut display = display_path(&path);
         if path.is_dir() {
             display.push('/');
         }
@@ -264,7 +267,7 @@ fn execute_grep(workspace_root: &Path, arguments: &Value) -> Result<String> {
                 if output_mode == "content" && content_matches.len() < head_limit {
                     content_matches.push(format!(
                         "{}:{}: {}",
-                        display_relative(workspace_root, &path),
+                        display_path(&path),
                         index + 1,
                         line
                     ));
@@ -273,12 +276,8 @@ fn execute_grep(workspace_root: &Path, arguments: &Value) -> Result<String> {
         }
 
         if match_count > 0 {
-            matched_files.push(display_relative(workspace_root, &path));
-            count_matches.push(format!(
-                "{}: {}",
-                display_relative(workspace_root, &path),
-                match_count
-            ));
+            matched_files.push(display_path(&path));
+            count_matches.push(format!("{}: {}", display_path(&path), match_count));
         }
     }
 
@@ -331,7 +330,7 @@ fn execute_grep(workspace_root: &Path, arguments: &Value) -> Result<String> {
     Ok(output)
 }
 
-fn read_directory(workspace_root: &Path, directory: &Path) -> Result<String> {
+fn read_directory(directory: &Path) -> Result<String> {
     let mut entries = fs::read_dir(directory)
         .map_err(FluentCodeError::Io)?
         .filter_map(std::result::Result::ok)
@@ -341,7 +340,7 @@ fn read_directory(workspace_root: &Path, directory: &Path) -> Result<String> {
 
     let mut lines = Vec::new();
     for entry in entries {
-        let mut display = display_relative(workspace_root, &entry);
+        let mut display = display_path(&entry);
         if entry.is_dir() {
             display.push('/');
         }
@@ -349,10 +348,7 @@ fn read_directory(workspace_root: &Path, directory: &Path) -> Result<String> {
     }
 
     if lines.is_empty() {
-        return Ok(format!(
-            "Directory is empty: {}",
-            display_relative(workspace_root, directory)
-        ));
+        return Ok(format!("Directory is empty: {}", display_path(directory)));
     }
 
     Ok(lines.join("\n"))
@@ -377,16 +373,19 @@ fn format_file_slice(path: &str, content: &str, offset: usize, limit: usize) -> 
 fn resolve_optional_search_root(workspace_root: &Path, arguments: &Value) -> Result<PathBuf> {
     match get_optional_str(arguments, "path")? {
         Some(path) => resolve_workspace_path(workspace_root, &path),
-        None => Ok(workspace_root.to_path_buf()),
+        None => workspace_root.canonicalize().map_err(FluentCodeError::Io),
     }
 }
 
 fn resolve_workspace_path(workspace_root: &Path, path: &str) -> Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        workspace_root.join(path)
-    };
+    if !Path::new(path).is_absolute() {
+        return Err(FluentCodeError::Provider(format!(
+            "path '{}' must be an absolute path within the workspace",
+            path.replace('\\', "/")
+        )));
+    }
+
+    let candidate = PathBuf::from(path);
 
     canonicalize_within_workspace(workspace_root, &candidate)
 }
@@ -410,10 +409,8 @@ fn canonicalize_within_workspace(workspace_root: &Path, candidate: &Path) -> Res
     }
 }
 
-fn display_relative(workspace_root: &Path, path: &Path) -> String {
-    path.strip_prefix(workspace_root)
-        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))
+fn display_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn collect_files(root: &Path, workspace_root: &Path) -> Result<Vec<PathBuf>> {
@@ -444,7 +441,10 @@ fn collect_files(root: &Path, workspace_root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn matches_include_pattern(workspace_root: &Path, path: &Path, pattern: &str) -> Result<bool> {
-    let path = display_relative(workspace_root, path);
+    let path = path
+        .strip_prefix(workspace_root)
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| display_path(path));
     let escaped = regex::escape(pattern).replace("\\*", ".*");
     let regex = Regex::new(&format!("^{escaped}$"))
         .map_err(|error| FluentCodeError::Provider(format!("invalid include pattern: {error}")))?;
@@ -487,8 +487,8 @@ fn get_optional_usize(arguments: &Value, key: &str) -> Result<Option<usize>> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use fluent_code_provider::ProviderToolCall;
@@ -500,6 +500,19 @@ mod tests {
     fn current_dir_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn lock_current_dir() -> MutexGuard<'static, ()> {
+        current_dir_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn canonical_display(path: &Path) -> String {
+        path.canonicalize()
+            .expect("canonicalize test path")
+            .to_string_lossy()
+            .replace('\\', "/")
     }
 
     #[test]
@@ -518,10 +531,11 @@ mod tests {
 
     #[test]
     fn read_returns_line_numbered_file_content() {
-        let _guard = current_dir_lock().lock().expect("lock current dir");
+        let _guard = lock_current_dir();
         let workspace = unique_test_dir();
         fs::create_dir_all(&workspace).expect("create workspace");
-        fs::write(workspace.join("notes.txt"), "alpha\nbeta\ngamma\n").expect("write file");
+        let notes_path = workspace.join("notes.txt");
+        fs::write(&notes_path, "alpha\nbeta\ngamma\n").expect("write file");
 
         let original_dir = std::env::current_dir().expect("get current dir");
         std::env::set_current_dir(&workspace).expect("set current dir");
@@ -529,13 +543,17 @@ mod tests {
         let result = execute_built_in_tool(&ProviderToolCall {
             id: "call-1".to_string(),
             name: "read".to_string(),
-            arguments: serde_json::json!({ "path": "notes.txt", "offset": 2, "limit": 2 }),
+            arguments: serde_json::json!({
+                "path": notes_path.to_string_lossy().to_string(),
+                "offset": 2,
+                "limit": 2
+            }),
         })
         .expect("read tool result");
 
         std::env::set_current_dir(&original_dir).expect("restore current dir");
 
-        assert!(result.contains("<path>notes.txt</path>"));
+        assert!(result.contains(&format!("<path>{}</path>", canonical_display(&notes_path))));
         assert!(result.contains("2: beta"));
         assert!(result.contains("3: gamma"));
 
@@ -543,8 +561,34 @@ mod tests {
     }
 
     #[test]
+    fn read_rejects_relative_path() {
+        let _guard = lock_current_dir();
+        let workspace = unique_test_dir();
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let original_dir = std::env::current_dir().expect("get current dir");
+        std::env::set_current_dir(&workspace).expect("set current dir");
+
+        let error = execute_built_in_tool(&ProviderToolCall {
+            id: "call-1".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({ "path": "notes.txt" }),
+        })
+        .expect_err("read should reject relative path");
+
+        std::env::set_current_dir(&original_dir).expect("restore current dir");
+        assert!(
+            error
+                .to_string()
+                .contains("must be an absolute path within the workspace")
+        );
+
+        cleanup(workspace);
+    }
+
+    #[test]
     fn read_rejects_path_outside_workspace() {
-        let _guard = current_dir_lock().lock().expect("lock current dir");
+        let _guard = lock_current_dir();
         let workspace = unique_test_dir();
         fs::create_dir_all(&workspace).expect("create workspace");
         let outside_dir = std::env::temp_dir();
@@ -567,9 +611,10 @@ mod tests {
 
     #[test]
     fn read_missing_path_reports_not_accessible() {
-        let _guard = current_dir_lock().lock().expect("lock current dir");
+        let _guard = lock_current_dir();
         let workspace = unique_test_dir();
         fs::create_dir_all(&workspace).expect("create workspace");
+        let missing_path = workspace.join("missing.txt");
 
         let original_dir = std::env::current_dir().expect("get current dir");
         std::env::set_current_dir(&workspace).expect("set current dir");
@@ -577,7 +622,7 @@ mod tests {
         let error = execute_built_in_tool(&ProviderToolCall {
             id: "call-missing-read".to_string(),
             name: "read".to_string(),
-            arguments: serde_json::json!({ "path": "missing.txt" }),
+            arguments: serde_json::json!({ "path": missing_path.to_string_lossy().to_string() }),
         })
         .expect_err("read should fail for missing path");
 
@@ -589,12 +634,43 @@ mod tests {
     }
 
     #[test]
-    fn glob_returns_matching_relative_paths() {
-        let _guard = current_dir_lock().lock().expect("lock current dir");
+    fn read_canonicalizes_absolute_output_paths() {
+        let _guard = lock_current_dir();
+        let workspace = unique_test_dir();
+        fs::create_dir_all(workspace.join("nested")).expect("create dirs");
+        let canonical_path = workspace.join("nested/notes.txt");
+        fs::write(&canonical_path, "alpha\n").expect("write file");
+        let non_canonical_path = workspace.join("nested/../nested/notes.txt");
+
+        let original_dir = std::env::current_dir().expect("get current dir");
+        std::env::set_current_dir(&workspace).expect("set current dir");
+
+        let result = execute_built_in_tool(&ProviderToolCall {
+            id: "call-canonical-read".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({ "path": non_canonical_path.to_string_lossy().to_string() }),
+        })
+        .expect("read tool result");
+
+        std::env::set_current_dir(&original_dir).expect("restore current dir");
+
+        assert!(result.contains(&format!(
+            "<path>{}</path>",
+            canonical_display(&canonical_path)
+        )));
+
+        cleanup(workspace);
+    }
+
+    #[test]
+    fn glob_returns_matching_absolute_paths() {
+        let _guard = lock_current_dir();
         let workspace = unique_test_dir();
         fs::create_dir_all(workspace.join("src/nested")).expect("create dirs");
-        fs::write(workspace.join("src/main.rs"), "fn main() {}\n").expect("write main");
-        fs::write(workspace.join("src/nested/lib.rs"), "pub fn run() {}\n").expect("write lib");
+        let main_path = workspace.join("src/main.rs");
+        let lib_path = workspace.join("src/nested/lib.rs");
+        fs::write(&main_path, "fn main() {}\n").expect("write main");
+        fs::write(&lib_path, "pub fn run() {}\n").expect("write lib");
 
         let original_dir = std::env::current_dir().expect("get current dir");
         std::env::set_current_dir(&workspace).expect("set current dir");
@@ -608,22 +684,49 @@ mod tests {
 
         std::env::set_current_dir(&original_dir).expect("restore current dir");
 
-        assert!(result.contains("src/main.rs"));
-        assert!(result.contains("src/nested/lib.rs"));
+        assert!(result.contains(&canonical_display(&main_path)));
+        assert!(result.contains(&canonical_display(&lib_path)));
+
+        cleanup(workspace);
+    }
+
+    #[test]
+    fn glob_rejects_relative_search_root() {
+        let _guard = lock_current_dir();
+        let workspace = unique_test_dir();
+        fs::create_dir_all(workspace.join("src")).expect("create dirs");
+
+        let original_dir = std::env::current_dir().expect("get current dir");
+        std::env::set_current_dir(&workspace).expect("set current dir");
+
+        let error = execute_built_in_tool(&ProviderToolCall {
+            id: "call-glob-relative".to_string(),
+            name: "glob".to_string(),
+            arguments: serde_json::json!({
+                "pattern": "**/*.rs",
+                "path": "src"
+            }),
+        })
+        .expect_err("glob should reject relative search root");
+
+        std::env::set_current_dir(&original_dir).expect("restore current dir");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must be an absolute path within the workspace")
+        );
 
         cleanup(workspace);
     }
 
     #[test]
     fn grep_returns_matching_content_lines() {
-        let _guard = current_dir_lock().lock().expect("lock current dir");
+        let _guard = lock_current_dir();
         let workspace = unique_test_dir();
         fs::create_dir_all(workspace.join("src")).expect("create dirs");
-        fs::write(
-            workspace.join("src/main.rs"),
-            "fn alpha() {}\nfn beta() {}\n",
-        )
-        .expect("write file");
+        let main_path = workspace.join("src/main.rs");
+        fs::write(&main_path, "fn alpha() {}\nfn beta() {}\n").expect("write file");
 
         let original_dir = std::env::current_dir().expect("get current dir");
         std::env::set_current_dir(&workspace).expect("set current dir");
@@ -641,14 +744,47 @@ mod tests {
 
         std::env::set_current_dir(&original_dir).expect("restore current dir");
 
-        assert!(result.contains("src/main.rs:2: fn beta() {}"));
+        assert!(result.contains(&format!(
+            "{}:2: fn beta() {{}}",
+            canonical_display(&main_path)
+        )));
+
+        cleanup(workspace);
+    }
+
+    #[test]
+    fn grep_rejects_relative_search_root() {
+        let _guard = lock_current_dir();
+        let workspace = unique_test_dir();
+        fs::create_dir_all(workspace.join("src")).expect("create dirs");
+
+        let original_dir = std::env::current_dir().expect("get current dir");
+        std::env::set_current_dir(&workspace).expect("set current dir");
+
+        let error = execute_built_in_tool(&ProviderToolCall {
+            id: "call-grep-relative".to_string(),
+            name: "grep".to_string(),
+            arguments: serde_json::json!({
+                "pattern": "beta",
+                "path": "src"
+            }),
+        })
+        .expect_err("grep should reject relative search root");
+
+        std::env::set_current_dir(&original_dir).expect("restore current dir");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must be an absolute path within the workspace")
+        );
 
         cleanup(workspace);
     }
 
     #[test]
     fn grep_rejects_invalid_regex() {
-        let _guard = current_dir_lock().lock().expect("lock current dir");
+        let _guard = lock_current_dir();
         let workspace = unique_test_dir();
         fs::create_dir_all(&workspace).expect("create workspace");
 

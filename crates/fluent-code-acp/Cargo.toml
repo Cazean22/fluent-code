@@ -1,0 +1,17 @@
+[package]
+name = "fluent-code-acp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fluent-code-app = { path = "../fluent-code-app" }
+fluent-code-provider = { path = "../fluent-code-provider" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true

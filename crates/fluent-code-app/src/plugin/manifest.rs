@@ -651,7 +651,7 @@ fn parse_semverish(value: &str) -> [u64; 3] {
 mod tests {
     use std::fs;
     use std::path::Path;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
 
     use super::{FilesystemCapability, PluginManifest, TOOL_PLUGIN_API_VERSION};
 
@@ -832,12 +832,10 @@ input_schema = {{ type = "object" }}
     }
 
     fn unique_test_dir() -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-
-        std::env::temp_dir().join(format!("fluent-code-plugin-manifest-test-{nanos}"))
+        std::env::temp_dir().join(format!(
+            "fluent-code-plugin-manifest-test-{}",
+            Uuid::new_v4()
+        ))
     }
 
     fn cleanup(path: &Path) {

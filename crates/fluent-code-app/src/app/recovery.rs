@@ -6,8 +6,12 @@ use crate::app::delegation::{
 use crate::app::request_builder::build_provider_request;
 use crate::app::{AppState, Effect};
 use crate::session::model::{
-    ForegroundOwnerRecord, ForegroundPhase, RunStatus, ToolApprovalState, ToolExecutionState,
+    ForegroundOwnerRecord, ForegroundPhase, RunStatus, RunTerminalStopReason, ToolApprovalState,
+    ToolExecutionState,
 };
+
+const INTERRUPTED_RUNNING_TOOL_MESSAGE: &str =
+    "Tool execution was interrupted during restart recovery.";
 
 pub fn recover_startup_foreground(state: &mut AppState) -> Vec<Effect> {
     let Some(owner) = state.session.foreground_owner.clone() else {
@@ -64,13 +68,7 @@ fn recover_from_foreground_owner(
             }
         }
         ForegroundPhase::AwaitingToolApproval => recover_awaiting_tool_approval(state, owner),
-        ForegroundPhase::RunningTool => fail_closed_startup_recovery(
-            state,
-            format!(
-                "startup foreground recovery refuses to guess how to resume running tools for run {}",
-                owner.run_id
-            ),
-        ),
+        ForegroundPhase::RunningTool => interrupt_running_tool_recovery(state, owner),
     }
 }
 
@@ -137,6 +135,53 @@ fn recover_awaiting_tool_approval(
     Vec::new()
 }
 
+fn interrupt_running_tool_recovery(
+    state: &mut AppState,
+    owner: ForegroundOwnerRecord,
+) -> Vec<Effect> {
+    let interrupted_at = chrono::Utc::now();
+    let message = format!(
+        "startup foreground recovery refuses to guess how to resume running tools for run {}",
+        owner.run_id
+    );
+
+    for invocation in state
+        .session
+        .tool_invocations
+        .iter_mut()
+        .filter(|invocation| {
+            invocation.run_id == owner.run_id
+                && invocation.preceding_turn_id == owner.batch_anchor_turn_id
+                && invocation.approval_state == ToolApprovalState::Approved
+                && matches!(
+                    invocation.execution_state,
+                    ToolExecutionState::NotStarted | ToolExecutionState::Running
+                )
+        })
+    {
+        invocation.execution_state = ToolExecutionState::Failed;
+        invocation.error = Some(INTERRUPTED_RUNNING_TOOL_MESSAGE.to_string());
+        invocation.completed_at = Some(interrupted_at);
+
+        if let Some(delegation) = invocation.delegation.as_mut()
+            && delegation.status == crate::session::model::TaskDelegationStatus::Running
+        {
+            delegation.status = crate::session::model::TaskDelegationStatus::Failed;
+        }
+    }
+
+    state.session.upsert_run_with_stop_reason(
+        owner.run_id,
+        RunStatus::Failed,
+        Some(RunTerminalStopReason::Interrupted),
+    );
+    state.session.updated_at = interrupted_at;
+    state.clear_foreground();
+    state.status = crate::app::AppStatus::Error(message);
+
+    vec![Effect::PersistSession]
+}
+
 fn fail_closed_startup_recovery(state: &mut AppState, message: String) -> Vec<Effect> {
     warn!(
         session_id = %state.session.id,
@@ -157,8 +202,8 @@ mod tests {
     use crate::agent::TASK_TOOL_NAME;
     use crate::app::{AppState, AppStatus, Effect, RESTART_INTERRUPTED_TASK_RESULT};
     use crate::session::model::{
-        ForegroundOwnerRecord, ForegroundPhase, Role, RunRecord, RunStatus, Session,
-        TaskDelegationRecord, TaskDelegationStatus, ToolApprovalState, ToolExecutionState,
+        ForegroundOwnerRecord, ForegroundPhase, Role, RunRecord, RunStatus, RunTerminalStopReason,
+        Session, TaskDelegationRecord, TaskDelegationStatus, ToolApprovalState, ToolExecutionState,
         ToolInvocationRecord, ToolSource, Turn,
     };
 
@@ -210,10 +255,28 @@ mod tests {
 
         let effects = recover_startup_foreground(&mut state);
 
-        assert!(effects.is_empty());
+        assert!(matches!(effects.as_slice(), [Effect::PersistSession]));
         assert!(matches!(state.status, AppStatus::Error(_)));
         assert!(state.active_run_id.is_none());
-        assert!(state.session.foreground_owner.is_some());
+        assert!(state.session.foreground_owner.is_none());
+        assert_eq!(
+            state.session.tool_invocations[0].execution_state,
+            ToolExecutionState::Failed
+        );
+        assert_eq!(
+            state.session.tool_invocations[0].error.as_deref(),
+            Some(super::INTERRUPTED_RUNNING_TOOL_MESSAGE)
+        );
+        let run = state
+            .session
+            .find_run(state.session.tool_invocations[0].run_id)
+            .expect("run persisted");
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(
+            run.terminal_stop_reason,
+            Some(RunTerminalStopReason::Interrupted)
+        );
+        assert!(run.terminal_sequence.is_some());
     }
 
     #[test]
@@ -237,20 +300,26 @@ mod tests {
     fn root_generating_session() -> Session {
         let mut session = Session::new("root generating");
         let run_id = Uuid::new_v4();
+        let run_sequence = session.allocate_replay_sequence();
         session.runs.push(RunRecord {
             id: run_id,
             status: RunStatus::InProgress,
             parent_run_id: None,
             parent_tool_invocation_id: None,
+            created_sequence: run_sequence,
+            terminal_sequence: None,
+            terminal_stop_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
+        let turn_sequence = session.allocate_replay_sequence();
         session.turns.push(Turn {
             id: Uuid::new_v4(),
             run_id,
             role: Role::User,
             content: "resume me".to_string(),
             reasoning: String::new(),
+            sequence_number: turn_sequence,
             timestamp: Utc::now(),
         });
         session.foreground_owner = Some(ForegroundOwnerRecord {
@@ -265,30 +334,39 @@ mod tests {
         let mut session = Session::new("awaiting approval");
         let run_id = Uuid::new_v4();
         let assistant_turn_id = Uuid::new_v4();
+        let run_sequence = session.allocate_replay_sequence();
         session.runs.push(RunRecord {
             id: run_id,
             status: RunStatus::InProgress,
             parent_run_id: None,
             parent_tool_invocation_id: None,
+            created_sequence: run_sequence,
+            terminal_sequence: None,
+            terminal_stop_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
+        let user_turn_sequence = session.allocate_replay_sequence();
         session.turns.push(Turn {
             id: Uuid::new_v4(),
             run_id,
             role: Role::User,
             content: "read the file".to_string(),
             reasoning: String::new(),
+            sequence_number: user_turn_sequence,
             timestamp: Utc::now(),
         });
+        let assistant_turn_sequence = session.allocate_replay_sequence();
         session.turns.push(Turn {
             id: assistant_turn_id,
             run_id,
             role: Role::Assistant,
             content: "I'll use read".to_string(),
             reasoning: String::new(),
+            sequence_number: assistant_turn_sequence,
             timestamp: Utc::now(),
         });
+        let invocation_sequence = session.allocate_replay_sequence();
         session.tool_invocations.push(ToolInvocationRecord {
             id: Uuid::new_v4(),
             run_id,
@@ -302,6 +380,7 @@ mod tests {
             result: None,
             error: None,
             delegation: None,
+            sequence_number: invocation_sequence,
             requested_at: Utc::now(),
             approved_at: None,
             completed_at: None,
@@ -333,38 +412,51 @@ mod tests {
         let child_run_id = Uuid::new_v4();
         let task_invocation_id = Uuid::new_v4();
         let assistant_turn_id = Uuid::new_v4();
+        let parent_run_sequence = session.allocate_replay_sequence();
         session.runs.push(RunRecord {
             id: parent_run_id,
             status: RunStatus::InProgress,
             parent_run_id: None,
             parent_tool_invocation_id: None,
+            created_sequence: parent_run_sequence,
+            terminal_sequence: None,
+            terminal_stop_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
+        let child_run_sequence = session.allocate_replay_sequence();
         session.runs.push(RunRecord {
             id: child_run_id,
             status: RunStatus::InProgress,
             parent_run_id: Some(parent_run_id),
             parent_tool_invocation_id: Some(task_invocation_id),
+            created_sequence: child_run_sequence,
+            terminal_sequence: None,
+            terminal_stop_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
+        let user_turn_sequence = session.allocate_replay_sequence();
         session.turns.push(Turn {
             id: Uuid::new_v4(),
             run_id: parent_run_id,
             role: Role::User,
             content: "delegate".to_string(),
             reasoning: String::new(),
+            sequence_number: user_turn_sequence,
             timestamp: Utc::now(),
         });
+        let assistant_turn_sequence = session.allocate_replay_sequence();
         session.turns.push(Turn {
             id: assistant_turn_id,
             run_id: parent_run_id,
             role: Role::Assistant,
             content: "I will delegate".to_string(),
             reasoning: String::new(),
+            sequence_number: assistant_turn_sequence,
             timestamp: Utc::now(),
         });
+        let invocation_sequence = session.allocate_replay_sequence();
         session.tool_invocations.push(ToolInvocationRecord {
             id: task_invocation_id,
             run_id: parent_run_id,
@@ -383,6 +475,7 @@ mod tests {
                 prompt: Some("Inspect startup recovery".to_string()),
                 status: TaskDelegationStatus::Running,
             }),
+            sequence_number: invocation_sequence,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: None,

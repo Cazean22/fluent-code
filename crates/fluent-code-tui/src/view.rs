@@ -495,7 +495,9 @@ fn render_run_marker_row(marker: &RunMarkerRow) -> Vec<Line<'static>> {
         RunMarkerKind::AwaitingApproval => TUI_THEME.warning,
         RunMarkerKind::Running => TUI_THEME.info,
         RunMarkerKind::Completed => TUI_THEME.success,
-        RunMarkerKind::Failed | RunMarkerKind::Cancelled => TUI_THEME.error,
+        RunMarkerKind::Failed | RunMarkerKind::Cancelled | RunMarkerKind::Interrupted => {
+            TUI_THEME.error
+        }
     };
 
     vec![Line::from(vec![
@@ -1130,6 +1132,7 @@ mod tests {
             role: Role::Assistant,
             content: "Investigating session storage.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -1147,6 +1150,7 @@ mod tests {
             result: None,
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: None,
             completed_at: None,
@@ -1171,6 +1175,7 @@ mod tests {
             role: Role::Assistant,
             content: "Final answer.".to_string(),
             reasoning: "First inspect the state transitions.".to_string(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         });
 
@@ -1196,6 +1201,7 @@ mod tests {
             role: Role::Assistant,
             content: "Reading project files.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -1213,6 +1219,7 @@ mod tests {
             result: Some("ok".to_string()),
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1230,6 +1237,7 @@ mod tests {
             result: Some("ok".to_string()),
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1257,6 +1265,7 @@ mod tests {
             role: Role::Assistant,
             content: "Waiting on tools.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -1274,6 +1283,7 @@ mod tests {
             result: None,
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: None,
             completed_at: None,
@@ -1302,6 +1312,7 @@ mod tests {
             role: Role::Assistant,
             content: "Still working.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         });
 
@@ -1328,6 +1339,7 @@ mod tests {
             role: Role::Assistant,
             content: "Done.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         });
         session.upsert_run(run_id, RunStatus::Completed);
@@ -1352,6 +1364,7 @@ mod tests {
             role: Role::Assistant,
             content: "Oops.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         });
         session.upsert_run(run_id, RunStatus::Failed);
@@ -1367,6 +1380,35 @@ mod tests {
     }
 
     #[test]
+    fn conversation_lines_renders_interrupted_marker_inline() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("interrupted marker");
+        session.turns.push(Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "Stopped.".to_string(),
+            reasoning: String::new(),
+            sequence_number: 1,
+            timestamp: Utc::now(),
+        });
+        session.upsert_run_with_stop_reason(
+            run_id,
+            RunStatus::Failed,
+            Some(fluent_code_app::session::model::RunTerminalStopReason::Interrupted),
+        );
+
+        let state = AppState::new(session);
+        let text = conversation_lines(&state, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("interrupted"));
+    }
+
+    #[test]
     fn conversation_lines_collapses_paragraph_lines_but_preserves_blank_breaks() {
         let run_id = Uuid::new_v4();
         let mut session = Session::new("paragraph formatting");
@@ -1376,6 +1418,7 @@ mod tests {
             role: Role::Assistant,
             content: "first line\ncontinues here\n\nnext paragraph".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         });
 
@@ -1399,6 +1442,7 @@ mod tests {
             role: Role::Assistant,
             content: "- first item\n2. second item\n```rust\nfn main() {}\n```".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         });
 
@@ -1424,6 +1468,7 @@ mod tests {
             content: "# Heading\n> quoted text\nUse **bold** and `inline_code` plus [docs](https://example.com)."
                 .to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         });
 
@@ -1451,6 +1496,7 @@ mod tests {
             role: Role::Assistant,
             content: "Inspecting results.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -1468,6 +1514,7 @@ mod tests {
             result: Some("line one\nline two\nline three\nline four".to_string()),
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1493,6 +1540,7 @@ mod tests {
             role: Role::Assistant,
             content: "Inspecting results.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -1510,6 +1558,7 @@ mod tests {
             result: Some("useful success payload".to_string()),
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1538,6 +1587,7 @@ mod tests {
             role: Role::Assistant,
             content: "Inspecting results.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -1555,6 +1605,7 @@ mod tests {
             result: Some("useful success payload".to_string()),
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1582,6 +1633,7 @@ mod tests {
             role: Role::Assistant,
             content: "Reading project files.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -1603,6 +1655,7 @@ mod tests {
                 result: Some(result.to_string()),
                 error: None,
                 delegation: None,
+                sequence_number: 1,
                 requested_at: Utc::now(),
                 approved_at: Some(Utc::now()),
                 completed_at: Some(Utc::now()),
@@ -1632,6 +1685,7 @@ mod tests {
             role: Role::Assistant,
             content: "Reading project files.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -1649,6 +1703,7 @@ mod tests {
             result: Some("alpha\nbeta\ngamma\ndelta".to_string()),
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1666,6 +1721,7 @@ mod tests {
             result: Some("one\ntwo\nthree\nfour".to_string()),
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1692,6 +1748,7 @@ mod tests {
             role: Role::Assistant,
             content: "I will inspect the files first.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -1709,6 +1766,7 @@ mod tests {
             result: None,
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: None,
             completed_at: None,
@@ -1739,6 +1797,7 @@ mod tests {
             role: Role::Assistant,
             content: "Inspecting grouped tool output.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -1756,6 +1815,7 @@ mod tests {
             result: Some("first line\nsecond line\nthird line\nfourth line".to_string()),
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1773,6 +1833,7 @@ mod tests {
             result: Some("alpha\nbeta\ngamma\ndelta".to_string()),
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1801,6 +1862,7 @@ mod tests {
             role: Role::Assistant,
             content: "Using project plugin tools.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -1823,6 +1885,7 @@ mod tests {
             result: Some("found matches".to_string()),
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1849,6 +1912,7 @@ mod tests {
             role: Role::Assistant,
             content: "Using project plugin tools.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -1871,6 +1935,7 @@ mod tests {
             result: Some("found matches".to_string()),
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -1897,6 +1962,7 @@ mod tests {
             role: Role::Assistant,
             content: "Using built in tools.".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -1914,6 +1980,7 @@ mod tests {
             result: Some("ok".to_string()),
             error: None,
             delegation: None,
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -2049,6 +2116,7 @@ mod tests {
             role: Role::Assistant,
             content: "Delegate this task".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         };
 
@@ -2059,6 +2127,7 @@ mod tests {
             role: Role::User,
             content: "Inspect child flow".to_string(),
             reasoning: String::new(),
+            sequence_number: 1,
             timestamp: Utc::now(),
         });
         session.tool_invocations.push(ToolInvocationRecord {
@@ -2082,6 +2151,7 @@ mod tests {
                 prompt: Some("Inspect session persistence state".to_string()),
                 status: fluent_code_app::session::model::TaskDelegationStatus::Running,
             }),
+            sequence_number: 1,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: None,

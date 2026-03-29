@@ -14,6 +14,7 @@ const DATA_DIR_CONFIG_FILE: &str = "config.toml";
 const DEFAULT_MODEL_PROVIDER: &str = "mock";
 const DEFAULT_MODEL: &str = "gpt-4.1-mini";
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful coding assistant.";
+const DEFAULT_ACP_PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -23,7 +24,28 @@ pub struct Config {
     pub model: ModelConfig,
     pub agents: Option<Vec<AgentConfig>>,
     pub plugins: PluginConfig,
+    pub acp: AcpConfig,
     pub model_providers: HashMap<String, ProviderConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpConfig {
+    pub protocol_version: u16,
+    pub auth_methods: Vec<AcpAuthMethodConfig>,
+    pub session_defaults: AcpSessionDefaultsConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpAuthMethodConfig {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpSessionDefaultsConfig {
+    pub system_prompt: String,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +161,12 @@ impl Config {
             config.model.system_prompt = system_prompt;
         }
 
+        config.acp = if let Some(acp) = raw.acp {
+            AcpConfig::from_raw(acp, &config.model)?
+        } else {
+            AcpConfig::default_with_model(&config.model)
+        };
+
         if !raw.model_providers.is_empty() {
             config.model_providers = raw.model_providers;
         }
@@ -147,18 +175,22 @@ impl Config {
     }
 
     fn default_with_base_dir(base_dir: &Path) -> Self {
+        let data_dir = base_dir.join(".fluent-code");
+        let model = ModelConfig {
+            provider: DEFAULT_MODEL_PROVIDER.to_string(),
+            model: DEFAULT_MODEL.to_string(),
+            reasoning_effort: None,
+            system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
+        };
+
         Self {
             config_path: None,
-            data_dir: base_dir.join(".fluent-code"),
-            logging: LoggingConfig::default_with_data_dir(&base_dir.join(".fluent-code")),
-            model: ModelConfig {
-                provider: DEFAULT_MODEL_PROVIDER.to_string(),
-                model: DEFAULT_MODEL.to_string(),
-                reasoning_effort: None,
-                system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
-            },
+            data_dir: data_dir.clone(),
+            logging: LoggingConfig::default_with_data_dir(&data_dir),
+            model: model.clone(),
             agents: None,
-            plugins: PluginConfig::default_with_paths(base_dir, &base_dir.join(".fluent-code")),
+            plugins: PluginConfig::default_with_paths(base_dir, &data_dir),
+            acp: AcpConfig::default_with_model(&model),
             model_providers: HashMap::new(),
         }
     }
@@ -170,6 +202,7 @@ struct RawConfig {
     logging: Option<RawLoggingConfig>,
     agents: Option<Vec<RawAgentConfig>>,
     plugins: Option<RawPluginConfig>,
+    acp: Option<RawAcpConfig>,
     model_provider: Option<String>,
     model: Option<String>,
     model_reasoning_effort: Option<String>,
@@ -216,6 +249,107 @@ struct RawAgentConfig {
     tools_denied: Option<Vec<String>>,
     #[serde(default)]
     delegation_targets: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAcpConfig {
+    protocol_version: Option<u16>,
+    #[serde(default)]
+    auth_methods: Vec<RawAcpAuthMethodConfig>,
+    session_defaults: Option<RawAcpSessionDefaultsConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAcpAuthMethodConfig {
+    id: String,
+    name: String,
+    description: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAcpSessionDefaultsConfig {
+    system_prompt: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+impl AcpConfig {
+    fn default_with_model(model: &ModelConfig) -> Self {
+        Self {
+            protocol_version: DEFAULT_ACP_PROTOCOL_VERSION,
+            auth_methods: Vec::new(),
+            session_defaults: AcpSessionDefaultsConfig::default_with_model(model),
+        }
+    }
+
+    fn from_raw(raw: RawAcpConfig, model: &ModelConfig) -> Result<Self> {
+        let defaults = Self::default_with_model(model);
+
+        Ok(Self {
+            protocol_version: raw
+                .protocol_version
+                .map(validate_acp_protocol_version)
+                .transpose()?
+                .unwrap_or(defaults.protocol_version),
+            auth_methods: raw
+                .auth_methods
+                .into_iter()
+                .map(AcpAuthMethodConfig::from_raw)
+                .collect::<Result<Vec<_>>>()?,
+            session_defaults: AcpSessionDefaultsConfig::from_raw(raw.session_defaults, model)?,
+        })
+    }
+}
+
+impl AcpAuthMethodConfig {
+    fn from_raw(raw: RawAcpAuthMethodConfig) -> Result<Self> {
+        let id = raw.id.trim();
+        if id.is_empty() {
+            return Err(FluentCodeError::Config(
+                "acp.auth_methods entries require a non-empty id".to_string(),
+            ));
+        }
+
+        let name = raw.name.trim();
+        if name.is_empty() {
+            return Err(FluentCodeError::Config(
+                "acp.auth_methods entries require a non-empty name".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: raw.description,
+        })
+    }
+}
+
+impl AcpSessionDefaultsConfig {
+    fn default_with_model(model: &ModelConfig) -> Self {
+        Self {
+            system_prompt: model.system_prompt.clone(),
+            reasoning_effort: model.reasoning_effort.clone(),
+        }
+    }
+
+    fn from_raw(raw: Option<RawAcpSessionDefaultsConfig>, model: &ModelConfig) -> Result<Self> {
+        let defaults = Self::default_with_model(model);
+        let Some(raw) = raw else {
+            return Ok(defaults);
+        };
+
+        Ok(Self {
+            system_prompt: raw.system_prompt.unwrap_or(defaults.system_prompt),
+            reasoning_effort: raw
+                .reasoning_effort
+                .map(validate_model_reasoning_effort)
+                .transpose()?
+                .or(defaults.reasoning_effort),
+        })
+    }
 }
 
 impl LoggingConfig {
@@ -321,6 +455,16 @@ fn validate_model_reasoning_effort(value: String) -> Result<String> {
     )))
 }
 
+fn validate_acp_protocol_version(value: u16) -> Result<u16> {
+    if value == DEFAULT_ACP_PROTOCOL_VERSION {
+        return Ok(value);
+    }
+
+    Err(FluentCodeError::Config(format!(
+        "unsupported acp.protocol_version value '{value}'; expected {DEFAULT_ACP_PROTOCOL_VERSION}"
+    )))
+}
+
 fn is_supported_reasoning_effort(value: &str) -> bool {
     matches!(
         value,
@@ -334,7 +478,9 @@ mod tests {
 
     use fluent_code_provider::WireApi;
 
-    use super::{AgentConfig, Config, LoggingConfig};
+    use super::{
+        AcpAuthMethodConfig, AgentConfig, Config, LoggingConfig, validate_acp_protocol_version,
+    };
     use crate::FluentCodeError;
 
     #[test]
@@ -422,8 +568,75 @@ api_key_envs = ["OPENAI_API_KEY", "OPENAI_FALLBACK_KEY"]
             config.model.system_prompt,
             "You are a helpful coding assistant."
         );
+        assert_eq!(config.acp.protocol_version, 1);
+        assert!(config.acp.auth_methods.is_empty());
+        assert_eq!(
+            config.acp.session_defaults.system_prompt,
+            "You are a helpful coding assistant."
+        );
+        assert!(config.acp.session_defaults.reasoning_effort.is_none());
         assert!(config.agents.is_none());
         assert!(config.model_providers.is_empty());
+    }
+
+    #[test]
+    fn acp_defaults_follow_model_settings_when_not_overridden() {
+        let config = Config::from_toml_str(
+            r#"
+model_reasoning_effort = "medium"
+system_prompt = "Model default prompt"
+"#,
+            Path::new("/tmp/fluent-code-config"),
+        )
+        .expect("parse config with model defaults");
+
+        assert_eq!(
+            config.acp.session_defaults.system_prompt,
+            "Model default prompt"
+        );
+        assert_eq!(
+            config.acp.session_defaults.reasoning_effort.as_deref(),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn parses_acp_config_settings() {
+        let config = Config::from_toml_str(
+            r#"
+[acp]
+protocol_version = 1
+
+[[acp.auth_methods]]
+id = "api_key"
+name = "API key"
+description = "Provide a bearer token."
+
+[acp.session_defaults]
+system_prompt = "ACP session prompt"
+reasoning_effort = "high"
+"#,
+            Path::new("/tmp/fluent-code-config"),
+        )
+        .expect("parse acp config");
+
+        assert_eq!(config.acp.protocol_version, 1);
+        assert_eq!(
+            config.acp.auth_methods,
+            vec![AcpAuthMethodConfig {
+                id: "api_key".to_string(),
+                name: "API key".to_string(),
+                description: Some("Provide a bearer token.".to_string()),
+            }]
+        );
+        assert_eq!(
+            config.acp.session_defaults.system_prompt,
+            "ACP session prompt"
+        );
+        assert_eq!(
+            config.acp.session_defaults.reasoning_effort.as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
@@ -454,6 +667,43 @@ model_reasoning_effort = " High "
         .expect("supported reasoning effort should parse after normalization");
 
         assert_eq!(config.model.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn rejects_unsupported_acp_protocol_version() {
+        let error = Config::from_toml_str(
+            r#"
+[acp]
+protocol_version = 99
+"#,
+            Path::new("/tmp/fluent-code-config"),
+        )
+        .expect_err("unsupported ACP protocol version should fail");
+
+        assert!(matches!(
+            error,
+            FluentCodeError::Config(message)
+                if message == "unsupported acp.protocol_version value '99'; expected 1"
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_acp_config_fields() {
+        let error = Config::from_toml_str(
+            r#"
+[acp]
+session_list = true
+"#,
+            Path::new("/tmp/fluent-code-config"),
+        )
+        .expect_err("unsupported ACP config field should fail");
+
+        assert!(matches!(error, FluentCodeError::Toml(_)));
+    }
+
+    #[test]
+    fn validate_acp_protocol_version_accepts_supported_version() {
+        assert_eq!(validate_acp_protocol_version(1).unwrap(), 1);
     }
 
     #[test]

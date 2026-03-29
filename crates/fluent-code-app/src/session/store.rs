@@ -177,17 +177,19 @@ impl SessionStore for FsSessionStore {
         let metadata: SessionMetadata = serde_json::from_str(&fs::read_to_string(meta_path)?)?;
         let turns = self.read_turns(&self.turns_path(id))?;
 
-        let session = Session {
+        let mut session = Session {
             id: metadata.id,
             title: metadata.title,
             created_at: metadata.created_at,
             updated_at: metadata.updated_at,
+            next_replay_sequence: metadata.next_replay_sequence,
             permissions: metadata.permissions,
             runs: metadata.runs,
             turns,
             tool_invocations: metadata.tool_invocations,
             foreground_owner: metadata.foreground_owner,
         };
+        session.normalize_persistence();
 
         info!(
             session_id = %session.id,
@@ -255,6 +257,8 @@ struct SessionMetadata {
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
+    next_replay_sequence: crate::session::model::ReplaySequence,
+    #[serde(default)]
     permissions: crate::session::model::SessionPermissionState,
     #[serde(default)]
     runs: Vec<RunRecord>,
@@ -271,6 +275,7 @@ impl From<&Session> for SessionMetadata {
             title: session.title.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
+            next_replay_sequence: session.next_replay_sequence,
             permissions: session.permissions.clone(),
             runs: session.runs.clone(),
             tool_invocations: session.tool_invocations.clone(),
@@ -290,9 +295,9 @@ mod tests {
     use super::{FsSessionStore, SessionStore};
     use crate::error::FluentCodeError;
     use crate::session::model::{
-        ForegroundOwnerRecord, ForegroundPhase, Role, Session, TaskDelegationRecord,
-        TaskDelegationStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
-        ToolSource, Turn,
+        ForegroundOwnerRecord, ForegroundPhase, Role, RunStatus, RunTerminalStopReason, Session,
+        TaskDelegationRecord, TaskDelegationStatus, ToolApprovalState, ToolExecutionState,
+        ToolInvocationRecord, ToolSource, Turn,
     };
 
     #[test]
@@ -335,12 +340,14 @@ mod tests {
         let store = FsSessionStore::new(root.clone());
 
         let mut session = Session::new("test session");
+        let turn_sequence = session.allocate_replay_sequence();
         session.turns.push(Turn {
             id: Uuid::new_v4(),
             run_id: Uuid::new_v4(),
             role: Role::User,
             content: "hello".to_string(),
             reasoning: String::new(),
+            sequence_number: turn_sequence,
             timestamp: Utc::now(),
         });
 
@@ -486,6 +493,7 @@ mod tests {
         let store = FsSessionStore::new(root.clone());
 
         let mut session = Session::new("tool session");
+        let invocation_sequence = session.allocate_replay_sequence();
         session.tool_invocations.push(ToolInvocationRecord {
             id: Uuid::new_v4(),
             run_id: Uuid::new_v4(),
@@ -499,6 +507,7 @@ mod tests {
             result: Some("HELLO".to_string()),
             error: None,
             delegation: None,
+            sequence_number: invocation_sequence,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
@@ -584,6 +593,7 @@ mod tests {
         let store = FsSessionStore::new(root.clone());
 
         let mut session = Session::new("delegated tool session");
+        let invocation_sequence = session.allocate_replay_sequence();
         session.tool_invocations.push(ToolInvocationRecord {
             id: Uuid::new_v4(),
             run_id: Uuid::new_v4(),
@@ -602,6 +612,7 @@ mod tests {
                 prompt: Some("Inspect state".to_string()),
                 status: TaskDelegationStatus::Running,
             }),
+            sequence_number: invocation_sequence,
             requested_at: Utc::now(),
             approved_at: Some(Utc::now()),
             completed_at: None,
@@ -622,6 +633,110 @@ mod tests {
         assert!(!saved.contains("\"delegation_prompt\""));
         assert!(saved.contains("\"child_run_id\":"));
         assert!(saved.contains("\"status\": \"running\""));
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn save_and_load_preserves_replay_sequence_order_and_stop_reason() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+
+        let mut session = Session::new("ordered replay session");
+        let run_id = Uuid::new_v4();
+        let shared_timestamp = Utc::now();
+        session.upsert_run(run_id, RunStatus::InProgress);
+
+        let assistant_turn_id = Uuid::new_v4();
+        let first_turn_sequence = session.allocate_replay_sequence();
+        session.turns.push(Turn {
+            id: assistant_turn_id,
+            run_id,
+            role: Role::Assistant,
+            content: "second in time, first in replay".to_string(),
+            reasoning: String::new(),
+            sequence_number: first_turn_sequence,
+            timestamp: shared_timestamp + chrono::Duration::seconds(2),
+        });
+        let tool_sequence = session.allocate_replay_sequence();
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
+            arguments: serde_json::json!({ "path": "src/main.rs" }),
+            preceding_turn_id: Some(assistant_turn_id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("ok".to_string()),
+            error: None,
+            delegation: None,
+            sequence_number: tool_sequence,
+            requested_at: shared_timestamp - chrono::Duration::seconds(5),
+            approved_at: Some(shared_timestamp - chrono::Duration::seconds(4)),
+            completed_at: Some(shared_timestamp - chrono::Duration::seconds(3)),
+        });
+        let second_turn_sequence = session.allocate_replay_sequence();
+        session.turns.push(Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "earlier in time, later in replay".to_string(),
+            reasoning: String::new(),
+            sequence_number: second_turn_sequence,
+            timestamp: shared_timestamp - chrono::Duration::seconds(10),
+        });
+        session.upsert_run_with_stop_reason(
+            run_id,
+            RunStatus::Failed,
+            Some(RunTerminalStopReason::Interrupted),
+        );
+
+        store
+            .create(&session)
+            .expect("create ordered replay session");
+        let loaded = store
+            .load(&session.id)
+            .expect("load ordered replay session");
+
+        let mut replay_items = loaded
+            .turns
+            .iter()
+            .map(|turn| (turn.sequence_number, format!("turn:{}", turn.content)))
+            .chain(loaded.tool_invocations.iter().map(|invocation| {
+                (
+                    invocation.sequence_number,
+                    format!("tool:{}", invocation.tool_name),
+                )
+            }))
+            .collect::<Vec<_>>();
+        replay_items.sort_by_key(|(sequence_number, _)| *sequence_number);
+
+        assert_eq!(
+            replay_items,
+            vec![
+                (
+                    loaded.turns[0].sequence_number,
+                    "turn:second in time, first in replay".to_string(),
+                ),
+                (
+                    loaded.tool_invocations[0].sequence_number,
+                    "tool:read".to_string(),
+                ),
+                (
+                    loaded.turns[1].sequence_number,
+                    "turn:earlier in time, later in replay".to_string(),
+                ),
+            ]
+        );
+        let run = loaded.find_run(run_id).expect("run restored");
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(
+            run.terminal_stop_reason,
+            Some(RunTerminalStopReason::Interrupted)
+        );
+        assert!(run.terminal_sequence.is_some());
 
         cleanup(root);
     }

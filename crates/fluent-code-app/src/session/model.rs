@@ -8,6 +8,9 @@ pub type SessionId = Uuid;
 pub type TurnId = Uuid;
 pub type RunId = Uuid;
 pub type ToolInvocationId = Uuid;
+pub type ReplaySequence = u64;
+
+const FIRST_REPLAY_SEQUENCE: ReplaySequence = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -15,6 +18,8 @@ pub struct Session {
     pub title: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default = "default_next_replay_sequence")]
+    pub next_replay_sequence: ReplaySequence,
     #[serde(default)]
     pub permissions: SessionPermissionState,
     #[serde(default)]
@@ -36,6 +41,7 @@ impl Session {
             title: title.into(),
             created_at: now,
             updated_at: now,
+            next_replay_sequence: default_next_replay_sequence(),
             permissions: SessionPermissionState::default(),
             runs: Vec::new(),
             turns: Vec::new(),
@@ -66,19 +72,77 @@ impl Session {
     }
 
     pub fn upsert_run(&mut self, run_id: RunId, status: RunStatus) {
-        if let Some(run) = self.runs.iter_mut().find(|run| run.id == run_id) {
+        self.upsert_run_with_parent_and_stop_reason(run_id, status, None, None, None);
+    }
+
+    pub fn upsert_run_with_stop_reason(
+        &mut self,
+        run_id: RunId,
+        status: RunStatus,
+        stop_reason: Option<RunTerminalStopReason>,
+    ) {
+        self.upsert_run_with_parent_and_stop_reason(run_id, status, None, None, stop_reason);
+    }
+
+    fn upsert_run_with_parent_and_stop_reason(
+        &mut self,
+        run_id: RunId,
+        status: RunStatus,
+        parent_run_id: Option<RunId>,
+        parent_tool_invocation_id: Option<ToolInvocationId>,
+        stop_reason: Option<RunTerminalStopReason>,
+    ) {
+        let resolved_stop_reason = stop_reason.or_else(|| status.default_terminal_stop_reason());
+        let now = Utc::now();
+
+        if let Some(run_index) = self.runs.iter().position(|run| run.id == run_id) {
+            let needs_terminal_sequence = {
+                let run = &self.runs[run_index];
+                status.is_terminal()
+                    && (run.terminal_sequence.is_none()
+                        || run.terminal_stop_reason != resolved_stop_reason)
+            };
+            let terminal_sequence =
+                needs_terminal_sequence.then(|| self.allocate_replay_sequence());
+
+            let run = &mut self.runs[run_index];
             run.status = status;
-            run.updated_at = Utc::now();
+            if parent_run_id.is_some() || run.parent_run_id.is_none() {
+                run.parent_run_id = parent_run_id;
+            }
+            if parent_tool_invocation_id.is_some() || run.parent_tool_invocation_id.is_none() {
+                run.parent_tool_invocation_id = parent_tool_invocation_id;
+            }
+            run.updated_at = now;
+
+            if status.is_terminal() {
+                if let Some(terminal_sequence) = terminal_sequence {
+                    run.terminal_sequence = Some(terminal_sequence);
+                }
+                run.terminal_stop_reason = resolved_stop_reason;
+            } else {
+                run.terminal_sequence = None;
+                run.terminal_stop_reason = None;
+            }
+
             return;
         }
+
+        let created_sequence = self.allocate_replay_sequence();
+        let terminal_sequence = status
+            .is_terminal()
+            .then(|| self.allocate_replay_sequence());
 
         self.runs.push(RunRecord {
             id: run_id,
             status,
-            parent_run_id: None,
-            parent_tool_invocation_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            parent_run_id,
+            parent_tool_invocation_id,
+            created_sequence,
+            terminal_sequence,
+            terminal_stop_reason: resolved_stop_reason,
+            created_at: now,
+            updated_at: now,
         });
     }
 
@@ -89,26 +153,41 @@ impl Session {
         parent_run_id: Option<RunId>,
         parent_tool_invocation_id: Option<ToolInvocationId>,
     ) {
-        if let Some(run) = self.runs.iter_mut().find(|run| run.id == run_id) {
-            run.status = status;
-            run.parent_run_id = parent_run_id;
-            run.parent_tool_invocation_id = parent_tool_invocation_id;
-            run.updated_at = Utc::now();
-            return;
-        }
-
-        self.runs.push(RunRecord {
-            id: run_id,
+        self.upsert_run_with_parent_and_stop_reason(
+            run_id,
             status,
             parent_run_id,
             parent_tool_invocation_id,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        });
+            None,
+        );
     }
 
     pub fn latest_run_status(&self) -> Option<RunStatus> {
-        self.runs.last().map(|run| run.status)
+        self.runs
+            .iter()
+            .max_by_key(|run| run.latest_replay_sequence())
+            .map(|run| run.status)
+    }
+
+    pub fn allocate_replay_sequence(&mut self) -> ReplaySequence {
+        let sequence = self.next_replay_sequence.max(FIRST_REPLAY_SEQUENCE);
+        self.next_replay_sequence = sequence.saturating_add(1);
+        sequence
+    }
+
+    pub fn normalize_persistence(&mut self) {
+        if self.has_legacy_replay_metadata() {
+            self.resequence_from_legacy_timestamps();
+        }
+
+        for run in &mut self.runs {
+            run.normalize_terminal_stop_reason();
+        }
+
+        self.next_replay_sequence = self
+            .max_replay_sequence()
+            .map(|sequence| sequence.saturating_add(1))
+            .unwrap_or(FIRST_REPLAY_SEQUENCE);
     }
 
     pub fn find_run(&self, run_id: RunId) -> Option<&RunRecord> {
@@ -170,6 +249,90 @@ impl Session {
             .iter_mut()
             .find(|invocation| invocation.id == invocation_id)
     }
+
+    fn has_legacy_replay_metadata(&self) -> bool {
+        self.runs.iter().any(|run| run.created_sequence == 0)
+            || self.turns.iter().any(|turn| turn.sequence_number == 0)
+            || self
+                .tool_invocations
+                .iter()
+                .any(|invocation| invocation.sequence_number == 0)
+            || self.runs.iter().any(|run| {
+                run.status.is_terminal()
+                    && (run.terminal_sequence.is_none() || run.terminal_stop_reason.is_none())
+            })
+    }
+
+    fn max_replay_sequence(&self) -> Option<ReplaySequence> {
+        self.runs
+            .iter()
+            .map(|run| run.created_sequence)
+            .chain(self.runs.iter().filter_map(|run| run.terminal_sequence))
+            .chain(self.turns.iter().map(|turn| turn.sequence_number))
+            .chain(
+                self.tool_invocations
+                    .iter()
+                    .map(|invocation| invocation.sequence_number),
+            )
+            .filter(|sequence| *sequence >= FIRST_REPLAY_SEQUENCE)
+            .max()
+    }
+
+    fn resequence_from_legacy_timestamps(&mut self) {
+        #[derive(Clone, Copy)]
+        enum ReplayEvent {
+            RunCreated(usize),
+            Turn(usize),
+            ToolInvocation(usize),
+            RunTerminal(usize),
+        }
+
+        let mut events = Vec::new();
+
+        for (index, run) in self.runs.iter().enumerate() {
+            events.push((run.created_at, 0_u8, index, ReplayEvent::RunCreated(index)));
+
+            if run.status.is_terminal() {
+                events.push((run.updated_at, 3_u8, index, ReplayEvent::RunTerminal(index)));
+            }
+        }
+
+        for (index, turn) in self.turns.iter().enumerate() {
+            events.push((turn.timestamp, 1_u8, index, ReplayEvent::Turn(index)));
+        }
+
+        for (index, invocation) in self.tool_invocations.iter().enumerate() {
+            events.push((
+                invocation.requested_at,
+                2_u8,
+                index,
+                ReplayEvent::ToolInvocation(index),
+            ));
+        }
+
+        events.sort_by_key(|(timestamp, priority, index, _)| (*timestamp, *priority, *index));
+
+        let mut next_sequence = FIRST_REPLAY_SEQUENCE;
+
+        for (_, _, _, event) in events {
+            match event {
+                ReplayEvent::RunCreated(index) => {
+                    self.runs[index].created_sequence = next_sequence;
+                }
+                ReplayEvent::Turn(index) => {
+                    self.turns[index].sequence_number = next_sequence;
+                }
+                ReplayEvent::ToolInvocation(index) => {
+                    self.tool_invocations[index].sequence_number = next_sequence;
+                }
+                ReplayEvent::RunTerminal(index) => {
+                    self.runs[index].terminal_sequence = Some(next_sequence);
+                }
+            }
+
+            next_sequence = next_sequence.saturating_add(1);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,8 +343,31 @@ pub struct RunRecord {
     pub parent_run_id: Option<RunId>,
     #[serde(default)]
     pub parent_tool_invocation_id: Option<ToolInvocationId>,
+    #[serde(default)]
+    pub created_sequence: ReplaySequence,
+    #[serde(default)]
+    pub terminal_sequence: Option<ReplaySequence>,
+    #[serde(default)]
+    pub terminal_stop_reason: Option<RunTerminalStopReason>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl RunRecord {
+    pub fn latest_replay_sequence(&self) -> ReplaySequence {
+        self.terminal_sequence.unwrap_or(self.created_sequence)
+    }
+
+    fn normalize_terminal_stop_reason(&mut self) {
+        if self.status.is_terminal() && self.terminal_stop_reason.is_none() {
+            self.terminal_stop_reason = self.status.default_terminal_stop_reason();
+        }
+
+        if !self.status.is_terminal() {
+            self.terminal_sequence = None;
+            self.terminal_stop_reason = None;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +376,30 @@ pub enum RunStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+impl RunStatus {
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::InProgress)
+    }
+
+    pub fn default_terminal_stop_reason(self) -> Option<RunTerminalStopReason> {
+        match self {
+            Self::InProgress => None,
+            Self::Completed => Some(RunTerminalStopReason::Completed),
+            Self::Failed => Some(RunTerminalStopReason::Failed),
+            Self::Cancelled => Some(RunTerminalStopReason::Cancelled),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunTerminalStopReason {
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -229,6 +439,8 @@ pub struct ToolInvocationRecord {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation: Option<TaskDelegationRecord>,
+    #[serde(default)]
+    pub sequence_number: ReplaySequence,
     pub requested_at: DateTime<Utc>,
     #[serde(default)]
     pub approved_at: Option<DateTime<Utc>>,
@@ -309,6 +521,7 @@ impl<'de> Deserialize<'de> for ToolInvocationRecord {
                 compat.delegation_agent_name,
                 compat.delegation_prompt,
             ),
+            sequence_number: compat.sequence_number,
             requested_at: compat.requested_at,
             approved_at: compat.approved_at,
             completed_at: compat.completed_at,
@@ -417,6 +630,8 @@ struct ToolInvocationRecordCompat {
     delegation_agent_name: Option<String>,
     #[serde(default)]
     delegation_prompt: Option<String>,
+    #[serde(default)]
+    sequence_number: ReplaySequence,
     requested_at: DateTime<Utc>,
     #[serde(default)]
     approved_at: Option<DateTime<Utc>>,
@@ -528,7 +743,13 @@ pub struct Turn {
     pub content: String,
     #[serde(default)]
     pub reasoning: String,
+    #[serde(default)]
+    pub sequence_number: ReplaySequence,
     pub timestamp: DateTime<Utc>,
+}
+
+const fn default_next_replay_sequence() -> ReplaySequence {
+    FIRST_REPLAY_SEQUENCE
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

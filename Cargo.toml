@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/fluent-code-acp",
     "crates/fluent-code-app",
     "crates/fluent-code-provider",
     "crates/fluent-code-tui",
@@ -40,8 +41,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-fluent-code-app = { path = "crates/fluent-code-app" }
-fluent-code-provider = { path = "crates/fluent-code-provider" }
-fluent-code-tui = { path = "crates/fluent-code-tui" }
+fluent-code-acp = { path = "crates/fluent-code-acp" }
 tokio.workspace = true
-tracing.workspace = true

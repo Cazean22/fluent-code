@@ -86,7 +86,9 @@ impl AgentToolPermissions {
 
 /// Check whether any pattern in `patterns` matches `tool_name`.
 fn pattern_list_matches(patterns: &[String], tool_name: &str) -> bool {
-    patterns.iter().any(|pattern| tool_pattern_matches(pattern, tool_name))
+    patterns
+        .iter()
+        .any(|pattern| tool_pattern_matches(pattern, tool_name))
 }
 
 /// Evaluate a single tool permission pattern against a tool name.
@@ -102,7 +104,8 @@ fn tool_pattern_matches(pattern: &str, tool_name: &str) -> bool {
         "*" | "all" => true,
         p if p.ends_with("(*)") => {
             let prefix = &p[..p.len() - 3];
-            tool_name == prefix || tool_name.starts_with(&format!("{prefix}_"))
+            tool_name == prefix
+                || tool_name.starts_with(&format!("{prefix}_"))
                 || tool_name.starts_with(&format!("{prefix}("))
         }
         p => p == tool_name,
@@ -418,7 +421,7 @@ mod tests {
     #[test]
     fn task_tool_exposes_configured_agents() {
         let registry = AgentRegistry::from_configured(Some(&[test_agent_config("oracle")]))
-        .expect("custom registry");
+            .expect("custom registry");
         let tool = task_tool(&registry);
 
         assert_eq!(tool.name, TASK_TOOL_NAME);
@@ -433,7 +436,7 @@ mod tests {
     #[test]
     fn parse_task_request_accepts_known_agent_from_registry() {
         let registry = AgentRegistry::from_configured(Some(&[test_agent_config("oracle")]))
-        .expect("custom registry");
+            .expect("custom registry");
         let request = parse_task_request(
             &registry,
             &serde_json::json!({
@@ -450,7 +453,7 @@ mod tests {
     #[test]
     fn parse_task_request_rejects_unknown_agent_from_registry() {
         let registry = AgentRegistry::from_configured(Some(&[test_agent_config("oracle")]))
-        .expect("custom registry");
+            .expect("custom registry");
         let error = parse_task_request(
             &registry,
             &serde_json::json!({

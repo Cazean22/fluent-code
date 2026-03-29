@@ -445,6 +445,9 @@ mod tests {
         let run_id = uuid::Uuid::new_v4();
         let invocation_id = uuid::Uuid::new_v4();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let missing_path = std::env::current_dir()
+            .expect("current dir")
+            .join("missing.txt");
 
         runtime.spawn_effect(
             Effect::ExecuteTool {
@@ -453,7 +456,9 @@ mod tests {
                 tool_call: ProviderToolCall {
                     id: "tool-call-missing-read".to_string(),
                     name: "read".to_string(),
-                    arguments: serde_json::json!({ "path": "missing.txt" }),
+                    arguments: serde_json::json!({
+                        "path": missing_path.to_string_lossy().to_string()
+                    }),
                 },
             },
             tx,
