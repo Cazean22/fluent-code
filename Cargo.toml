@@ -39,7 +39,9 @@ wasmtime-wasi = "38.0.4"
 name = "fluent-code"
 version.workspace = true
 edition.workspace = true
+default-run = "fluent-code"
 
 [dependencies]
 fluent-code-acp = { path = "crates/fluent-code-acp" }
+fluent-code-tui = { path = "crates/fluent-code-tui" }
 tokio.workspace = true
