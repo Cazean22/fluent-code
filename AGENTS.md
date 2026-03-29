@@ -20,16 +20,19 @@ Prefer repo-local evidence over generic Rust habits.
 - `examples/plugins/echo/guest` is a standalone example guest crate, not a workspace member.
 
 ## Crate roles
-- `src/main.rs`: ACP-first thin composition root that calls `fluent_code_acp::run()`.
+- `src/main.rs`: TUI-first thin composition root that calls the root entrypoint wrapper.
+- `src/lib.rs`: root entrypoint wrappers for the default TUI path and the secondary ACP binary.
 - `fluent-code-acp`: ACP server entrypoint, JSON-RPC session lifecycle, stdio/jsonl harness, contract coverage.
-- `fluent-code-app`: durable session model, reducer logic, permissions, replay, recovery, tools, plugins, config.
+- `fluent-code-app`: durable session model, reducer logic, permissions, replay, recovery, tools, plugins, config, and shared startup bootstrap.
 - `fluent-code-provider`: provider-facing request and streaming types, mock provider, Rig/OpenAI integration.
 - `fluent-code-tui`: terminal lifecycle, rendering, input mapping, local UI state, effect application.
 
 ## Hard boundaries
 - Keep `src/main.rs` thin.
+- Keep root entrypoint wrappers in `src/lib.rs`; do not move bootstrap or protocol logic into the root crate.
 - Keep ACP protocol handling, session new/load/prompt/cancel flows, and ACP harness behavior in `fluent-code-acp`.
 - Keep durable state, replay rules, permissions, batching, delegation, and startup recovery in `fluent-code-app`.
+- Keep shared config/logging/store/provider/plugin/runtime bootstrap in `fluent-code-app`, not `fluent-code-tui`.
 - Keep provider streaming and provider validation in `fluent-code-provider`.
 - Keep rendering, wording, input mapping, and local-only UI state in `fluent-code-tui`.
 - Runtime is an executor, not a scheduler or persistence layer.
@@ -37,8 +40,9 @@ Prefer repo-local evidence over generic Rust habits.
 - Do not move persisted state concerns into the TUI.
 
 ## Start here
-- Root entrypoint: `src/main.rs`
+- Root entrypoints: `src/main.rs`, `src/lib.rs`, `src/bin/fluent-code-acp.rs`
 - ACP server and contract tests: `crates/fluent-code-acp/src/server/{mod,contract_tests}.rs`
+- Shared bootstrap: `crates/fluent-code-app/src/bootstrap.rs`
 - Reducer, state, messages: `crates/fluent-code-app/src/app/{message,state,update}.rs`
 - Delegation, recovery, replay: `crates/fluent-code-app/src/app/{delegation,recovery,request_builder}.rs`
 - App internals: `crates/fluent-code-app/src/{session,runtime,tool,plugin}/`
@@ -57,6 +61,7 @@ Run from the repo root unless package scope is required.
 
 ### Run
 - `cargo run -p fluent-code`
+- `cargo run -p fluent-code --bin fluent-code-acp`
 
 ### Format / lint
 - `cargo fmt --all`
@@ -100,7 +105,8 @@ Run from the repo root unless package scope is required.
 ## Testing conventions
 - Tests are mostly inline `#[cfg(test)]` modules inside source files.
 - ACP contract coverage is in `crates/fluent-code-acp/src/server/contract_tests.rs`.
-- There is no top-level workspace `tests/` tree.
+- Root-package binary wiring coverage lives in `tests/entrypoints.rs`.
+- Some crate-level exact-name startup coverage lives in `crates/fluent-code-app/tests/` and `crates/fluent-code-tui/tests/` when command-level verification needs an integration-test surface.
 - Sync tests use `#[test]`; async tests use `#[tokio::test]`.
 - Prefer colocated tests unless the user asks for another structure.
 - Keep test names descriptive and behavior-oriented.
@@ -108,8 +114,11 @@ Run from the repo root unless package scope is required.
 - Test-heavy files include:
   - `crates/fluent-code-acp/src/server/contract_tests.rs`
   - `crates/fluent-code-app/src/app/{update,delegation,recovery}.rs`
+  - `crates/fluent-code-app/tests/bootstrap.rs`
   - `crates/fluent-code-app/src/{runtime/orchestrator,session/store}.rs`
-  - `crates/fluent-code-provider/src/rig.rs`, `crates/fluent-code-tui/src/{lib,view,conversation}.rs`
+  - `crates/fluent-code-provider/src/rig.rs`
+  - `crates/fluent-code-tui/src/{lib,view,conversation}.rs`
+  - `crates/fluent-code-tui/tests/startup.rs`
 
 ## Code style
 - Keep imports explicit. Let `rustfmt` handle ordering and wrapping.
@@ -152,4 +161,5 @@ Run from the repo root unless package scope is required.
 - Prefer the smallest change that preserves these invariants.
 - If a change affects crate boundaries or shared session/provider/ACP types, validate the full workspace.
 - Do not introduce new rule files unless the user asks.
+- Keep the default user-facing binary TUI-first and preserve ACP as the secondary binary unless the user explicitly requests another startup topology.
 - Update this file when workspace members, commands, recovery behavior, or major subsystem boundaries change.
