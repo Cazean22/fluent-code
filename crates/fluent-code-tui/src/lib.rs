@@ -8,6 +8,7 @@ pub mod view;
 
 use fluent_code_app::agent::AgentRegistry;
 use fluent_code_app::app::{AppState, Effect, update};
+use fluent_code_app::bootstrap::{AppBootstrap, BootstrapContext};
 use fluent_code_app::error::Result;
 use fluent_code_app::plugin::{PluginLoadSnapshot, ToolRegistry};
 use fluent_code_app::runtime::Runtime;
@@ -19,6 +20,56 @@ use tracing::{debug, info};
 
 use crate::events::TuiAction;
 use crate::ui_state::UiState;
+
+type RuntimeSender = tokio::sync::mpsc::UnboundedSender<fluent_code_app::app::Msg>;
+type RuntimeReceiver = tokio::sync::mpsc::UnboundedReceiver<fluent_code_app::app::Msg>;
+
+pub struct TuiStartup {
+    pub session: Session,
+    pub store: FsSessionStore,
+    pub runtime: Runtime,
+    pub agent_registry: Arc<AgentRegistry>,
+    pub tool_registry: Arc<ToolRegistry>,
+    pub plugin_load_snapshot: PluginLoadSnapshot,
+}
+
+impl TuiStartup {
+    pub fn from_bootstrap(bootstrap: BootstrapContext) -> Result<Self> {
+        let BootstrapContext {
+            store,
+            runtime,
+            agent_registry,
+            tool_registry,
+            plugin_load_snapshot,
+            ..
+        } = bootstrap;
+        let session = store.load_or_create_latest()?;
+
+        Ok(Self {
+            session,
+            store,
+            runtime,
+            agent_registry,
+            tool_registry,
+            plugin_load_snapshot,
+        })
+    }
+}
+
+pub async fn run() -> Result<()> {
+    let (bootstrap, _logging) = AppBootstrap::load()?.into_parts();
+    let startup = TuiStartup::from_bootstrap(bootstrap)?;
+
+    run_app(
+        startup.session,
+        startup.store,
+        startup.runtime,
+        startup.agent_registry,
+        startup.tool_registry,
+        startup.plugin_load_snapshot,
+    )
+    .await
+}
 
 pub async fn run_app(
     session: Session,
@@ -39,30 +90,106 @@ pub async fn run_app(
     let mut ui_state = UiState::default();
     let (runtime_sender, mut runtime_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-    recover_startup_state(&mut state, &store, &runtime, runtime_sender.clone()).await?;
-
-    let app_result = run_loop(
-        &mut terminal,
-        &mut state,
-        &mut ui_state,
-        &store,
-        &runtime,
-        runtime_sender,
-        &mut runtime_receiver,
-    )
+    let app_result = async {
+        recover_startup_state(&mut state, &store, &runtime, runtime_sender.clone()).await?;
+        run_loop(
+            &mut terminal,
+            &mut state,
+            &mut ui_state,
+            &store,
+            &runtime,
+            runtime_sender,
+            &mut runtime_receiver,
+        )
+        .await
+    }
     .await;
     let restore_result = terminal::restore(terminal);
 
     info!(session_id = %state.session.id, "tui application finished");
-    app_result?;
-    restore_result
+    merge_app_and_restore_results(app_result, restore_result)
+}
+
+fn merge_app_and_restore_results(app_result: Result<()>, restore_result: Result<()>) -> Result<()> {
+    match (app_result, restore_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(err), Ok(())) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Err(err), Err(_)) => Err(err),
+    }
+}
+
+async fn run_startup_with_terminal_hooks<
+    InitTerminal,
+    RestoreTerminal,
+    RecoverStartup,
+    RecoverFuture,
+>(
+    startup: TuiStartup,
+    init_terminal: InitTerminal,
+    restore_terminal: RestoreTerminal,
+    recover_startup: RecoverStartup,
+) -> Result<()>
+where
+    InitTerminal: FnOnce() -> Result<terminal::AppTerminal>,
+    RestoreTerminal: FnOnce(terminal::AppTerminal) -> Result<()>,
+    RecoverStartup:
+        FnOnce(&mut AppState, &FsSessionStore, &Runtime, RuntimeSender) -> RecoverFuture,
+    RecoverFuture: std::future::Future<Output = Result<()>>,
+{
+    let terminal = init_terminal()?;
+    let mut state = AppState::new_with_plugin_state(
+        startup.session,
+        startup.agent_registry,
+        startup.tool_registry,
+        startup.plugin_load_snapshot,
+    );
+    let (runtime_sender, _runtime_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    let app_result =
+        recover_startup(&mut state, &startup.store, &startup.runtime, runtime_sender).await;
+    let restore_result = restore_terminal(terminal);
+
+    merge_app_and_restore_results(app_result, restore_result)
+}
+
+#[doc(hidden)]
+pub async fn recover_startup_state_for_tests(
+    state: &mut AppState,
+    store: &FsSessionStore,
+    runtime: &Runtime,
+    runtime_sender: RuntimeSender,
+) -> Result<()> {
+    recover_startup_state(state, store, runtime, runtime_sender).await
+}
+
+#[doc(hidden)]
+pub async fn run_startup_with_terminal_hooks_for_tests<
+    InitTerminal,
+    RestoreTerminal,
+    RecoverStartup,
+    RecoverFuture,
+>(
+    startup: TuiStartup,
+    init_terminal: InitTerminal,
+    restore_terminal: RestoreTerminal,
+    recover_startup: RecoverStartup,
+) -> Result<()>
+where
+    InitTerminal: FnOnce() -> Result<terminal::AppTerminal>,
+    RestoreTerminal: FnOnce(terminal::AppTerminal) -> Result<()>,
+    RecoverStartup:
+        FnOnce(&mut AppState, &FsSessionStore, &Runtime, RuntimeSender) -> RecoverFuture,
+    RecoverFuture: std::future::Future<Output = Result<()>>,
+{
+    run_startup_with_terminal_hooks(startup, init_terminal, restore_terminal, recover_startup).await
 }
 
 async fn recover_startup_state(
     state: &mut AppState,
     store: &FsSessionStore,
     runtime: &Runtime,
-    runtime_sender: tokio::sync::mpsc::UnboundedSender<fluent_code_app::app::Msg>,
+    runtime_sender: RuntimeSender,
 ) -> Result<()> {
     let effects = fluent_code_app::app::recover_startup_foreground(state);
     if effects.is_empty() {
@@ -86,8 +213,8 @@ async fn run_loop(
     ui_state: &mut UiState,
     store: &FsSessionStore,
     runtime: &Runtime,
-    runtime_sender: tokio::sync::mpsc::UnboundedSender<fluent_code_app::app::Msg>,
-    runtime_receiver: &mut tokio::sync::mpsc::UnboundedReceiver<fluent_code_app::app::Msg>,
+    runtime_sender: RuntimeSender,
+    runtime_receiver: &mut RuntimeReceiver,
 ) -> Result<()> {
     debug!(session_id = %state.session.id, "entered tui run loop");
     loop {
@@ -459,13 +586,22 @@ fn log_tui_effect(context: &str, state: &AppState, effect: &Effect) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use chrono::Utc;
     use fluent_code_app::app::permissions::PermissionReply;
     use fluent_code_app::app::{AppState, AppStatus, Msg, RESTART_INTERRUPTED_TASK_RESULT};
+    use fluent_code_app::bootstrap::BootstrapContext;
+    use fluent_code_app::config::{
+        AcpConfig, AcpSessionDefaultsConfig, Config, LoggingConfig, LoggingFileConfig,
+        LoggingStderrConfig, ModelConfig, PluginConfig,
+    };
+    use fluent_code_app::error::FluentCodeError;
     use fluent_code_app::runtime::Runtime;
     use fluent_code_app::session::model::{
         ForegroundOwnerRecord, ForegroundPhase, Role, RunRecord, RunStatus, Session,
@@ -474,9 +610,13 @@ mod tests {
     };
     use fluent_code_app::session::store::{FsSessionStore, SessionStore};
     use fluent_code_provider::{MockProvider, ProviderClient};
+    use ratatui::{Terminal, backend::CrosstermBackend};
     use tokio::sync::Mutex;
 
-    use super::{drain_runtime_messages, handle_message, recover_startup_state};
+    use super::{
+        TuiStartup, drain_runtime_messages, handle_message, recover_startup_state,
+        run_startup_with_terminal_hooks,
+    };
     use crate::ui_state::UiState;
 
     struct StartupRecoveryFixture {
@@ -484,6 +624,59 @@ mod tests {
         parent_run_id: uuid::Uuid,
         child_run_id: uuid::Uuid,
         preceding_turn_id: uuid::Uuid,
+    }
+
+    #[test]
+    fn startup_uses_latest_session_by_default() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.join(".fluent-code"));
+        let existing = store.create_new_session().expect("create latest session");
+        let bootstrap =
+            BootstrapContext::from_config(test_config(&root)).expect("bootstrap context");
+
+        let startup =
+            TuiStartup::from_bootstrap(bootstrap).expect("prepare startup from bootstrap");
+
+        assert_eq!(startup.session.id, existing.id);
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn restores_terminal_when_startup_recovery_fails() {
+        let root = unique_test_dir();
+        let bootstrap =
+            BootstrapContext::from_config(test_config(&root)).expect("bootstrap context");
+        let startup =
+            TuiStartup::from_bootstrap(bootstrap).expect("prepare startup from bootstrap");
+        let restored = AtomicBool::new(false);
+
+        let err = run_startup_with_terminal_hooks(
+            startup,
+            || {
+                let backend = CrosstermBackend::new(std::io::stdout());
+                Ok(Terminal::new(backend).expect("test terminal"))
+            },
+            |terminal| {
+                restored.store(true, Ordering::SeqCst);
+                drop(terminal);
+                Ok(())
+            },
+            |_state, _store, _runtime, _sender| async {
+                Err(FluentCodeError::Config(
+                    "forced startup recovery failure".to_string(),
+                ))
+            },
+        )
+        .await
+        .expect_err("startup recovery should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "config error: forced startup recovery failure"
+        );
+        assert!(restored.load(Ordering::SeqCst));
+
+        cleanup(root);
     }
 
     #[tokio::test]
@@ -537,6 +730,48 @@ mod tests {
     fn test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn test_config(root: &Path) -> Config {
+        let data_dir = root.join(".fluent-code");
+
+        Config {
+            config_path: None,
+            data_dir: data_dir.clone(),
+            logging: LoggingConfig {
+                file: LoggingFileConfig {
+                    enabled: false,
+                    path: data_dir.join("logs/fluent-code.log"),
+                    level: "info".to_string(),
+                },
+                stderr: LoggingStderrConfig {
+                    enabled: false,
+                    level: "info".to_string(),
+                },
+            },
+            model: ModelConfig {
+                provider: "mock".to_string(),
+                model: "gpt-4.1-mini".to_string(),
+                reasoning_effort: None,
+                system_prompt: "You are a helpful coding assistant.".to_string(),
+            },
+            agents: None,
+            plugins: PluginConfig {
+                enable_project_plugins: false,
+                enable_global_plugins: false,
+                project_dir: root.join("plugins/project"),
+                global_dir: root.join("plugins/global"),
+            },
+            acp: AcpConfig {
+                protocol_version: 1,
+                auth_methods: vec![],
+                session_defaults: AcpSessionDefaultsConfig {
+                    system_prompt: "You are a helpful coding assistant.".to_string(),
+                    reasoning_effort: None,
+                },
+            },
+            model_providers: HashMap::new(),
+        }
     }
 
     #[tokio::test]
