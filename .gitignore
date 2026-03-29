@@ -2,3 +2,4 @@
 *.log
 /.fluent-code/
 .DS_Store
+.sisyphus
