@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use fluent_code_app::agent::AgentRegistry;
 use fluent_code_app::app::{AppState, AppStatus, Effect, Msg, recover_startup_foreground, update};
+use fluent_code_app::bootstrap::{AppBootstrap, BootstrapContext};
 use fluent_code_app::config::Config;
-use fluent_code_app::logging::{config_source_for_log, init_logging, path_for_log};
-use fluent_code_app::plugin::{PluginLoadSnapshot, ToolRegistry, load_tool_registry};
+use fluent_code_app::logging::{config_source_for_log, path_for_log};
+use fluent_code_app::plugin::{PluginLoadSnapshot, ToolRegistry};
 use fluent_code_app::runtime::Runtime;
 use fluent_code_app::session::model::{
     ForegroundPhase, RunId, RunTerminalStopReason, Session, SessionId, TaskDelegationStatus,
@@ -16,7 +17,6 @@ use fluent_code_app::session::model::{
 };
 use fluent_code_app::session::store::{FsSessionStore, SessionStore};
 use fluent_code_app::{FluentCodeError, Result};
-use fluent_code_provider::ProviderClient;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -52,8 +52,8 @@ const CANCELLED_TOOL_MESSAGE: &str =
     "Tool execution was cancelled because the prompt turn was cancelled.";
 
 pub async fn run() -> Result<()> {
-    let config = Config::load()?;
-    let _logging = init_logging(&config)?;
+    let (bootstrap, _logging) = AppBootstrap::load()?.into_parts();
+    let config = &bootstrap.config;
 
     info!(
         config_source = %config_source_for_log(config.config_path.as_deref()),
@@ -68,7 +68,9 @@ pub async fn run() -> Result<()> {
         "application startup configuration loaded"
     );
 
-    AcpServer::build(config)?.run().await
+    AcpServer::from_dependencies(AcpServerDependencies::from_bootstrap(bootstrap))
+        .run()
+        .await
 }
 
 pub struct HeadlessAppHost {
@@ -285,28 +287,28 @@ pub struct AcpServerDependencies {
 }
 
 impl AcpServerDependencies {
-    pub fn from_config(config: Config) -> Result<Self> {
-        let store = FsSessionStore::new(config.data_dir.clone());
-        let agent_registry = Arc::new(AgentRegistry::from_configured(config.agents.as_deref())?);
-        let provider = ProviderClient::new(
-            &config.model.provider,
-            config.model.model.clone(),
-            config.model.system_prompt.clone(),
-            config.model.reasoning_effort.clone(),
-            config.selected_provider_config().cloned(),
-        )?;
-        let loaded_tool_registry = load_tool_registry(&config)?;
-        let tool_registry = Arc::new(loaded_tool_registry.tool_registry);
-        let runtime = Runtime::new_with_tool_registry(provider, Arc::clone(&tool_registry));
-
-        Ok(Self {
+    pub fn from_bootstrap(bootstrap: BootstrapContext) -> Self {
+        let BootstrapContext {
             config,
             store,
             agent_registry,
             runtime,
             tool_registry,
-            plugin_load_snapshot: loaded_tool_registry.plugin_load_snapshot,
-        })
+            plugin_load_snapshot,
+        } = bootstrap;
+
+        Self {
+            config,
+            store,
+            agent_registry,
+            runtime,
+            tool_registry,
+            plugin_load_snapshot,
+        }
+    }
+
+    pub fn from_config(config: Config) -> Result<Self> {
+        Ok(Self::from_bootstrap(BootstrapContext::from_config(config)?))
     }
 }
 
