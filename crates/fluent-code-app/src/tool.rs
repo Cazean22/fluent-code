@@ -19,6 +19,7 @@ const MAX_READ_LIMIT: usize = 500;
 const MAX_GLOB_MATCHES: usize = 200;
 const DEFAULT_GREP_HEAD_LIMIT: usize = 50;
 const MAX_GREP_HEAD_LIMIT: usize = 200;
+const WORKSPACE_ALIAS_ROOT: &str = "/workspace";
 
 pub fn built_in_tools(agent_registry: &AgentRegistry) -> Vec<ProviderTool> {
     vec![
@@ -385,9 +386,26 @@ fn resolve_workspace_path(workspace_root: &Path, path: &str) -> Result<PathBuf> 
         )));
     }
 
-    let candidate = PathBuf::from(path);
+    let candidate = remap_workspace_alias(workspace_root, Path::new(path));
 
     canonicalize_within_workspace(workspace_root, &candidate)
+}
+
+fn remap_workspace_alias(workspace_root: &Path, candidate: &Path) -> PathBuf {
+    let alias_root = Path::new(WORKSPACE_ALIAS_ROOT);
+
+    if workspace_root == alias_root {
+        return candidate.to_path_buf();
+    }
+
+    if candidate == alias_root {
+        return workspace_root.to_path_buf();
+    }
+
+    match candidate.strip_prefix(alias_root) {
+        Ok(relative) => workspace_root.join(relative),
+        Err(_) => candidate.to_path_buf(),
+    }
 }
 
 fn canonicalize_within_workspace(workspace_root: &Path, candidate: &Path) -> Result<PathBuf> {
@@ -721,6 +739,37 @@ mod tests {
     }
 
     #[test]
+    fn glob_accepts_workspace_alias_search_root() {
+        let _guard = lock_current_dir();
+        let workspace = unique_test_dir();
+        fs::create_dir_all(workspace.join("src/nested")).expect("create dirs");
+        let main_path = workspace.join("src/main.rs");
+        let lib_path = workspace.join("src/nested/lib.rs");
+        fs::write(&main_path, "fn main() {}\n").expect("write main");
+        fs::write(&lib_path, "pub fn run() {}\n").expect("write lib");
+
+        let original_dir = std::env::current_dir().expect("get current dir");
+        std::env::set_current_dir(&workspace).expect("set current dir");
+
+        let result = execute_built_in_tool(&ProviderToolCall {
+            id: "call-glob-workspace-alias".to_string(),
+            name: "glob".to_string(),
+            arguments: serde_json::json!({
+                "pattern": "src/**/*.rs",
+                "path": "/workspace"
+            }),
+        })
+        .expect("glob tool should accept /workspace alias");
+
+        std::env::set_current_dir(&original_dir).expect("restore current dir");
+
+        assert!(result.contains(&canonical_display(&main_path)));
+        assert!(result.contains(&canonical_display(&lib_path)));
+
+        cleanup(workspace);
+    }
+
+    #[test]
     fn grep_returns_matching_content_lines() {
         let _guard = lock_current_dir();
         let workspace = unique_test_dir();
@@ -800,6 +849,38 @@ mod tests {
 
         std::env::set_current_dir(&original_dir).expect("restore current dir");
         assert!(error.to_string().contains("invalid regex pattern"));
+
+        cleanup(workspace);
+    }
+
+    #[test]
+    fn grep_accepts_workspace_alias_search_root() {
+        let _guard = lock_current_dir();
+        let workspace = unique_test_dir();
+        fs::create_dir_all(workspace.join("src")).expect("create dirs");
+        let main_path = workspace.join("src/main.rs");
+        fs::write(&main_path, "fn alpha() {}\nfn beta() {}\n").expect("write file");
+
+        let original_dir = std::env::current_dir().expect("get current dir");
+        std::env::set_current_dir(&workspace).expect("set current dir");
+
+        let result = execute_built_in_tool(&ProviderToolCall {
+            id: "call-grep-workspace-alias".to_string(),
+            name: "grep".to_string(),
+            arguments: serde_json::json!({
+                "pattern": "beta",
+                "path": "/workspace",
+                "output_mode": "content"
+            }),
+        })
+        .expect("grep tool should accept /workspace alias");
+
+        std::env::set_current_dir(&original_dir).expect("restore current dir");
+
+        assert!(result.contains(&format!(
+            "{}:2: fn beta() {{}}",
+            canonical_display(&main_path)
+        )));
 
         cleanup(workspace);
     }
