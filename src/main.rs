@@ -1,6 +1,6 @@
-use fluent_code_acp::{Result, run};
+use fluent_code::{Result, run_default_entrypoint};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    run().await
+    run_default_entrypoint().await
 }
