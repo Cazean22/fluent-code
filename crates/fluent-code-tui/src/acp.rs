@@ -1148,12 +1148,12 @@ impl AcpLaunchOptions {
     }
 }
 
-struct ProjectionClient {
+struct AcpClientRuntimeInner {
     projection: Arc<Mutex<ProjectionSharedState>>,
     capabilities: ProjectionClientCapabilities,
 }
 
-impl ProjectionClient {
+impl AcpClientRuntimeInner {
     fn new(
         projection: Arc<Mutex<ProjectionSharedState>>,
         capabilities: ProjectionClientCapabilities,
@@ -1163,10 +1163,68 @@ impl ProjectionClient {
             capabilities,
         }
     }
-}
 
-#[async_trait(?Send)]
-impl acp::Client for ProjectionClient {
+    fn projection(&self) -> &Arc<Mutex<ProjectionSharedState>> {
+        &self.projection
+    }
+
+    fn client_capabilities(&self) -> acp::ClientCapabilities {
+        self.capabilities.as_acp_client_capabilities()
+    }
+
+    async fn projection_snapshot(&self) -> TuiProjectionState {
+        self.projection.lock().await.projection.clone()
+    }
+
+    async fn register_session_cwd(
+        &self,
+        session_id: acp::SessionId,
+        cwd: impl Into<PathBuf>,
+    ) -> acp::Result<()> {
+        self.projection
+            .lock()
+            .await
+            .register_session_cwd(session_id, cwd)
+    }
+
+    async fn mark_session_created(&self, session_id: acp::SessionId) {
+        self.projection
+            .lock()
+            .await
+            .mark_session_created(session_id);
+    }
+
+    async fn prepare_session_load(&self, session_id: &acp::SessionId) {
+        self.projection
+            .lock()
+            .await
+            .prepare_session_load(session_id);
+    }
+
+    async fn select_permission_option(&self, option_id: &str) -> Result<()> {
+        resolve_pending_permission_selection(self.projection(), option_id).await
+    }
+
+    async fn cancel_pending_permission(&self) -> Result<()> {
+        cancel_pending_permission(self.projection()).await
+    }
+
+    fn ensure_filesystem_enabled(&self) -> acp::Result<()> {
+        if self.capabilities.filesystem {
+            Ok(())
+        } else {
+            Err(acp::Error::method_not_found())
+        }
+    }
+
+    fn ensure_terminal_enabled(&self) -> acp::Result<()> {
+        if self.capabilities.terminal {
+            Ok(())
+        } else {
+            Err(acp::Error::method_not_found())
+        }
+    }
+
     async fn request_permission(
         &self,
         args: acp::RequestPermissionRequest,
@@ -1195,10 +1253,7 @@ impl acp::Client for ProjectionClient {
         &self,
         args: acp::WriteTextFileRequest,
     ) -> acp::Result<acp::WriteTextFileResponse> {
-        if !self.capabilities.filesystem {
-            return Err(acp::Error::method_not_found());
-        }
-
+        self.ensure_filesystem_enabled()?;
         self.projection
             .lock()
             .await
@@ -1210,10 +1265,7 @@ impl acp::Client for ProjectionClient {
         &self,
         args: acp::ReadTextFileRequest,
     ) -> acp::Result<acp::ReadTextFileResponse> {
-        if !self.capabilities.filesystem {
-            return Err(acp::Error::method_not_found());
-        }
-
+        self.ensure_filesystem_enabled()?;
         self.projection.lock().await.filesystem.read_text_file(args)
     }
 
@@ -1221,9 +1273,7 @@ impl acp::Client for ProjectionClient {
         &self,
         args: acp::CreateTerminalRequest,
     ) -> acp::Result<acp::CreateTerminalResponse> {
-        if !self.capabilities.terminal {
-            return Err(acp::Error::method_not_found());
-        }
+        self.ensure_terminal_enabled()?;
 
         let terminal = self.projection.lock().await.terminal.clone();
         terminal.create_terminal(args).await
@@ -1233,9 +1283,7 @@ impl acp::Client for ProjectionClient {
         &self,
         args: acp::TerminalOutputRequest,
     ) -> acp::Result<acp::TerminalOutputResponse> {
-        if !self.capabilities.terminal {
-            return Err(acp::Error::method_not_found());
-        }
+        self.ensure_terminal_enabled()?;
 
         let terminal = self.projection.lock().await.terminal.clone();
         terminal.terminal_output(args).await
@@ -1245,9 +1293,7 @@ impl acp::Client for ProjectionClient {
         &self,
         args: acp::ReleaseTerminalRequest,
     ) -> acp::Result<acp::ReleaseTerminalResponse> {
-        if !self.capabilities.terminal {
-            return Err(acp::Error::method_not_found());
-        }
+        self.ensure_terminal_enabled()?;
 
         let terminal = self.projection.lock().await.terminal.clone();
         terminal.release_terminal(args).await
@@ -1257,9 +1303,7 @@ impl acp::Client for ProjectionClient {
         &self,
         args: acp::WaitForTerminalExitRequest,
     ) -> acp::Result<acp::WaitForTerminalExitResponse> {
-        if !self.capabilities.terminal {
-            return Err(acp::Error::method_not_found());
-        }
+        self.ensure_terminal_enabled()?;
 
         let terminal = self.projection.lock().await.terminal.clone();
         terminal.wait_for_terminal_exit(args).await
@@ -1269,17 +1313,78 @@ impl acp::Client for ProjectionClient {
         &self,
         args: acp::KillTerminalRequest,
     ) -> acp::Result<acp::KillTerminalResponse> {
-        if !self.capabilities.terminal {
-            return Err(acp::Error::method_not_found());
-        }
+        self.ensure_terminal_enabled()?;
 
         let terminal = self.projection.lock().await.terminal.clone();
         terminal.kill_terminal(args).await
     }
 }
 
+#[async_trait(?Send)]
+impl acp::Client for AcpClientRuntimeInner {
+    async fn request_permission(
+        &self,
+        args: acp::RequestPermissionRequest,
+    ) -> acp::Result<acp::RequestPermissionResponse> {
+        AcpClientRuntimeInner::request_permission(self, args).await
+    }
+
+    async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
+        AcpClientRuntimeInner::session_notification(self, args).await
+    }
+
+    async fn write_text_file(
+        &self,
+        args: acp::WriteTextFileRequest,
+    ) -> acp::Result<acp::WriteTextFileResponse> {
+        AcpClientRuntimeInner::write_text_file(self, args).await
+    }
+
+    async fn read_text_file(
+        &self,
+        args: acp::ReadTextFileRequest,
+    ) -> acp::Result<acp::ReadTextFileResponse> {
+        AcpClientRuntimeInner::read_text_file(self, args).await
+    }
+
+    async fn create_terminal(
+        &self,
+        args: acp::CreateTerminalRequest,
+    ) -> acp::Result<acp::CreateTerminalResponse> {
+        AcpClientRuntimeInner::create_terminal(self, args).await
+    }
+
+    async fn terminal_output(
+        &self,
+        args: acp::TerminalOutputRequest,
+    ) -> acp::Result<acp::TerminalOutputResponse> {
+        AcpClientRuntimeInner::terminal_output(self, args).await
+    }
+
+    async fn release_terminal(
+        &self,
+        args: acp::ReleaseTerminalRequest,
+    ) -> acp::Result<acp::ReleaseTerminalResponse> {
+        AcpClientRuntimeInner::release_terminal(self, args).await
+    }
+
+    async fn wait_for_terminal_exit(
+        &self,
+        args: acp::WaitForTerminalExitRequest,
+    ) -> acp::Result<acp::WaitForTerminalExitResponse> {
+        AcpClientRuntimeInner::wait_for_terminal_exit(self, args).await
+    }
+
+    async fn kill_terminal(
+        &self,
+        args: acp::KillTerminalRequest,
+    ) -> acp::Result<acp::KillTerminalResponse> {
+        AcpClientRuntimeInner::kill_terminal(self, args).await
+    }
+}
+
 pub struct AcpClientRuntime {
-    projection: Arc<Mutex<ProjectionSharedState>>,
+    inner: Arc<AcpClientRuntimeInner>,
     initialize_response: acp::InitializeResponse,
     connection: StdArc<acp::ClientSideConnection>,
     io_task: JoinHandle<acp::Result<()>>,
@@ -1292,7 +1397,7 @@ impl AcpClientRuntime {
     }
 
     pub async fn projection_snapshot(&self) -> TuiProjectionState {
-        self.projection.lock().await.projection.clone()
+        self.inner.projection_snapshot().await
     }
 
     #[doc(hidden)]
@@ -1305,14 +1410,12 @@ impl AcpClientRuntime {
             .connection
             .new_session(acp::NewSessionRequest::new(cwd.clone()))
             .await?;
-        self.projection
-            .lock()
-            .await
-            .register_session_cwd(response.session_id.clone(), cwd)?;
-        self.projection
-            .lock()
-            .await
-            .mark_session_created(response.session_id.clone());
+        self.inner
+            .register_session_cwd(response.session_id.clone(), cwd)
+            .await?;
+        self.inner
+            .mark_session_created(response.session_id.clone())
+            .await;
         Ok(response)
     }
 
@@ -1324,10 +1427,7 @@ impl AcpClientRuntime {
     ) -> acp::Result<acp::LoadSessionResponse> {
         let session_id = session_id.into();
         let cwd = cwd.into();
-        self.projection
-            .lock()
-            .await
-            .prepare_session_load(&session_id);
+        self.inner.prepare_session_load(&session_id).await;
         let response = self
             .connection
             .load_session(acp::LoadSessionRequest::new(
@@ -1335,10 +1435,7 @@ impl AcpClientRuntime {
                 cwd.clone(),
             ))
             .await?;
-        self.projection
-            .lock()
-            .await
-            .register_session_cwd(session_id, cwd)?;
+        self.inner.register_session_cwd(session_id, cwd).await?;
         Ok(response)
     }
 
@@ -1453,12 +1550,12 @@ impl AcpClientRuntime {
 
     #[doc(hidden)]
     pub async fn select_permission_option_for_tests(&self, option_id: &str) -> Result<()> {
-        resolve_pending_permission_selection(&self.projection, option_id).await
+        self.inner.select_permission_option(option_id).await
     }
 
     #[doc(hidden)]
     pub async fn cancel_pending_permission_for_tests(&self) -> Result<()> {
-        cancel_pending_permission(&self.projection).await
+        self.inner.cancel_pending_permission().await
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
@@ -1477,6 +1574,69 @@ impl AcpClientRuntime {
                 Ok(())
             }
         }
+    }
+}
+
+#[async_trait(?Send)]
+impl acp::Client for AcpClientRuntime {
+    async fn request_permission(
+        &self,
+        args: acp::RequestPermissionRequest,
+    ) -> acp::Result<acp::RequestPermissionResponse> {
+        self.inner.request_permission(args).await
+    }
+
+    async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
+        self.inner.session_notification(args).await
+    }
+
+    async fn write_text_file(
+        &self,
+        args: acp::WriteTextFileRequest,
+    ) -> acp::Result<acp::WriteTextFileResponse> {
+        self.inner.write_text_file(args).await
+    }
+
+    async fn read_text_file(
+        &self,
+        args: acp::ReadTextFileRequest,
+    ) -> acp::Result<acp::ReadTextFileResponse> {
+        self.inner.read_text_file(args).await
+    }
+
+    async fn create_terminal(
+        &self,
+        args: acp::CreateTerminalRequest,
+    ) -> acp::Result<acp::CreateTerminalResponse> {
+        self.inner.create_terminal(args).await
+    }
+
+    async fn terminal_output(
+        &self,
+        args: acp::TerminalOutputRequest,
+    ) -> acp::Result<acp::TerminalOutputResponse> {
+        self.inner.terminal_output(args).await
+    }
+
+    async fn release_terminal(
+        &self,
+        args: acp::ReleaseTerminalRequest,
+    ) -> acp::Result<acp::ReleaseTerminalResponse> {
+        self.inner.release_terminal(args).await
+    }
+
+    async fn wait_for_terminal_exit(
+        &self,
+        args: acp::WaitForTerminalExitRequest,
+    ) -> acp::Result<acp::WaitForTerminalExitResponse> {
+        self.inner.wait_for_terminal_exit(args).await
+    }
+
+    async fn kill_terminal(
+        &self,
+        args: acp::KillTerminalRequest,
+    ) -> acp::Result<acp::KillTerminalResponse> {
+        self.inner.kill_terminal(args).await
     }
 }
 
@@ -1859,12 +2019,19 @@ async fn bootstrap_client(
         let state = projection.lock().await;
         ProjectionClientCapabilities::from_services(&state.filesystem, &state.terminal)
     };
-    let client_capabilities = projection_capabilities.as_acp_client_capabilities();
-    let client = ProjectionClient::new(Arc::clone(&projection), projection_capabilities);
-    let (connection, io_future) =
-        acp::ClientSideConnection::new(client, stdin.compat_write(), stdout.compat(), |future| {
+    let inner = Arc::new(AcpClientRuntimeInner::new(
+        Arc::clone(&projection),
+        projection_capabilities,
+    ));
+    let client_capabilities = inner.client_capabilities();
+    let (connection, io_future) = acp::ClientSideConnection::new(
+        Arc::clone(&inner),
+        stdin.compat_write(),
+        stdout.compat(),
+        |future| {
             tokio::task::spawn_local(future);
-        });
+        },
+    );
     let connection = StdArc::new(connection);
     let io_task = tokio::task::spawn_local(io_future);
 
@@ -1915,7 +2082,7 @@ async fn bootstrap_client(
     );
 
     Ok(AcpClientRuntime {
-        projection,
+        inner,
         initialize_response,
         connection,
         io_task,

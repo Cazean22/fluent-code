@@ -243,8 +243,28 @@ async fn startup_spawns_acp_subprocess_and_initializes_client() {
                 .await
                 .expect("bootstrap ACP client subprocess through TUI startup path");
             let snapshot = runtime.projection_snapshot().await;
+            let initialize_response = runtime.initialize_response();
 
             assert!(snapshot.startup_error.is_none());
+            assert_eq!(
+                initialize_response.protocol_version,
+                acp::ProtocolVersion::V1
+            );
+            assert!(initialize_response.agent_capabilities.load_session);
+            assert_eq!(
+                initialize_response
+                    .agent_info
+                    .as_ref()
+                    .map(|info| info.name.as_str()),
+                Some("fluent-code")
+            );
+            assert_eq!(
+                initialize_response
+                    .agent_info
+                    .as_ref()
+                    .and_then(|info| info.title.as_deref()),
+                Some("Fluent Code")
+            );
             assert!(matches!(
                 snapshot.subprocess.status,
                 SubprocessStatus::Initialized {
