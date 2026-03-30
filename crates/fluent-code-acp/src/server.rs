@@ -233,9 +233,25 @@ struct LivePromptPollResult {
 
 type ManagedSessionHandle = Arc<Mutex<ManagedSession>>;
 
-struct OfficialAgentAdapter {
+struct OfficialAgentConnection {
     server: AcpServer,
-    connection: Mutex<AcpConnectionState>,
+    state: Mutex<AcpConnectionState>,
+}
+
+#[derive(Clone)]
+struct OfficialAgentRuntime {
+    connection: Arc<OfficialAgentConnection>,
+    outbound_sender: mpsc::UnboundedSender<OutboundClientCall>,
+    test_probes_enabled: bool,
+}
+
+tokio::task_local! {
+    static OFFICIAL_AGENT_RUNTIME: OfficialAgentRuntime;
+}
+
+#[derive(Clone)]
+struct OfficialAgentAdapter {
+    connection: Arc<OfficialAgentConnection>,
     outbound_sender: mpsc::UnboundedSender<OutboundClientCall>,
 }
 
@@ -320,11 +336,20 @@ struct TerminalCommandProbeResponse {
 }
 
 impl OfficialAgentAdapter {
-    fn new(server: AcpServer, outbound_sender: mpsc::UnboundedSender<OutboundClientCall>) -> Self {
+    fn for_probe_connection(
+        server: AcpServer,
+        outbound_sender: mpsc::UnboundedSender<OutboundClientCall>,
+    ) -> Self {
         Self {
-            server,
-            connection: Mutex::new(AcpConnectionState::default()),
+            connection: Arc::new(OfficialAgentConnection::new(server)),
             outbound_sender,
+        }
+    }
+
+    fn from_runtime(runtime: &OfficialAgentRuntime) -> Self {
+        Self {
+            connection: Arc::clone(&runtime.connection),
+            outbound_sender: runtime.outbound_sender.clone(),
         }
     }
 
@@ -337,27 +362,7 @@ impl OfficialAgentAdapter {
         TParams: Serialize,
         TResponse: serde::de::DeserializeOwned,
     {
-        let params = serde_json::to_value(params)
-            .map_err(|error| acp::Error::new(JSONRPC_INVALID_PARAMS, error.to_string()))?;
-        let outbound_frames = {
-            let mut connection = self.connection.lock().await;
-            let request_id = next_official_request_id(&mut connection);
-            ensure_official_request_order(connection.protocol.state(), method)
-                .map_err(map_protocol_error_to_acp_error)?;
-            self.server
-                .handle_request(
-                    &mut connection,
-                    ParsedRequest {
-                        jsonrpc: crate::protocol::JSONRPC_VERSION.to_string(),
-                        id: request_id,
-                        method,
-                        params,
-                    },
-                )
-                .await
-                .map_err(map_rpc_response_error)?
-        };
-
+        let outbound_frames = self.connection.delegate_request(method, params).await?;
         self.process_outbound_frames(outbound_frames).await
     }
 
@@ -559,40 +564,6 @@ impl OfficialAgentAdapter {
             .map_err(|_| acp::Error::internal_error())?
     }
 
-    async fn managed_session_handle(
-        &self,
-        session_id: &SessionId,
-        session_id_string: &str,
-    ) -> acp::Result<ManagedSessionHandle> {
-        let connection = self.connection.lock().await;
-        connection
-            .sessions
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| active_session_not_found_error(session_id_string))
-    }
-
-    async fn prepare_official_session_request(
-        &self,
-        method: Method,
-        session_id: &SessionId,
-        session_id_string: &str,
-    ) -> acp::Result<(u64, ManagedSessionHandle)> {
-        let mut connection = self.connection.lock().await;
-        let request_id = next_official_request_id(&mut connection);
-        ensure_official_request_order(connection.protocol.state(), method)
-            .map_err(map_protocol_error_to_acp_error)?;
-        self.server
-            .ensure_authenticated(&connection)
-            .map_err(map_rpc_response_error)?;
-        let managed_session = connection
-            .sessions
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| active_session_not_found_error(session_id_string))?;
-        Ok((request_id, managed_session))
-    }
-
     async fn handle_ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
         match args.method.as_ref() {
             "fluent_code/test/write_text_file" => {
@@ -690,51 +661,17 @@ impl OfficialAgentAdapter {
         request: &acp::RequestPermissionRequest,
         response: acp::RequestPermissionResponse,
     ) -> acp::Result<Vec<Value>> {
-        let session_id =
-            parse_session_id(&request.session_id.to_string()).map_err(map_rpc_response_error)?;
-        let managed_session = self
-            .managed_session_handle(&session_id, &request.session_id.to_string())
-            .await?;
-        let mut managed_session = managed_session.lock().await;
-
-        self.server
-            .apply_permission_response(
-                &request.session_id.to_string(),
-                &mut managed_session,
-                request,
-                response,
-            )
+        self.connection
+            .process_permission_response(request, response)
             .await
-            .map_err(map_rpc_response_error)
     }
 
     async fn handle_live_prompt_request(
         &self,
         args: acp::PromptRequest,
     ) -> acp::Result<acp::PromptResponse> {
-        let session_id = args.session_id.to_string();
-        let managed_session_id = parse_session_id(&session_id).map_err(map_rpc_response_error)?;
-        let prompt =
-            official_prompt_text_from_blocks(&args.prompt).map_err(map_rpc_response_error)?;
-        let (prompt_request_id, managed_session) = self
-            .prepare_official_session_request(
-                Method::SessionPrompt,
-                &managed_session_id,
-                &session_id,
-            )
-            .await?;
-        let outbound_frames = {
-            let mut managed_session = managed_session.lock().await;
-            self.server
-                .start_live_prompt_turn_for_session(
-                    &session_id,
-                    &mut managed_session,
-                    prompt,
-                    prompt_request_id,
-                )
-                .await
-                .map_err(map_rpc_response_error)?
-        };
+        let (session_id, prompt_request_id, managed_session, outbound_frames) =
+            self.connection.start_live_prompt_request(args).await?;
 
         if let Some(response) = self
             .process_prompt_outbound_frames(prompt_request_id, outbound_frames)
@@ -759,10 +696,9 @@ impl OfficialAgentAdapter {
                     ));
                 }
 
-                self.server
+                self.connection
                     .poll_live_prompt_turn(&session_id, &mut managed_session)
-                    .await
-                    .map_err(map_rpc_response_error)?
+                    .await?
             };
 
             if let Some(response) = self
@@ -941,52 +877,172 @@ impl OfficialAgentAdapter {
         }
 
         if let Some(buffered_prompt_completion) = buffered_prompt_completion {
-            let managed_session = self
-                .managed_session_handle(session_id, &session_id.to_string())
+            self.connection
+                .store_buffered_prompt_completion(session_id, buffered_prompt_completion)
                 .await?;
-            let mut managed_session = managed_session.lock().await;
-            managed_session.buffered_prompt_completion = Some(buffered_prompt_completion);
         }
 
         Ok(())
     }
 }
 
-#[async_trait::async_trait(?Send)]
-impl acp::Agent for OfficialAgentAdapter {
-    async fn initialize(
+impl OfficialAgentConnection {
+    fn new(server: AcpServer) -> Self {
+        Self {
+            server,
+            state: Mutex::new(AcpConnectionState::default()),
+        }
+    }
+
+    async fn delegate_request<TParams>(
         &self,
-        args: acp::InitializeRequest,
-    ) -> acp::Result<acp::InitializeResponse> {
-        self.delegate_request(Method::Initialize, args).await
+        method: Method,
+        params: TParams,
+    ) -> acp::Result<Vec<Value>>
+    where
+        TParams: Serialize,
+    {
+        let params = serde_json::to_value(params)
+            .map_err(|error| acp::Error::new(JSONRPC_INVALID_PARAMS, error.to_string()))?;
+        let mut connection = self.state.lock().await;
+        let request_id = next_official_request_id(&mut connection);
+        ensure_official_request_order(connection.protocol.state(), method)
+            .map_err(map_protocol_error_to_acp_error)?;
+        self.server
+            .handle_request(
+                &mut connection,
+                ParsedRequest {
+                    jsonrpc: crate::protocol::JSONRPC_VERSION.to_string(),
+                    id: request_id,
+                    method,
+                    params,
+                },
+            )
+            .await
+            .map_err(map_rpc_response_error)
     }
 
-    async fn authenticate(
+    async fn managed_session_handle(
         &self,
-        args: acp::AuthenticateRequest,
-    ) -> acp::Result<acp::AuthenticateResponse> {
-        self.delegate_request(Method::Authenticate, args).await
+        session_id: &SessionId,
+        session_id_string: &str,
+    ) -> acp::Result<ManagedSessionHandle> {
+        let connection = self.state.lock().await;
+        connection
+            .sessions
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| active_session_not_found_error(session_id_string))
     }
 
-    async fn new_session(
+    async fn prepare_official_session_request(
         &self,
-        args: acp::NewSessionRequest,
-    ) -> acp::Result<acp::NewSessionResponse> {
-        self.delegate_request(Method::SessionNew, args).await
+        method: Method,
+        session_id: &SessionId,
+        session_id_string: &str,
+    ) -> acp::Result<(u64, ManagedSessionHandle)> {
+        let mut connection = self.state.lock().await;
+        let request_id = next_official_request_id(&mut connection);
+        ensure_official_request_order(connection.protocol.state(), method)
+            .map_err(map_protocol_error_to_acp_error)?;
+        self.server
+            .ensure_authenticated(&connection)
+            .map_err(map_rpc_response_error)?;
+        let managed_session = connection
+            .sessions
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| active_session_not_found_error(session_id_string))?;
+        Ok((request_id, managed_session))
     }
 
-    async fn load_session(
+    async fn process_permission_response(
         &self,
-        args: acp::LoadSessionRequest,
-    ) -> acp::Result<acp::LoadSessionResponse> {
-        self.delegate_request(Method::SessionLoad, args).await
+        request: &acp::RequestPermissionRequest,
+        response: acp::RequestPermissionResponse,
+    ) -> acp::Result<Vec<Value>> {
+        let session_id =
+            parse_session_id(&request.session_id.to_string()).map_err(map_rpc_response_error)?;
+        let managed_session = self
+            .managed_session_handle(&session_id, &request.session_id.to_string())
+            .await?;
+        let mut managed_session = managed_session.lock().await;
+
+        self.server
+            .apply_permission_response(
+                &request.session_id.to_string(),
+                &mut managed_session,
+                request,
+                response,
+            )
+            .await
+            .map_err(map_rpc_response_error)
     }
 
-    async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
-        self.handle_live_prompt_request(args).await
+    async fn start_live_prompt_request(
+        &self,
+        args: acp::PromptRequest,
+    ) -> acp::Result<(String, u64, ManagedSessionHandle, Vec<Value>)> {
+        let session_id = args.session_id.to_string();
+        let managed_session_id = parse_session_id(&session_id).map_err(map_rpc_response_error)?;
+        let prompt =
+            official_prompt_text_from_blocks(&args.prompt).map_err(map_rpc_response_error)?;
+        let (prompt_request_id, managed_session) = self
+            .prepare_official_session_request(
+                Method::SessionPrompt,
+                &managed_session_id,
+                &session_id,
+            )
+            .await?;
+        let outbound_frames = {
+            let mut managed_session = managed_session.lock().await;
+            self.server
+                .start_live_prompt_turn_for_session(
+                    &session_id,
+                    &mut managed_session,
+                    prompt,
+                    prompt_request_id,
+                )
+                .await
+                .map_err(map_rpc_response_error)?
+        };
+
+        Ok((
+            session_id,
+            prompt_request_id,
+            managed_session,
+            outbound_frames,
+        ))
     }
 
-    async fn cancel(&self, args: acp::CancelNotification) -> acp::Result<()> {
+    async fn store_buffered_prompt_completion(
+        &self,
+        session_id: &SessionId,
+        buffered_prompt_completion: BufferedPromptCompletion,
+    ) -> acp::Result<()> {
+        let managed_session = self
+            .managed_session_handle(session_id, &session_id.to_string())
+            .await?;
+        let mut managed_session = managed_session.lock().await;
+        managed_session.buffered_prompt_completion = Some(buffered_prompt_completion);
+        Ok(())
+    }
+
+    async fn poll_live_prompt_turn(
+        &self,
+        session_id: &str,
+        managed_session: &mut ManagedSession,
+    ) -> acp::Result<LivePromptPollResult> {
+        self.server
+            .poll_live_prompt_turn(session_id, managed_session)
+            .await
+            .map_err(map_rpc_response_error)
+    }
+
+    async fn prepare_cancel_request(
+        &self,
+        args: &acp::CancelNotification,
+    ) -> acp::Result<(SessionId, u64, Vec<Value>)> {
         let session_id =
             parse_session_id(&args.session_id.to_string()).map_err(map_rpc_response_error)?;
         let (cancel_request_id, managed_session) = self
@@ -1008,18 +1064,97 @@ impl acp::Agent for OfficialAgentAdapter {
                 .map_err(map_rpc_response_error)?
         };
 
-        if let Some(buffered_prompt_completion) =
-            buffered_prompt_completion_from_outbound_frames(cancel_request_id, &outbound_frames)?
-        {
-            let mut managed_session = managed_session.lock().await;
-            managed_session.buffered_prompt_completion = Some(buffered_prompt_completion);
-        }
+        Ok((session_id, cancel_request_id, outbound_frames))
+    }
+}
 
-        self.process_cancel_outbound_frames(&session_id, cancel_request_id, outbound_frames)
+impl OfficialAgentRuntime {
+    fn new(
+        server: AcpServer,
+        outbound_sender: mpsc::UnboundedSender<OutboundClientCall>,
+        test_probes_enabled: bool,
+    ) -> Self {
+        Self {
+            connection: Arc::new(OfficialAgentConnection::new(server)),
+            outbound_sender,
+            test_probes_enabled,
+        }
+    }
+
+    fn adapter(&self) -> OfficialAgentAdapter {
+        OfficialAgentAdapter::from_runtime(self)
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl acp::Agent for AcpServer {
+    async fn initialize(
+        &self,
+        args: acp::InitializeRequest,
+    ) -> acp::Result<acp::InitializeResponse> {
+        self.official_agent_adapter()?
+            .delegate_request(Method::Initialize, args)
             .await
     }
 
-    async fn ext_method(&self, _args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+    async fn authenticate(
+        &self,
+        args: acp::AuthenticateRequest,
+    ) -> acp::Result<acp::AuthenticateResponse> {
+        self.official_agent_adapter()?
+            .delegate_request(Method::Authenticate, args)
+            .await
+    }
+
+    async fn new_session(
+        &self,
+        args: acp::NewSessionRequest,
+    ) -> acp::Result<acp::NewSessionResponse> {
+        self.official_agent_adapter()?
+            .delegate_request(Method::SessionNew, args)
+            .await
+    }
+
+    async fn load_session(
+        &self,
+        args: acp::LoadSessionRequest,
+    ) -> acp::Result<acp::LoadSessionResponse> {
+        self.official_agent_adapter()?
+            .delegate_request(Method::SessionLoad, args)
+            .await
+    }
+
+    async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
+        self.official_agent_adapter()?
+            .handle_live_prompt_request(args)
+            .await
+    }
+
+    async fn cancel(&self, args: acp::CancelNotification) -> acp::Result<()> {
+        let adapter = self.official_agent_adapter()?;
+        let (session_id, cancel_request_id, outbound_frames) =
+            adapter.connection.prepare_cancel_request(&args).await?;
+
+        if let Some(buffered_prompt_completion) =
+            buffered_prompt_completion_from_outbound_frames(cancel_request_id, &outbound_frames)?
+        {
+            adapter
+                .connection
+                .store_buffered_prompt_completion(&session_id, buffered_prompt_completion)
+                .await?;
+        }
+
+        adapter
+            .process_cancel_outbound_frames(&session_id, cancel_request_id, outbound_frames)
+            .await
+    }
+
+    async fn ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+        let runtime = self.official_agent_runtime()?;
+        if runtime.test_probes_enabled {
+            return runtime.adapter().handle_ext_method(args).await;
+        }
+
         Err(acp::Error::method_not_found())
     }
 }
@@ -1036,36 +1171,61 @@ impl acp::Agent for OfficialAgentTestProbeAdapter {
         &self,
         args: acp::InitializeRequest,
     ) -> acp::Result<acp::InitializeResponse> {
-        self.adapter.initialize(args).await
+        self.adapter
+            .delegate_request(Method::Initialize, args)
+            .await
     }
 
     async fn authenticate(
         &self,
         args: acp::AuthenticateRequest,
     ) -> acp::Result<acp::AuthenticateResponse> {
-        self.adapter.authenticate(args).await
+        self.adapter
+            .delegate_request(Method::Authenticate, args)
+            .await
     }
 
     async fn new_session(
         &self,
         args: acp::NewSessionRequest,
     ) -> acp::Result<acp::NewSessionResponse> {
-        self.adapter.new_session(args).await
+        self.adapter
+            .delegate_request(Method::SessionNew, args)
+            .await
     }
 
     async fn load_session(
         &self,
         args: acp::LoadSessionRequest,
     ) -> acp::Result<acp::LoadSessionResponse> {
-        self.adapter.load_session(args).await
+        self.adapter
+            .delegate_request(Method::SessionLoad, args)
+            .await
     }
 
     async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
-        self.adapter.prompt(args).await
+        self.adapter.handle_live_prompt_request(args).await
     }
 
     async fn cancel(&self, args: acp::CancelNotification) -> acp::Result<()> {
-        self.adapter.cancel(args).await
+        let (session_id, cancel_request_id, outbound_frames) = self
+            .adapter
+            .connection
+            .prepare_cancel_request(&args)
+            .await?;
+
+        if let Some(buffered_prompt_completion) =
+            buffered_prompt_completion_from_outbound_frames(cancel_request_id, &outbound_frames)?
+        {
+            self.adapter
+                .connection
+                .store_buffered_prompt_completion(&session_id, buffered_prompt_completion)
+                .await?;
+        }
+
+        self.adapter
+            .process_cancel_outbound_frames(&session_id, cancel_request_id, outbound_frames)
+            .await
     }
 
     async fn ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
@@ -1293,17 +1453,41 @@ impl AcpServer {
             .run_until(async move {
                 let (outbound_sender, outbound_receiver) = mpsc::unbounded_channel();
                 if official_test_probes_enabled() {
-                    let adapter = OfficialAgentTestProbeAdapter::new(OfficialAgentAdapter::new(
-                        server,
-                        outbound_sender,
-                    ));
-                    run_official_agent_connection(adapter, reader, writer, outbound_receiver).await
+                    let probe_adapter = OfficialAgentTestProbeAdapter::new(
+                        OfficialAgentAdapter::for_probe_connection(server, outbound_sender),
+                    );
+                    run_probe_official_agent_connection(
+                        probe_adapter,
+                        reader,
+                        writer,
+                        outbound_receiver,
+                    )
+                    .await
                 } else {
-                    let adapter = OfficialAgentAdapter::new(server, outbound_sender);
-                    run_official_agent_connection(adapter, reader, writer, outbound_receiver).await
+                    run_official_agent_server_connection(
+                        server,
+                        reader,
+                        writer,
+                        outbound_sender,
+                        outbound_receiver,
+                    )
+                    .await
                 }
             })
             .await
+    }
+
+    fn official_agent_runtime(&self) -> acp::Result<OfficialAgentRuntime> {
+        OFFICIAL_AGENT_RUNTIME.try_with(Clone::clone).map_err(|_| {
+            acp::Error::new(
+                JSONRPC_INTERNAL_ERROR,
+                "official ACP server methods require an active per-connection runtime",
+            )
+        })
+    }
+
+    fn official_agent_adapter(&self) -> acp::Result<OfficialAgentAdapter> {
+        Ok(self.official_agent_runtime()?.adapter())
     }
 
     fn initialize_response(&self, requested_protocol_version: u16) -> InitializeResponse {
@@ -2321,8 +2505,8 @@ fn official_prompt_text_from_blocks(
     Ok(prompt)
 }
 
-async fn run_official_agent_connection<R, W, A>(
-    adapter: A,
+async fn run_probe_official_agent_connection<R, W, A>(
+    probe_adapter: A,
     reader: R,
     writer: W,
     mut outbound_receiver: mpsc::UnboundedReceiver<OutboundClientCall>,
@@ -2332,9 +2516,10 @@ where
     W: AsyncWrite + Unpin + 'static,
     A: acp::Agent + 'static,
 {
-    let (connection, io_task) = acp::AgentSideConnection::new(adapter, writer, reader, |future| {
-        tokio::task::spawn_local(future);
-    });
+    let (connection, io_task) =
+        acp::AgentSideConnection::new(probe_adapter, writer, reader, |future| {
+            tokio::task::spawn_local(future);
+        });
 
     tokio::task::spawn_local(async move {
         while let Some(outbound_call) = outbound_receiver.recv().await {
@@ -2371,6 +2556,71 @@ where
         .await
         .map_err(|error| FluentCodeError::Provider(format!("ACP connection error: {error}")))
         .map(|_| 0)
+}
+
+async fn run_official_agent_server_connection<R, W>(
+    server: AcpServer,
+    reader: R,
+    writer: W,
+    outbound_sender: mpsc::UnboundedSender<OutboundClientCall>,
+    mut outbound_receiver: mpsc::UnboundedReceiver<OutboundClientCall>,
+) -> Result<usize>
+where
+    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin + 'static,
+{
+    let runtime = OfficialAgentRuntime::new(server.clone(), outbound_sender, false);
+    let spawn_runtime = runtime.clone();
+    let (connection, io_task) = OFFICIAL_AGENT_RUNTIME
+        .scope(runtime.clone(), async move {
+            acp::AgentSideConnection::new(server, writer, reader, move |future| {
+                let runtime = spawn_runtime.clone();
+                tokio::task::spawn_local(OFFICIAL_AGENT_RUNTIME.scope(runtime, future));
+            })
+        })
+        .await;
+
+    tokio::task::spawn_local(async move {
+        while let Some(outbound_call) = outbound_receiver.recv().await {
+            match outbound_call {
+                OutboundClientCall::SessionNotification { notification, ack } => {
+                    let _ = ack.send(connection.session_notification(notification).await);
+                }
+                OutboundClientCall::RequestPermission { request, ack } => {
+                    let _ = ack.send(connection.request_permission(request).await);
+                }
+                OutboundClientCall::ReadTextFile { request, ack } => {
+                    let _ = ack.send(connection.read_text_file(request).await);
+                }
+                OutboundClientCall::WriteTextFile { request, ack } => {
+                    let _ = ack.send(connection.write_text_file(request).await);
+                }
+                OutboundClientCall::CreateTerminal { request, ack } => {
+                    let _ = ack.send(connection.create_terminal(request).await);
+                }
+                OutboundClientCall::WaitForTerminalExit { request, ack } => {
+                    let _ = ack.send(connection.wait_for_terminal_exit(request).await);
+                }
+                OutboundClientCall::TerminalOutput { request, ack } => {
+                    let _ = ack.send(connection.terminal_output(request).await);
+                }
+                OutboundClientCall::ReleaseTerminal { request, ack } => {
+                    let _ = ack.send(connection.release_terminal(request).await);
+                }
+            }
+        }
+    });
+
+    OFFICIAL_AGENT_RUNTIME
+        .scope(runtime, async move {
+            io_task
+                .await
+                .map_err(|error| {
+                    FluentCodeError::Provider(format!("ACP connection error: {error}"))
+                })
+                .map(|_| 0)
+        })
+        .await
 }
 
 impl BufferedPromptCompletion {

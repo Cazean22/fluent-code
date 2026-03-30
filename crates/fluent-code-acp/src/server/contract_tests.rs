@@ -47,18 +47,25 @@ async fn contract_initialize_rejects_unsupported_protocol_version() {
     );
 
     let capture = harness.run_script(&server, &script).await.unwrap();
+    let stdout_frames = capture.stdout_frames();
 
     assert_eq!(capture.frames_processed, 2);
-    assert_eq!(capture.stdout_frames()[0]["error"]["code"], -32602);
+    assert_eq!(stdout_frames.len(), 2);
+    assert_eq!(stdout_frames[0]["id"], 1);
+    assert_eq!(stdout_frames[0]["error"]["code"], -32602);
     assert_eq!(
-        capture.stdout_frames()[0]["error"]["message"],
+        stdout_frames[0]["error"]["message"],
         "unsupported ACP protocol version `999`; expected `1`"
     );
-    assert_eq!(capture.stdout_frames()[1]["error"]["code"], -32600);
+    assert!(stdout_frames[0].get("result").is_none());
+    assert_eq!(stdout_frames[1]["id"], 2);
+    assert_eq!(stdout_frames[1]["error"]["code"], -32600);
     assert_eq!(
-        capture.stdout_frames()[1]["error"]["message"],
+        stdout_frames[1]["error"]["message"],
         "initialize must be the first request, got `session/new`"
     );
+    assert!(stdout_frames[1].get("result").is_none());
+    assert_stdout_contains_only_jsonrpc_frames(&capture);
 
     cleanup(temp_dir);
 }
@@ -417,10 +424,16 @@ async fn contract_live_same_connection_cancel_resolves_prompt_over_stdio_loop() 
     sender.await.unwrap();
 
     let responses = stdout_frames(&output);
+    let response_ids = responses
+        .iter()
+        .filter_map(|frame| frame.get("id").and_then(Value::as_u64))
+        .collect::<Vec<_>>();
     let cancel_response_index = responses.iter().position(|frame| frame["id"] == 4).unwrap();
     let prompt_response_index = responses.iter().position(|frame| frame["id"] == 3).unwrap();
 
     assert_eq!(frames_processed, 4);
+    assert_eq!(response_ids, vec![1, 2, 4, 3]);
+    assert!(responses.iter().all(|frame| frame.get("error").is_none()));
     assert_eq!(
         responses[cancel_response_index]["result"]["stopReason"],
         "cancelled"
