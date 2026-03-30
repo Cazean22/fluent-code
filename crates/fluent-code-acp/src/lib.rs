@@ -1,8 +1,9 @@
-pub mod dev_harness;
-pub mod mapping;
-pub mod protocol;
-pub mod server;
-pub mod transport;
+#[cfg(test)]
+mod dev_harness;
+mod mapping;
+mod protocol;
+mod server;
+mod transport;
 
 pub use fluent_code_app::{FluentCodeError, Result};
-pub use server::{AcpServer, AcpServerDependencies, HeadlessAppHost, run};
+pub use server::{AcpServer, AcpServerDependencies, run};

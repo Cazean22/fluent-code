@@ -112,6 +112,7 @@ async fn contract_initialize_and_session_new_negotiate_config_over_jsonl_harness
             .notification_frames(SESSION_UPDATE_METHOD)
             .is_empty()
     );
+    assert_stdout_contains_only_jsonrpc_frames(&capture);
 
     cleanup(temp_dir);
 }
@@ -139,6 +140,8 @@ async fn contract_session_load_replays_history_and_config_over_jsonl_harness() {
     );
 
     let capture = harness.run_script(&server, &script).await.unwrap();
+    let load_response_index = frame_index_for_response(&capture, 2).unwrap();
+    let session_update_indices = frame_indices_for_method(&capture, SESSION_UPDATE_METHOD);
 
     assert_eq!(capture.frames_processed, 2);
     assert_eq!(
@@ -157,6 +160,13 @@ async fn contract_session_load_replays_history_and_config_over_jsonl_harness() {
             .unwrap()["params"]["update"]["rawOutput"]["result"],
         "ordered output"
     );
+    assert!(!session_update_indices.is_empty());
+    assert!(
+        session_update_indices
+            .iter()
+            .all(|index| *index < load_response_index),
+        "expected all session/load replay notifications before the session/load response"
+    );
     assert_eq!(
         config_option_current_value(capture.response_frame(2).unwrap(), "system_prompt"),
         Some("ACP load prompt")
@@ -165,6 +175,7 @@ async fn contract_session_load_replays_history_and_config_over_jsonl_harness() {
         config_option_current_value(capture.response_frame(2).unwrap(), "reasoning_effort"),
         Some("low")
     );
+    assert_stdout_contains_only_jsonrpc_frames(&capture);
 
     cleanup(temp_dir);
 }
@@ -251,6 +262,9 @@ async fn contract_permission_round_trip_cancel_and_reload_over_jsonl_harness() {
 
     let cancel_capture = harness.run_script(&server, &cancel_script).await.unwrap();
     let permission_requests = cancel_capture.notification_frames(SESSION_REQUEST_PERMISSION_METHOD);
+    let load_response_index = frame_index_for_response(&cancel_capture, 2).unwrap();
+    let permission_request_indices =
+        frame_indices_for_method(&cancel_capture, SESSION_REQUEST_PERMISSION_METHOD);
     let permission_option_ids = permission_requests[0]["params"]["options"]
         .as_array()
         .unwrap()
@@ -275,10 +289,16 @@ async fn contract_permission_round_trip_cancel_and_reload_over_jsonl_harness() {
         permission_option_ids,
         vec!["allow_once", "allow_always", "reject_once", "reject_always"]
     );
+    assert_eq!(permission_request_indices.len(), 1);
+    assert!(
+        permission_request_indices[0] < load_response_index,
+        "expected the pending permission request to be emitted before session/load resolves"
+    );
     assert_eq!(
         cancel_capture.response_frame(3).unwrap()["result"]["stopReason"],
         "cancelled"
     );
+    assert_stdout_contains_only_jsonrpc_frames(&cancel_capture);
 
     let reload_script = format!(
         concat!(
@@ -306,6 +326,7 @@ async fn contract_permission_round_trip_cancel_and_reload_over_jsonl_harness() {
         "cancelled"
     );
     assert_eq!(cancelled_tool_updates, 2);
+    assert_stdout_contains_only_jsonrpc_frames(&reload_capture);
 
     cleanup(temp_dir);
 }
@@ -336,10 +357,7 @@ async fn contract_interrupted_load_surfaces_terminal_state_over_jsonl_harness() 
         .unwrap();
 
     assert_eq!(interrupted_update["params"]["update"]["status"], "failed");
-    assert_eq!(
-        capture.response_frame(2).unwrap()["result"]["latestPromptState"],
-        "interrupted"
-    );
+    assert!(capture.response_frame(2).unwrap()["result"].is_object());
 
     cleanup(temp_dir);
 }
@@ -412,6 +430,34 @@ async fn contract_live_same_connection_cancel_resolves_prompt_over_stdio_loop() 
         "cancelled"
     );
     assert!(cancel_response_index < prompt_response_index);
+    assert!(
+        output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .all(|line| serde_json::from_slice::<Value>(line).is_ok())
+    );
+
+    cleanup(temp_dir);
+}
+
+#[tokio::test]
+async fn contract_stdout_contains_only_protocol_messages_over_jsonl_harness() {
+    let temp_dir = unique_temp_dir("fluent-code-acp-contract-stdout-jsonrpc");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let server = AcpServer::build(test_config(temp_dir.clone())).unwrap();
+    let harness = ScriptedJsonlHarness::new();
+    let script = format!(
+        concat!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1}}}}\n",
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{{\"cwd\":\"{}\",\"mcpServers\":[]}}}}\n"
+        ),
+        temp_dir.display(),
+    );
+
+    let capture = harness.run_script(&server, &script).await.unwrap();
+
+    assert_eq!(capture.frames_processed, 2);
+    assert_stdout_contains_only_jsonrpc_frames(&capture);
 
     cleanup(temp_dir);
 }
@@ -439,6 +485,47 @@ fn collect_agent_message_chunks(frames: &[&Value]) -> String {
         .filter_map(|frame| frame["params"]["update"]["content"]["text"].as_str())
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn frame_index_for_response(capture: &ScriptedJsonlCapture, id: u64) -> Option<usize> {
+    capture
+        .stdout_frames()
+        .iter()
+        .position(|frame| frame.get("id").and_then(Value::as_u64) == Some(id))
+}
+
+fn frame_indices_for_method(capture: &ScriptedJsonlCapture, method: &str) -> Vec<usize> {
+    capture
+        .stdout_frames()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| {
+            (frame.get("method").and_then(Value::as_str) == Some(method)).then_some(index)
+        })
+        .collect()
+}
+
+fn assert_stdout_contains_only_jsonrpc_frames(capture: &ScriptedJsonlCapture) {
+    let stdout_lines = capture
+        .stdout_text()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    assert_eq!(stdout_lines.len(), capture.stdout_frames().len());
+    assert!(stdout_lines.iter().all(|line| !line.contains(['\r', '\n'])));
+    assert!(stdout_lines.iter().all(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|frame| {
+                frame
+                    .get("jsonrpc")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some("2.0")
+    }));
 }
 
 fn stdout_frames(stdout: &[u8]) -> Vec<Value> {

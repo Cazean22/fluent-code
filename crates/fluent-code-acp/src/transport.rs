@@ -1,6 +1,14 @@
-use std::io::{self, BufRead, Write};
+#![cfg_attr(not(test), allow(dead_code))]
 
+#[cfg(test)]
+use std::io;
+
+#[cfg(test)]
+use std::io::{BufRead, Write};
+
+#[cfg(test)]
 use serde::Serialize;
+#[cfg(test)]
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -15,6 +23,7 @@ impl StdioTransport {
         "stdio"
     }
 
+    #[cfg(test)]
     pub fn read_frame<R: BufRead>(
         self,
         reader: &mut R,
@@ -22,7 +31,7 @@ impl StdioTransport {
         let mut frame_bytes = Vec::new();
         let bytes_read = reader
             .read_until(b'\n', &mut frame_bytes)
-            .map_err(StdioTransportError::ReadFrame)?;
+            .map_err(StdioTransportError::Read)?;
 
         if bytes_read == 0 {
             return Ok(None);
@@ -32,7 +41,7 @@ impl StdioTransport {
             return Err(StdioTransportError::UnterminatedFrame);
         }
 
-        let frame = String::from_utf8(frame_bytes).map_err(StdioTransportError::NonUtf8Frame)?;
+        let frame = String::from_utf8(frame_bytes).map_err(StdioTransportError::NonUtf8)?;
         let frame = frame
             .strip_suffix('\n')
             .expect("frame bytes ending in newline always strip one newline");
@@ -49,12 +58,13 @@ impl StdioTransport {
         Ok(Some(frame.to_string()))
     }
 
+    #[cfg(test)]
     pub fn serialize_frame<T: Serialize>(
         self,
         message: &T,
     ) -> Result<Vec<u8>, StdioTransportError> {
         let serialized_frame =
-            serde_json::to_vec(message).map_err(StdioTransportError::SerializeFrame)?;
+            serde_json::to_vec(message).map_err(StdioTransportError::Serialize)?;
 
         if serialized_frame.contains(&b'\n') || serialized_frame.contains(&b'\r') {
             return Err(StdioTransportError::MultilineFrame);
@@ -65,6 +75,7 @@ impl StdioTransport {
         Ok(framed_output)
     }
 
+    #[cfg(test)]
     pub fn write_frame<W: Write, T: Serialize>(
         self,
         writer: &mut W,
@@ -74,16 +85,17 @@ impl StdioTransport {
         writer
             .write_all(&frame)
             .and_then(|()| writer.flush())
-            .map_err(StdioTransportError::WriteFrame)
+            .map_err(StdioTransportError::Write)
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Error)]
 pub enum StdioTransportError {
     #[error("failed to read stdio frame")]
-    ReadFrame(#[source] io::Error),
+    Read(#[source] io::Error),
     #[error("stdio frame must be UTF-8")]
-    NonUtf8Frame(#[source] std::string::FromUtf8Error),
+    NonUtf8(#[source] std::string::FromUtf8Error),
     #[error("stdio frame must end with a newline delimiter")]
     UnterminatedFrame,
     #[error("stdio frame must contain exactly one JSON-RPC line")]
@@ -91,9 +103,9 @@ pub enum StdioTransportError {
     #[error("stdio frame must not be empty")]
     EmptyFrame,
     #[error("failed to serialize JSON-RPC frame")]
-    SerializeFrame(#[source] serde_json::Error),
+    Serialize(#[source] serde_json::Error),
     #[error("failed to write stdio frame")]
-    WriteFrame(#[source] io::Error),
+    Write(#[source] io::Error),
 }
 
 #[cfg(test)]

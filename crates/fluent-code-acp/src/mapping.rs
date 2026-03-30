@@ -12,9 +12,9 @@ use crate::protocol::{
     ACP_PROTOCOL_VERSION, AgentCapabilities, AgentMessageChunk, AgentThoughtChunk, AuthMethod,
     ContentBlock, InitializeResponse, PermissionOption, PermissionOptionKind,
     RequestPermissionRequest, ServerInfo, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption, SessionInfo,
-    SessionInfoUpdate, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
-    ToolCallStatus, ToolCallUpdate, ToolKind, UserMessageChunk,
+    SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption, SessionUpdate,
+    StopReason, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolKind, UserMessageChunk,
 };
 
 const TOOL_CALL_CREATE_PHASE: ProjectionEventPhase = ProjectionEventPhase::ToolCallCreate;
@@ -83,22 +83,6 @@ impl SessionUpdateMapper {
 
     pub fn session_config_options(&self) -> Option<Vec<SessionConfigOption>> {
         (!self.session_config_options.is_empty()).then(|| self.session_config_options.clone())
-    }
-
-    pub fn session_info(&self, cwd: &Path, session: &Session) -> SessionInfo {
-        SessionInfo {
-            cwd: cwd.display().to_string(),
-            session_id: session.id.to_string(),
-            title: session_title(session),
-            updated_at: Some(session.updated_at.to_rfc3339()),
-        }
-    }
-
-    pub fn session_info_update(&self, session: &Session) -> SessionInfoUpdate {
-        SessionInfoUpdate {
-            title: session_title(session),
-            updated_at: Some(session.updated_at.to_rfc3339()),
-        }
     }
 
     pub fn project_prompt_turns(&self, state: &AppState) -> Vec<PromptTurnProjection> {
@@ -369,11 +353,6 @@ pub enum ProjectionEventPhase {
 pub enum TerminalStopProjection {
     PromptResponse(StopReason),
     SessionState(RunTerminalStopReason),
-}
-
-fn session_title(session: &Session) -> Option<String> {
-    let title = session.title.trim();
-    (!title.is_empty()).then(|| title.to_string())
 }
 
 fn is_valid_sequence(session: &Session, sequence: ReplaySequence) -> bool {

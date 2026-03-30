@@ -53,6 +53,7 @@ pub fn render(frame: &mut Frame, state: &AppState, ui_state: &UiState) {
 // Layout
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 pub(crate) fn transcript_area(area: Rect) -> Rect {
     shell_areas(area).1
 }

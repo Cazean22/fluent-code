@@ -1,13 +1,18 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+use std::io::{BufRead, Write};
+
+use agent_client_protocol::{self as acp, Client as _};
 use fluent_code_app::agent::AgentRegistry;
-use fluent_code_app::app::{AppState, AppStatus, Effect, Msg, recover_startup_foreground, update};
+use fluent_code_app::app::permissions::{PermissionReply, can_remember_reply, remember_reply};
+use fluent_code_app::app::{AppState, AppStatus, Msg};
 use fluent_code_app::bootstrap::{AppBootstrap, BootstrapContext};
 use fluent_code_app::config::Config;
+use fluent_code_app::host::SharedAppHost;
 use fluent_code_app::logging::{config_source_for_log, path_for_log};
 use fluent_code_app::plugin::{PluginLoadSnapshot, ToolRegistry};
 use fluent_code_app::runtime::Runtime;
@@ -15,12 +20,18 @@ use fluent_code_app::session::model::{
     ForegroundPhase, RunId, RunTerminalStopReason, Session, SessionId, TaskDelegationStatus,
     ToolApprovalState, ToolExecutionState,
 };
-use fluent_code_app::session::store::{FsSessionStore, SessionStore};
+use fluent_code_app::session::store::FsSessionStore;
 use fluent_code_app::{FluentCodeError, Result};
-use serde::Serialize;
+use futures::io::{AsyncRead, AsyncWrite};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
-use tracing::{debug, info};
+use serde_json::value::{RawValue, to_raw_value};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tracing::info;
+
+#[cfg(test)]
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::mapping::{
@@ -32,7 +43,7 @@ use crate::protocol::{
     InitializeRequest, InitializeResponse, JsonRpcErrorResponse, JsonRpcNotification,
     JsonRpcProtocol, JsonRpcResponse, LoadSessionRequest, LoadSessionResponse, Method,
     NewSessionRequest, NewSessionResponse, ParsedRequest, PromptTurnState, ProtocolError,
-    ServerInfo, SessionCancelRequest, SessionNotification, SessionPromptRequest,
+    ProtocolState, ServerInfo, SessionCancelRequest, SessionNotification, SessionPromptRequest,
     SessionPromptResponse, SessionUpdate, ToolCallUpdate, UserMessageChunk,
 };
 use crate::transport::StdioTransport;
@@ -45,6 +56,7 @@ const JSONRPC_INTERNAL_ERROR: i32 = -32603;
 const ACP_AUTH_REQUIRED: i32 = -32000;
 const ACP_RESOURCE_NOT_FOUND: i32 = -32002;
 const ACP_ACTIVE_PROMPT: i32 = -32003;
+const ACP_TEST_PROBES_ENV_VAR: &str = "FLUENT_CODE_ACP_ENABLE_TEST_PROBES";
 const SESSION_UPDATE_METHOD: &str = "session/update";
 const SESSION_REQUEST_PERMISSION_METHOD: &str = "session/request_permission";
 const PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -73,210 +85,9 @@ pub async fn run() -> Result<()> {
         .await
 }
 
-pub struct HeadlessAppHost {
-    state: AppState,
-    store: FsSessionStore,
-    runtime: Runtime,
-    runtime_sender: mpsc::UnboundedSender<Msg>,
-    runtime_receiver: mpsc::UnboundedReceiver<Msg>,
-}
+type ManagedAppHost = SharedAppHost;
 
-impl HeadlessAppHost {
-    pub fn new(
-        session: Session,
-        store: FsSessionStore,
-        runtime: Runtime,
-        agent_registry: Arc<AgentRegistry>,
-        tool_registry: Arc<ToolRegistry>,
-        plugin_load_snapshot: PluginLoadSnapshot,
-    ) -> Self {
-        let (runtime_sender, runtime_receiver) = mpsc::unbounded_channel();
-
-        Self {
-            state: AppState::new_with_plugin_state(
-                session,
-                agent_registry,
-                tool_registry,
-                plugin_load_snapshot,
-            ),
-            store,
-            runtime,
-            runtime_sender,
-            runtime_receiver,
-        }
-    }
-
-    pub fn load_or_create(
-        store: FsSessionStore,
-        runtime: Runtime,
-        agent_registry: Arc<AgentRegistry>,
-        tool_registry: Arc<ToolRegistry>,
-        plugin_load_snapshot: PluginLoadSnapshot,
-    ) -> Result<Self> {
-        let session = store.load_or_create_latest()?;
-        Ok(Self::new(
-            session,
-            store,
-            runtime,
-            agent_registry,
-            tool_registry,
-            plugin_load_snapshot,
-        ))
-    }
-
-    pub fn load(
-        session_id: &SessionId,
-        store: FsSessionStore,
-        runtime: Runtime,
-        agent_registry: Arc<AgentRegistry>,
-        tool_registry: Arc<ToolRegistry>,
-        plugin_load_snapshot: PluginLoadSnapshot,
-    ) -> Result<Self> {
-        let session = store.load(session_id)?;
-        Ok(Self::new(
-            session,
-            store,
-            runtime,
-            agent_registry,
-            tool_registry,
-            plugin_load_snapshot,
-        ))
-    }
-
-    pub fn state(&self) -> &AppState {
-        &self.state
-    }
-
-    pub fn state_mut(&mut self) -> &mut AppState {
-        &mut self.state
-    }
-
-    pub fn runtime_sender(&self) -> mpsc::UnboundedSender<Msg> {
-        self.runtime_sender.clone()
-    }
-
-    pub async fn recover_startup(&mut self) -> Result<()> {
-        let effects = recover_startup_foreground(&mut self.state);
-        if effects.is_empty() {
-            return Ok(());
-        }
-
-        self.apply_effects(effects, &mut VecDeque::new()).await
-    }
-
-    pub async fn submit_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
-        self.handle_message(Msg::InputChanged(prompt.into()))
-            .await?;
-        self.handle_message(Msg::SubmitPrompt).await
-    }
-
-    pub async fn handle_message(&mut self, msg: Msg) -> Result<()> {
-        if matches!(msg, Msg::NewSession) {
-            self.create_and_swap_session()?;
-            return Ok(());
-        }
-
-        debug!(
-            session_id = %self.state.session.id,
-            message = ?msg,
-            "handling headless host message"
-        );
-
-        let mut pending_messages = VecDeque::from([msg]);
-
-        while let Some(message) = pending_messages.pop_front() {
-            let effects = update(&mut self.state, message);
-            self.apply_effects(effects, &mut pending_messages).await?;
-        }
-
-        Ok(())
-    }
-
-    pub async fn drain_runtime_messages(&mut self) -> Result<()> {
-        while let Ok(message) = self.runtime_receiver.try_recv() {
-            debug!(
-                session_id = %self.state.session.id,
-                message = ?message,
-                "draining queued runtime message into headless host state"
-            );
-            self.handle_message(message).await?;
-        }
-
-        Ok(())
-    }
-
-    fn create_and_swap_session(&mut self) -> Result<()> {
-        let session = self.store.create_new_session()?;
-        info!(session_id = %session.id, "swapped headless host to new session");
-        self.state.replace_session(session);
-        Ok(())
-    }
-
-    async fn apply_effects(
-        &mut self,
-        effects: Vec<Effect>,
-        pending_messages: &mut VecDeque<Msg>,
-    ) -> Result<()> {
-        for effect in effects {
-            self.apply_effect(
-                effect,
-                "forwarding async effect from headless host to runtime",
-            )?;
-        }
-
-        while let Some(message) = pending_messages.pop_front() {
-            let effects = update(&mut self.state, message);
-            for effect in effects {
-                self.apply_effect(
-                    effect,
-                    "forwarding queued async effect from headless host to runtime",
-                )?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn apply_effect(&mut self, effect: Effect, async_effect_log_context: &str) -> Result<()> {
-        match effect {
-            Effect::PersistSession => self.persist_session(),
-            Effect::PersistSessionIfDue => self.persist_session_if_due(),
-            Effect::StartAssistant { .. }
-            | Effect::ExecuteTool { .. }
-            | Effect::CancelAssistant { .. } => {
-                debug!(
-                    session_id = %self.state.session.id,
-                    effect = ?effect,
-                    "{async_effect_log_context}"
-                );
-                self.runtime
-                    .spawn_effect(effect, self.runtime_sender.clone());
-                Ok(())
-            }
-        }
-    }
-
-    fn persist_session(&mut self) -> Result<()> {
-        debug!(session_id = %self.state.session.id, "persisting session snapshot from headless host");
-        self.store.save(&self.state.session)?;
-        Ok(())
-    }
-
-    fn persist_session_if_due(&mut self) -> Result<()> {
-        if self.state.should_checkpoint_now() {
-            debug!(session_id = %self.state.session.id, "persisting due session checkpoint from headless host");
-            self.store.save(&self.state.session)?;
-            self.state.mark_checkpoint_saved();
-        }
-
-        Ok(())
-    }
-
-    pub fn persist_now(&mut self) -> Result<()> {
-        self.persist_session()
-    }
-}
-
+#[derive(Clone)]
 pub struct AcpServerDependencies {
     pub config: Config,
     pub store: FsSessionStore,
@@ -312,25 +123,27 @@ impl AcpServerDependencies {
     }
 }
 
+#[derive(Clone)]
 pub struct AcpServer {
     dependencies: AcpServerDependencies,
     transport: StdioTransport,
     mapper: SessionUpdateMapper,
 }
 
-#[derive(Default)]
 struct AcpConnectionState {
     protocol: JsonRpcProtocol,
     authenticated: bool,
-    sessions: HashMap<SessionId, ManagedSession>,
+    sessions: HashMap<SessionId, ManagedSessionHandle>,
+    next_request_id: u64,
 }
 
 struct ManagedSession {
     _cwd: PathBuf,
     _mcp_servers: Vec<Value>,
-    host: HeadlessAppHost,
+    host: ManagedAppHost,
     live_prompt_turn: Option<LivePromptTurnState>,
     pending_prompt_request_id: Option<u64>,
+    buffered_prompt_completion: Option<BufferedPromptCompletion>,
 }
 
 struct LivePromptTurnState {
@@ -338,10 +151,15 @@ struct LivePromptTurnState {
     emission_state: PromptTurnEmissionState,
 }
 
+enum BufferedPromptCompletion {
+    Response(acp::PromptResponse),
+    Error { code: i32, message: String },
+}
+
+#[cfg(test)]
 enum ReaderEvent {
     Frame(String),
     Eof,
-    Error(String),
 }
 
 #[derive(Clone, Copy)]
@@ -410,6 +228,849 @@ struct PromptTurnResult {
 
 struct LivePromptPollResult {
     frames: Vec<Value>,
+    prompt_turn_complete: bool,
+}
+
+type ManagedSessionHandle = Arc<Mutex<ManagedSession>>;
+
+struct OfficialAgentAdapter {
+    server: AcpServer,
+    connection: Mutex<AcpConnectionState>,
+    outbound_sender: mpsc::UnboundedSender<OutboundClientCall>,
+}
+
+struct OfficialAgentTestProbeAdapter {
+    adapter: OfficialAgentAdapter,
+}
+
+enum OutboundClientCall {
+    SessionNotification {
+        notification: acp::SessionNotification,
+        ack: oneshot::Sender<acp::Result<()>>,
+    },
+    RequestPermission {
+        request: acp::RequestPermissionRequest,
+        ack: oneshot::Sender<acp::Result<acp::RequestPermissionResponse>>,
+    },
+    ReadTextFile {
+        request: acp::ReadTextFileRequest,
+        ack: oneshot::Sender<acp::Result<acp::ReadTextFileResponse>>,
+    },
+    WriteTextFile {
+        request: acp::WriteTextFileRequest,
+        ack: oneshot::Sender<acp::Result<acp::WriteTextFileResponse>>,
+    },
+    CreateTerminal {
+        request: acp::CreateTerminalRequest,
+        ack: oneshot::Sender<acp::Result<acp::CreateTerminalResponse>>,
+    },
+    WaitForTerminalExit {
+        request: acp::WaitForTerminalExitRequest,
+        ack: oneshot::Sender<acp::Result<acp::WaitForTerminalExitResponse>>,
+    },
+    TerminalOutput {
+        request: acp::TerminalOutputRequest,
+        ack: oneshot::Sender<acp::Result<acp::TerminalOutputResponse>>,
+    },
+    ReleaseTerminal {
+        request: acp::ReleaseTerminalRequest,
+        ack: oneshot::Sender<acp::Result<acp::ReleaseTerminalResponse>>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct FilesystemWriteProbeRequest {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    path: PathBuf,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FilesystemReadProbeRequest {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    path: PathBuf,
+    line: Option<u32>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct FilesystemReadProbeResponse {
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalCommandProbeRequest {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    command: String,
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    #[serde(rename = "outputByteLimit")]
+    output_byte_limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalCommandProbeResponse {
+    output: String,
+    truncated: bool,
+    #[serde(rename = "exitCode")]
+    exit_code: Option<i32>,
+}
+
+impl OfficialAgentAdapter {
+    fn new(server: AcpServer, outbound_sender: mpsc::UnboundedSender<OutboundClientCall>) -> Self {
+        Self {
+            server,
+            connection: Mutex::new(AcpConnectionState::default()),
+            outbound_sender,
+        }
+    }
+
+    async fn delegate_request<TParams, TResponse>(
+        &self,
+        method: Method,
+        params: TParams,
+    ) -> acp::Result<TResponse>
+    where
+        TParams: Serialize,
+        TResponse: serde::de::DeserializeOwned,
+    {
+        let params = serde_json::to_value(params)
+            .map_err(|error| acp::Error::new(JSONRPC_INVALID_PARAMS, error.to_string()))?;
+        let outbound_frames = {
+            let mut connection = self.connection.lock().await;
+            let request_id = next_official_request_id(&mut connection);
+            ensure_official_request_order(connection.protocol.state(), method)
+                .map_err(map_protocol_error_to_acp_error)?;
+            self.server
+                .handle_request(
+                    &mut connection,
+                    ParsedRequest {
+                        jsonrpc: crate::protocol::JSONRPC_VERSION.to_string(),
+                        id: request_id,
+                        method,
+                        params,
+                    },
+                )
+                .await
+                .map_err(map_rpc_response_error)?
+        };
+
+        self.process_outbound_frames(outbound_frames).await
+    }
+
+    async fn process_outbound_frames<TResponse>(
+        &self,
+        outbound_frames: Vec<Value>,
+    ) -> acp::Result<TResponse>
+    where
+        TResponse: serde::de::DeserializeOwned,
+    {
+        let mut response = None;
+        let mut outbound_frames = VecDeque::from(outbound_frames);
+
+        while let Some(outbound_frame) = outbound_frames.pop_front() {
+            if outbound_frame.get("method").and_then(Value::as_str) == Some(SESSION_UPDATE_METHOD) {
+                let notification = serde_json::from_value::<acp::SessionNotification>(
+                    outbound_frame
+                        .get("params")
+                        .cloned()
+                        .ok_or_else(acp::Error::internal_error)?,
+                )
+                .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
+                self.send_session_notification(notification).await?;
+                continue;
+            }
+
+            if outbound_frame.get("method").and_then(Value::as_str)
+                == Some(SESSION_REQUEST_PERMISSION_METHOD)
+            {
+                let request = serde_json::from_value::<acp::RequestPermissionRequest>(
+                    outbound_frame
+                        .get("params")
+                        .cloned()
+                        .ok_or_else(acp::Error::internal_error)?,
+                )
+                .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
+                let client_response = self.request_permission(request.clone()).await?;
+                let follow_up_frames = self
+                    .process_permission_response(&request, client_response)
+                    .await?;
+                outbound_frames.extend(follow_up_frames);
+                continue;
+            }
+
+            if let Some(error) = outbound_frame.get("error") {
+                let code = error
+                    .get("code")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(acp::Error::internal_error)? as i32;
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .ok_or_else(acp::Error::internal_error)?;
+                return Err(acp::Error::new(code, message));
+            }
+
+            if let Some(result) = outbound_frame.get("result") {
+                response = Some(
+                    serde_json::from_value::<TResponse>(result.clone()).map_err(|error| {
+                        acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string())
+                    })?,
+                );
+            }
+        }
+
+        response.ok_or_else(|| {
+            acp::Error::new(
+                JSONRPC_INTERNAL_ERROR,
+                "ACP method did not produce a response result",
+            )
+        })
+    }
+
+    async fn send_session_notification(
+        &self,
+        notification: acp::SessionNotification,
+    ) -> acp::Result<()> {
+        let (ack_sender, ack_receiver) = oneshot::channel();
+        self.outbound_sender
+            .send(OutboundClientCall::SessionNotification {
+                notification,
+                ack: ack_sender,
+            })
+            .map_err(|_| acp::Error::internal_error())?;
+        ack_receiver
+            .await
+            .map_err(|_| acp::Error::internal_error())?
+    }
+
+    async fn request_permission(
+        &self,
+        request: acp::RequestPermissionRequest,
+    ) -> acp::Result<acp::RequestPermissionResponse> {
+        let (ack_sender, ack_receiver) = oneshot::channel();
+        self.outbound_sender
+            .send(OutboundClientCall::RequestPermission {
+                request,
+                ack: ack_sender,
+            })
+            .map_err(|_| acp::Error::internal_error())?;
+        ack_receiver
+            .await
+            .map_err(|_| acp::Error::internal_error())?
+    }
+
+    async fn read_text_file(
+        &self,
+        request: acp::ReadTextFileRequest,
+    ) -> acp::Result<acp::ReadTextFileResponse> {
+        let (ack_sender, ack_receiver) = oneshot::channel();
+        self.outbound_sender
+            .send(OutboundClientCall::ReadTextFile {
+                request,
+                ack: ack_sender,
+            })
+            .map_err(|_| acp::Error::internal_error())?;
+        ack_receiver
+            .await
+            .map_err(|_| acp::Error::internal_error())?
+    }
+
+    async fn write_text_file(
+        &self,
+        request: acp::WriteTextFileRequest,
+    ) -> acp::Result<acp::WriteTextFileResponse> {
+        let (ack_sender, ack_receiver) = oneshot::channel();
+        self.outbound_sender
+            .send(OutboundClientCall::WriteTextFile {
+                request,
+                ack: ack_sender,
+            })
+            .map_err(|_| acp::Error::internal_error())?;
+        ack_receiver
+            .await
+            .map_err(|_| acp::Error::internal_error())?
+    }
+
+    async fn create_terminal(
+        &self,
+        request: acp::CreateTerminalRequest,
+    ) -> acp::Result<acp::CreateTerminalResponse> {
+        let (ack_sender, ack_receiver) = oneshot::channel();
+        self.outbound_sender
+            .send(OutboundClientCall::CreateTerminal {
+                request,
+                ack: ack_sender,
+            })
+            .map_err(|_| acp::Error::internal_error())?;
+        ack_receiver
+            .await
+            .map_err(|_| acp::Error::internal_error())?
+    }
+
+    async fn wait_for_terminal_exit(
+        &self,
+        request: acp::WaitForTerminalExitRequest,
+    ) -> acp::Result<acp::WaitForTerminalExitResponse> {
+        let (ack_sender, ack_receiver) = oneshot::channel();
+        self.outbound_sender
+            .send(OutboundClientCall::WaitForTerminalExit {
+                request,
+                ack: ack_sender,
+            })
+            .map_err(|_| acp::Error::internal_error())?;
+        ack_receiver
+            .await
+            .map_err(|_| acp::Error::internal_error())?
+    }
+
+    async fn terminal_output(
+        &self,
+        request: acp::TerminalOutputRequest,
+    ) -> acp::Result<acp::TerminalOutputResponse> {
+        let (ack_sender, ack_receiver) = oneshot::channel();
+        self.outbound_sender
+            .send(OutboundClientCall::TerminalOutput {
+                request,
+                ack: ack_sender,
+            })
+            .map_err(|_| acp::Error::internal_error())?;
+        ack_receiver
+            .await
+            .map_err(|_| acp::Error::internal_error())?
+    }
+
+    async fn release_terminal(
+        &self,
+        request: acp::ReleaseTerminalRequest,
+    ) -> acp::Result<acp::ReleaseTerminalResponse> {
+        let (ack_sender, ack_receiver) = oneshot::channel();
+        self.outbound_sender
+            .send(OutboundClientCall::ReleaseTerminal {
+                request,
+                ack: ack_sender,
+            })
+            .map_err(|_| acp::Error::internal_error())?;
+        ack_receiver
+            .await
+            .map_err(|_| acp::Error::internal_error())?
+    }
+
+    async fn managed_session_handle(
+        &self,
+        session_id: &SessionId,
+        session_id_string: &str,
+    ) -> acp::Result<ManagedSessionHandle> {
+        let connection = self.connection.lock().await;
+        connection
+            .sessions
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| active_session_not_found_error(session_id_string))
+    }
+
+    async fn prepare_official_session_request(
+        &self,
+        method: Method,
+        session_id: &SessionId,
+        session_id_string: &str,
+    ) -> acp::Result<(u64, ManagedSessionHandle)> {
+        let mut connection = self.connection.lock().await;
+        let request_id = next_official_request_id(&mut connection);
+        ensure_official_request_order(connection.protocol.state(), method)
+            .map_err(map_protocol_error_to_acp_error)?;
+        self.server
+            .ensure_authenticated(&connection)
+            .map_err(map_rpc_response_error)?;
+        let managed_session = connection
+            .sessions
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| active_session_not_found_error(session_id_string))?;
+        Ok((request_id, managed_session))
+    }
+
+    async fn handle_ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+        match args.method.as_ref() {
+            "fluent_code/test/write_text_file" => {
+                let request =
+                    serde_json::from_str::<FilesystemWriteProbeRequest>(args.params.get())
+                        .map_err(|error| {
+                            acp::Error::invalid_params().data(serde_json::json!({
+                        "message": format!("invalid ACP test filesystem write request: {error}")
+                    }))
+                        })?;
+                self.write_text_file(acp::WriteTextFileRequest::new(
+                    request.session_id,
+                    request.path,
+                    request.content,
+                ))
+                .await?;
+                Ok(acp::ExtResponse::new(RawValue::NULL.to_owned().into()))
+            }
+            "fluent_code/test/read_text_file" => {
+                let request = serde_json::from_str::<FilesystemReadProbeRequest>(args.params.get())
+                    .map_err(|error| {
+                        acp::Error::invalid_params().data(serde_json::json!({
+                            "message": format!("invalid ACP test filesystem read request: {error}")
+                        }))
+                    })?;
+                let response = self
+                    .read_text_file(
+                        acp::ReadTextFileRequest::new(request.session_id, request.path)
+                            .line(request.line)
+                            .limit(request.limit),
+                    )
+                    .await?;
+                let result = to_raw_value(&FilesystemReadProbeResponse {
+                    content: response.content,
+                })
+                .map_err(|error| acp::Error::internal_error().data(serde_json::json!({
+                    "message": format!("failed to encode ACP test filesystem read response: {error}")
+                })))?;
+                Ok(acp::ExtResponse::new(result.into()))
+            }
+            "fluent_code/test/run_terminal_command" => {
+                let request =
+                    serde_json::from_str::<TerminalCommandProbeRequest>(args.params.get())
+                        .map_err(|error| {
+                            acp::Error::invalid_params().data(serde_json::json!({
+                                "message": format!("invalid ACP test terminal request: {error}")
+                            }))
+                        })?;
+                let created = self
+                    .create_terminal(
+                        acp::CreateTerminalRequest::new(
+                            request.session_id.clone(),
+                            request.command,
+                        )
+                        .args(request.args)
+                        .cwd(request.cwd)
+                        .output_byte_limit(request.output_byte_limit.map(u64::from)),
+                    )
+                    .await?;
+                let exit = self
+                    .wait_for_terminal_exit(acp::WaitForTerminalExitRequest::new(
+                        request.session_id.clone(),
+                        created.terminal_id.clone(),
+                    ))
+                    .await?;
+                let output = self
+                    .terminal_output(acp::TerminalOutputRequest::new(
+                        request.session_id.clone(),
+                        created.terminal_id.clone(),
+                    ))
+                    .await?;
+                self.release_terminal(acp::ReleaseTerminalRequest::new(
+                    request.session_id,
+                    created.terminal_id,
+                ))
+                .await?;
+                let result = to_raw_value(&TerminalCommandProbeResponse {
+                    output: output.output,
+                    truncated: output.truncated,
+                    exit_code: exit.exit_status.exit_code.map(|code| code as i32),
+                })
+                .map_err(|error| {
+                    acp::Error::internal_error().data(serde_json::json!({
+                        "message": format!("failed to encode ACP test terminal response: {error}")
+                    }))
+                })?;
+                Ok(acp::ExtResponse::new(result.into()))
+            }
+            _ => Ok(acp::ExtResponse::new(RawValue::NULL.to_owned().into())),
+        }
+    }
+
+    async fn process_permission_response(
+        &self,
+        request: &acp::RequestPermissionRequest,
+        response: acp::RequestPermissionResponse,
+    ) -> acp::Result<Vec<Value>> {
+        let session_id =
+            parse_session_id(&request.session_id.to_string()).map_err(map_rpc_response_error)?;
+        let managed_session = self
+            .managed_session_handle(&session_id, &request.session_id.to_string())
+            .await?;
+        let mut managed_session = managed_session.lock().await;
+
+        self.server
+            .apply_permission_response(
+                &request.session_id.to_string(),
+                &mut managed_session,
+                request,
+                response,
+            )
+            .await
+            .map_err(map_rpc_response_error)
+    }
+
+    async fn handle_live_prompt_request(
+        &self,
+        args: acp::PromptRequest,
+    ) -> acp::Result<acp::PromptResponse> {
+        let session_id = args.session_id.to_string();
+        let managed_session_id = parse_session_id(&session_id).map_err(map_rpc_response_error)?;
+        let prompt =
+            official_prompt_text_from_blocks(&args.prompt).map_err(map_rpc_response_error)?;
+        let (prompt_request_id, managed_session) = self
+            .prepare_official_session_request(
+                Method::SessionPrompt,
+                &managed_session_id,
+                &session_id,
+            )
+            .await?;
+        let outbound_frames = {
+            let mut managed_session = managed_session.lock().await;
+            self.server
+                .start_live_prompt_turn_for_session(
+                    &session_id,
+                    &mut managed_session,
+                    prompt,
+                    prompt_request_id,
+                )
+                .await
+                .map_err(map_rpc_response_error)?
+        };
+
+        if let Some(response) = self
+            .process_prompt_outbound_frames(prompt_request_id, outbound_frames)
+            .await?
+        {
+            return Ok(response);
+        }
+
+        loop {
+            let poll_result = {
+                let mut managed_session = managed_session.lock().await;
+                if let Some(buffered_completion) = managed_session.buffered_prompt_completion.take()
+                {
+                    return buffered_completion.into_result();
+                }
+                if managed_session.live_prompt_turn.is_none() {
+                    return Err(acp::Error::new(
+                        JSONRPC_INTERNAL_ERROR,
+                        format!(
+                            "session `{session_id}` completed the live prompt turn without producing a prompt response"
+                        ),
+                    ));
+                }
+
+                self.server
+                    .poll_live_prompt_turn(&session_id, &mut managed_session)
+                    .await
+                    .map_err(map_rpc_response_error)?
+            };
+
+            if let Some(response) = self
+                .process_prompt_outbound_frames(prompt_request_id, poll_result.frames)
+                .await?
+            {
+                return Ok(response);
+            }
+
+            if poll_result.prompt_turn_complete {
+                return Err(acp::Error::new(
+                    JSONRPC_INTERNAL_ERROR,
+                    format!(
+                        "session `{session_id}` completed the live prompt turn without producing a prompt response"
+                    ),
+                ));
+            }
+
+            tokio::time::sleep(PROMPT_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn process_prompt_outbound_frames(
+        &self,
+        prompt_request_id: u64,
+        outbound_frames: Vec<Value>,
+    ) -> acp::Result<Option<acp::PromptResponse>> {
+        let mut prompt_response = None;
+        let mut outbound_frames = VecDeque::from(outbound_frames);
+
+        while let Some(outbound_frame) = outbound_frames.pop_front() {
+            if outbound_frame.get("method").and_then(Value::as_str) == Some(SESSION_UPDATE_METHOD) {
+                let notification = serde_json::from_value::<acp::SessionNotification>(
+                    outbound_frame
+                        .get("params")
+                        .cloned()
+                        .ok_or_else(acp::Error::internal_error)?,
+                )
+                .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
+                self.send_session_notification(notification).await?;
+                continue;
+            }
+
+            if outbound_frame.get("method").and_then(Value::as_str)
+                == Some(SESSION_REQUEST_PERMISSION_METHOD)
+            {
+                let request = serde_json::from_value::<acp::RequestPermissionRequest>(
+                    outbound_frame
+                        .get("params")
+                        .cloned()
+                        .ok_or_else(acp::Error::internal_error)?,
+                )
+                .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
+                let client_response = self.request_permission(request.clone()).await?;
+                let follow_up_frames = self
+                    .process_permission_response(&request, client_response)
+                    .await?;
+                outbound_frames.extend(follow_up_frames);
+                continue;
+            }
+
+            if let Some(error) = outbound_frame.get("error") {
+                let frame_id = outbound_frame
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(acp::Error::internal_error)?;
+                let code = error
+                    .get("code")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(acp::Error::internal_error)? as i32;
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .ok_or_else(acp::Error::internal_error)?;
+                if frame_id == prompt_request_id {
+                    return Err(acp::Error::new(code, message));
+                }
+
+                return Err(acp::Error::new(
+                    JSONRPC_INTERNAL_ERROR,
+                    format!("unexpected ACP error while processing live prompt output: {message}"),
+                ));
+            }
+
+            if let Some(result) = outbound_frame.get("result") {
+                let frame_id = outbound_frame
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(acp::Error::internal_error)?;
+                if frame_id == prompt_request_id {
+                    prompt_response = Some(
+                        serde_json::from_value::<acp::PromptResponse>(result.clone()).map_err(
+                            |error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()),
+                        )?,
+                    );
+                }
+            }
+        }
+
+        Ok(prompt_response)
+    }
+
+    async fn process_cancel_outbound_frames(
+        &self,
+        session_id: &SessionId,
+        cancel_request_id: u64,
+        outbound_frames: Vec<Value>,
+    ) -> acp::Result<()> {
+        let mut buffered_prompt_completion = None;
+
+        for outbound_frame in outbound_frames {
+            match outbound_frame.get("method").and_then(Value::as_str) {
+                Some(SESSION_UPDATE_METHOD) => {
+                    let notification = serde_json::from_value::<acp::SessionNotification>(
+                        outbound_frame
+                            .get("params")
+                            .cloned()
+                            .ok_or_else(acp::Error::internal_error)?,
+                    )
+                    .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
+                    self.send_session_notification(notification).await?;
+                }
+                Some(SESSION_REQUEST_PERMISSION_METHOD) => {
+                    let request = serde_json::from_value::<acp::RequestPermissionRequest>(
+                        outbound_frame
+                            .get("params")
+                            .cloned()
+                            .ok_or_else(acp::Error::internal_error)?,
+                    )
+                    .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
+                    let _ = self.request_permission(request).await?;
+                }
+                _ => {
+                    if let Some(error) = outbound_frame.get("error") {
+                        let frame_id = outbound_frame
+                            .get("id")
+                            .and_then(Value::as_u64)
+                            .ok_or_else(acp::Error::internal_error)?;
+                        let code = error
+                            .get("code")
+                            .and_then(Value::as_i64)
+                            .ok_or_else(acp::Error::internal_error)?
+                            as i32;
+                        let message = error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .ok_or_else(acp::Error::internal_error)?;
+                        if frame_id == cancel_request_id {
+                            return Err(acp::Error::new(code, message));
+                        }
+                        buffered_prompt_completion = Some(BufferedPromptCompletion::Error {
+                            code,
+                            message: message.to_string(),
+                        });
+                        continue;
+                    }
+
+                    if let Some(result) = outbound_frame.get("result") {
+                        let frame_id = outbound_frame
+                            .get("id")
+                            .and_then(Value::as_u64)
+                            .ok_or_else(acp::Error::internal_error)?;
+                        if frame_id == cancel_request_id {
+                            continue;
+                        }
+
+                        let prompt_response =
+                            serde_json::from_value::<acp::PromptResponse>(result.clone()).map_err(
+                                |error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()),
+                            )?;
+                        buffered_prompt_completion =
+                            Some(BufferedPromptCompletion::Response(prompt_response));
+                    }
+                }
+            }
+        }
+
+        if let Some(buffered_prompt_completion) = buffered_prompt_completion {
+            let managed_session = self
+                .managed_session_handle(session_id, &session_id.to_string())
+                .await?;
+            let mut managed_session = managed_session.lock().await;
+            managed_session.buffered_prompt_completion = Some(buffered_prompt_completion);
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl acp::Agent for OfficialAgentAdapter {
+    async fn initialize(
+        &self,
+        args: acp::InitializeRequest,
+    ) -> acp::Result<acp::InitializeResponse> {
+        self.delegate_request(Method::Initialize, args).await
+    }
+
+    async fn authenticate(
+        &self,
+        args: acp::AuthenticateRequest,
+    ) -> acp::Result<acp::AuthenticateResponse> {
+        self.delegate_request(Method::Authenticate, args).await
+    }
+
+    async fn new_session(
+        &self,
+        args: acp::NewSessionRequest,
+    ) -> acp::Result<acp::NewSessionResponse> {
+        self.delegate_request(Method::SessionNew, args).await
+    }
+
+    async fn load_session(
+        &self,
+        args: acp::LoadSessionRequest,
+    ) -> acp::Result<acp::LoadSessionResponse> {
+        self.delegate_request(Method::SessionLoad, args).await
+    }
+
+    async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
+        self.handle_live_prompt_request(args).await
+    }
+
+    async fn cancel(&self, args: acp::CancelNotification) -> acp::Result<()> {
+        let session_id =
+            parse_session_id(&args.session_id.to_string()).map_err(map_rpc_response_error)?;
+        let (cancel_request_id, managed_session) = self
+            .prepare_official_session_request(
+                Method::SessionCancel,
+                &session_id,
+                &args.session_id.to_string(),
+            )
+            .await?;
+        let outbound_frames = {
+            let mut managed_session = managed_session.lock().await;
+            self.server
+                .cancel_prompt_turn_for_session(
+                    &args.session_id.to_string(),
+                    &mut managed_session,
+                    cancel_request_id,
+                )
+                .await
+                .map_err(map_rpc_response_error)?
+        };
+
+        if let Some(buffered_prompt_completion) =
+            buffered_prompt_completion_from_outbound_frames(cancel_request_id, &outbound_frames)?
+        {
+            let mut managed_session = managed_session.lock().await;
+            managed_session.buffered_prompt_completion = Some(buffered_prompt_completion);
+        }
+
+        self.process_cancel_outbound_frames(&session_id, cancel_request_id, outbound_frames)
+            .await
+    }
+
+    async fn ext_method(&self, _args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+        Err(acp::Error::method_not_found())
+    }
+}
+
+impl OfficialAgentTestProbeAdapter {
+    fn new(adapter: OfficialAgentAdapter) -> Self {
+        Self { adapter }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl acp::Agent for OfficialAgentTestProbeAdapter {
+    async fn initialize(
+        &self,
+        args: acp::InitializeRequest,
+    ) -> acp::Result<acp::InitializeResponse> {
+        self.adapter.initialize(args).await
+    }
+
+    async fn authenticate(
+        &self,
+        args: acp::AuthenticateRequest,
+    ) -> acp::Result<acp::AuthenticateResponse> {
+        self.adapter.authenticate(args).await
+    }
+
+    async fn new_session(
+        &self,
+        args: acp::NewSessionRequest,
+    ) -> acp::Result<acp::NewSessionResponse> {
+        self.adapter.new_session(args).await
+    }
+
+    async fn load_session(
+        &self,
+        args: acp::LoadSessionRequest,
+    ) -> acp::Result<acp::LoadSessionResponse> {
+        self.adapter.load_session(args).await
+    }
+
+    async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
+        self.adapter.prompt(args).await
+    }
+
+    async fn cancel(&self, args: acp::CancelNotification) -> acp::Result<()> {
+        self.adapter.cancel(args).await
+    }
+
+    async fn ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+        self.adapter.handle_ext_method(args).await
+    }
 }
 
 impl PromptTurnEmissionState {
@@ -532,20 +1193,22 @@ impl AcpServer {
         }
     }
 
-    pub fn dependencies(&self) -> &AcpServerDependencies {
+    #[cfg(test)]
+    fn dependencies(&self) -> &AcpServerDependencies {
         &self.dependencies
     }
 
-    pub fn transport(&self) -> StdioTransport {
+    #[cfg(test)]
+    fn transport(&self) -> StdioTransport {
         self.transport
     }
 
-    pub fn server_info(&self) -> ServerInfo {
+    fn server_info(&self) -> ServerInfo {
         self.mapper.server_info()
     }
 
-    pub fn build_host(&self) -> Result<HeadlessAppHost> {
-        HeadlessAppHost::load_or_create(
+    fn build_host(&self) -> Result<ManagedAppHost> {
+        ManagedAppHost::load_or_create(
             self.dependencies.store.clone(),
             self.dependencies.runtime.clone(),
             Arc::clone(&self.dependencies.agent_registry),
@@ -554,8 +1217,8 @@ impl AcpServer {
         )
     }
 
-    fn build_host_for_session(&self, session: Session) -> HeadlessAppHost {
-        HeadlessAppHost::new(
+    fn build_host_for_session(&self, session: Session) -> ManagedAppHost {
+        ManagedAppHost::new(
             session,
             self.dependencies.store.clone(),
             self.dependencies.runtime.clone(),
@@ -565,8 +1228,8 @@ impl AcpServer {
         )
     }
 
-    fn load_host(&self, session_id: &SessionId) -> Result<HeadlessAppHost> {
-        HeadlessAppHost::load(
+    fn load_host(&self, session_id: &SessionId) -> Result<ManagedAppHost> {
+        ManagedAppHost::load(
             session_id,
             self.dependencies.store.clone(),
             self.dependencies.runtime.clone(),
@@ -601,9 +1264,7 @@ impl AcpServer {
             "acp server initialized with lifecycle-capable headless host"
         );
 
-        let stdout = io::stdout();
-        let mut writer = stdout.lock();
-        let frames_processed = self.serve_stdio_until_eof(&mut writer).await?;
+        let frames_processed = self.serve_stdio_via_official_sdk().await?;
         info!(
             frames_processed,
             "acp stdio server stopped after stdin closed"
@@ -612,7 +1273,40 @@ impl AcpServer {
         Ok(())
     }
 
-    pub fn initialize_response(&self, requested_protocol_version: u16) -> InitializeResponse {
+    async fn serve_stdio_via_official_sdk(&self) -> Result<usize> {
+        self.serve_agent_connection(
+            tokio::io::stdin().compat(),
+            tokio::io::stdout().compat_write(),
+        )
+        .await
+    }
+
+    async fn serve_agent_connection<R, W>(&self, reader: R, writer: W) -> Result<usize>
+    where
+        R: AsyncRead + Unpin + 'static,
+        W: AsyncWrite + Unpin + 'static,
+    {
+        let local_set = tokio::task::LocalSet::new();
+        let server = self.clone();
+
+        local_set
+            .run_until(async move {
+                let (outbound_sender, outbound_receiver) = mpsc::unbounded_channel();
+                if official_test_probes_enabled() {
+                    let adapter = OfficialAgentTestProbeAdapter::new(OfficialAgentAdapter::new(
+                        server,
+                        outbound_sender,
+                    ));
+                    run_official_agent_connection(adapter, reader, writer, outbound_receiver).await
+                } else {
+                    let adapter = OfficialAgentAdapter::new(server, outbound_sender);
+                    run_official_agent_connection(adapter, reader, writer, outbound_receiver).await
+                }
+            })
+            .await
+    }
+
+    fn initialize_response(&self, requested_protocol_version: u16) -> InitializeResponse {
         self.mapper.initialize_response(requested_protocol_version)
     }
 
@@ -630,34 +1324,7 @@ impl AcpServer {
         )))
     }
 
-    async fn serve_stdio_until_eof<W: Write>(&self, writer: &mut W) -> Result<usize> {
-        let (frame_sender, mut frame_receiver) = mpsc::unbounded_channel();
-        let transport = self.transport;
-        std::thread::spawn(move || {
-            let stdin = io::stdin();
-            let mut reader = BufReader::new(stdin.lock());
-            loop {
-                match transport.read_frame(&mut reader) {
-                    Ok(Some(frame)) => {
-                        if frame_sender.send(ReaderEvent::Frame(frame)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        let _ = frame_sender.send(ReaderEvent::Eof);
-                        break;
-                    }
-                    Err(error) => {
-                        let _ = frame_sender.send(ReaderEvent::Error(error.to_string()));
-                        break;
-                    }
-                }
-            }
-        });
-
-        self.serve_live_frames(&mut frame_receiver, writer).await
-    }
-
+    #[cfg(test)]
     async fn serve_live_frames<W: Write>(
         &self,
         frame_receiver: &mut mpsc::UnboundedReceiver<ReaderEvent>,
@@ -705,11 +1372,6 @@ impl AcpServer {
                         ReaderEvent::Eof => {
                             reader_closed = true;
                         }
-                        ReaderEvent::Error(error) => {
-                            return Err(FluentCodeError::Provider(format!(
-                                "ACP stdio transport error: {error}"
-                            )));
-                        }
                     }
                 }
                 _ = tokio::time::sleep(PROMPT_POLL_INTERVAL), if has_live_prompt_turns(&connection) => {
@@ -729,7 +1391,8 @@ impl AcpServer {
         Ok(frames_processed)
     }
 
-    pub async fn serve_jsonl_script<R: BufRead, W: Write>(
+    #[cfg(test)]
+    pub(crate) async fn serve_jsonl_script<R: BufRead, W: Write>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -759,9 +1422,26 @@ impl AcpServer {
         reader: &mut R,
         writer: &mut W,
     ) -> Result<usize> {
-        self.serve_jsonl_script(reader, writer).await
+        let mut connection = AcpConnectionState::default();
+        let mut frames_processed = 0;
+
+        while let Some(frame) = self.transport.read_frame(reader).map_err(|error| {
+            FluentCodeError::Provider(format!("ACP stdio transport error: {error}"))
+        })? {
+            frames_processed += 1;
+            debug!(frame_len = frame.len(), "received ACP stdio frame");
+
+            let outbound_frames = match self.handle_frame(&mut connection, &frame).await {
+                Ok(outbound_frames) => outbound_frames,
+                Err(error_response) => vec![serde_json::to_value(error_response)?],
+            };
+            self.write_outbound_frames(writer, outbound_frames)?;
+        }
+
+        Ok(frames_processed)
     }
 
+    #[cfg(test)]
     fn write_outbound_frames<W: Write>(
         &self,
         writer: &mut W,
@@ -778,6 +1458,7 @@ impl AcpServer {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn handle_frame(
         &self,
         connection: &mut AcpConnectionState,
@@ -793,6 +1474,7 @@ impl AcpServer {
             .map_err(|error| JsonRpcErrorResponse::new(request_id, error.code, error.message))
     }
 
+    #[cfg(test)]
     async fn handle_live_frame(
         &self,
         connection: &mut AcpConnectionState,
@@ -811,6 +1493,7 @@ impl AcpServer {
         result.map_err(|error| JsonRpcErrorResponse::new(request_id, error.code, error.message))
     }
 
+    #[cfg(test)]
     fn parse_request(
         &self,
         connection: &mut AcpConnectionState,
@@ -903,13 +1586,14 @@ impl AcpServer {
         let host = self.build_host_for_session(session);
         connection.sessions.insert(
             session_id,
-            ManagedSession {
+            Arc::new(Mutex::new(ManagedSession {
                 _cwd: cwd,
                 _mcp_servers: new_session_request.mcp_servers,
                 host,
                 live_prompt_turn: None,
                 pending_prompt_request_id: None,
-            },
+                buffered_prompt_completion: None,
+            })),
         );
 
         Ok(vec![serialize_value(JsonRpcResponse::new(
@@ -954,13 +1638,14 @@ impl AcpServer {
 
         connection.sessions.insert(
             host.state().session.id,
-            ManagedSession {
+            Arc::new(Mutex::new(ManagedSession {
                 _cwd: cwd,
                 _mcp_servers: load_session_request.mcp_servers,
                 host,
                 live_prompt_turn,
                 pending_prompt_request_id: None,
-            },
+                buffered_prompt_completion: None,
+            })),
         );
 
         Ok(outbound_frames)
@@ -976,11 +1661,16 @@ impl AcpServer {
         let session_prompt_request = decode_params::<SessionPromptRequest>(request.params)?;
         let session_id = parse_session_id(&session_prompt_request.session_id)?;
         let prompt = prompt_text_from_blocks(&session_prompt_request.prompt)?;
-        let managed_session = connection.sessions.get_mut(&session_id).ok_or_else(|| {
-            RpcResponseError::resource_not_found(format!(
-                "session `{session_id}` is not active on this connection"
-            ))
-        })?;
+        let managed_session = connection
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| {
+                RpcResponseError::resource_not_found(format!(
+                    "session `{session_id}` is not active on this connection"
+                ))
+            })?;
+        let mut managed_session = managed_session.lock().await;
 
         if managed_session.host.state().active_run_id.is_some() {
             return Err(RpcResponseError::active_prompt(format!(
@@ -1004,6 +1694,7 @@ impl AcpServer {
         Ok(prompt_result.frames)
     }
 
+    #[cfg(test)]
     async fn handle_live_session_prompt(
         &self,
         connection: &mut AcpConnectionState,
@@ -1015,11 +1706,16 @@ impl AcpServer {
         let session_prompt_request = decode_params::<SessionPromptRequest>(request.params)?;
         let session_id = parse_session_id(&session_prompt_request.session_id)?;
         let prompt = prompt_text_from_blocks(&session_prompt_request.prompt)?;
-        let managed_session = connection.sessions.get_mut(&session_id).ok_or_else(|| {
-            RpcResponseError::resource_not_found(format!(
-                "session `{session_id}` is not active on this connection"
-            ))
-        })?;
+        let managed_session = connection
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| {
+                RpcResponseError::resource_not_found(format!(
+                    "session `{session_id}` is not active on this connection"
+                ))
+            })?;
+        let mut managed_session = managed_session.lock().await;
 
         if managed_session.host.state().active_run_id.is_some() {
             return Err(RpcResponseError::active_prompt(format!(
@@ -1029,7 +1725,7 @@ impl AcpServer {
 
         self.start_live_prompt_turn(
             &session_prompt_request.session_id,
-            managed_session,
+            &mut managed_session,
             prompt,
             request_id,
         )
@@ -1045,14 +1741,22 @@ impl AcpServer {
 
         let session_cancel_request = decode_params::<SessionCancelRequest>(request.params)?;
         let session_id = parse_session_id(&session_cancel_request.session_id)?;
-        let managed_session = connection.sessions.get_mut(&session_id).ok_or_else(|| {
-            RpcResponseError::resource_not_found(format!(
-                "session `{session_id}` is not active on this connection"
-            ))
-        })?;
+        let managed_session = connection
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| {
+                RpcResponseError::resource_not_found(format!(
+                    "session `{session_id}` is not active on this connection"
+                ))
+            })?;
+        let mut managed_session = managed_session.lock().await;
 
         let mut outbound_frames = self
-            .drain_live_prompt_turn_updates(&session_cancel_request.session_id, managed_session)
+            .drain_live_prompt_turn_updates(
+                &session_cancel_request.session_id,
+                &mut managed_session,
+            )
             .await?;
         outbound_frames.push(serialize_value(JsonRpcResponse::new(
             request.id,
@@ -1069,7 +1773,7 @@ impl AcpServer {
         outbound_frames.extend(
             self.cancel_prompt_turn(
                 &session_cancel_request.session_id,
-                managed_session,
+                &mut managed_session,
                 cancel_target,
             )
             .await?,
@@ -1099,10 +1803,27 @@ impl AcpServer {
             .map(|result| result.frames)
     }
 
+    async fn start_live_prompt_turn_for_session(
+        &self,
+        session_id: &str,
+        managed_session: &mut ManagedSession,
+        prompt: String,
+        request_id: u64,
+    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+        if managed_session.host.state().active_run_id.is_some() {
+            return Err(RpcResponseError::active_prompt(format!(
+                "session `{session_id}` already has an active prompt turn"
+            )));
+        }
+
+        self.start_live_prompt_turn(session_id, managed_session, prompt, request_id)
+            .await
+    }
+
     fn seed_live_prompt_turn_state(
         &self,
         session_id: &str,
-        host: &HeadlessAppHost,
+        host: &ManagedAppHost,
     ) -> Result<Option<LivePromptTurnState>> {
         let Some(root_run_id) = current_prompt_turn_root_run_id(host.state()) else {
             return Ok(None);
@@ -1173,21 +1894,105 @@ impl AcpServer {
             .map(|result| result.frames)
     }
 
+    async fn cancel_prompt_turn_for_session(
+        &self,
+        session_id: &str,
+        managed_session: &mut ManagedSession,
+        request_id: u64,
+    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+        let mut outbound_frames = self
+            .drain_live_prompt_turn_updates(session_id, managed_session)
+            .await?;
+        outbound_frames.push(serialize_value(JsonRpcResponse::new(
+            request_id,
+            SessionPromptResponse {
+                stop_reason: crate::protocol::StopReason::Cancelled,
+            },
+        ))?);
+        let cancel_target = cancel_target(managed_session.host.state()).ok_or_else(|| {
+            RpcResponseError::invalid_params(format!(
+                "session `{session_id}` does not have an active prompt turn to cancel"
+            ))
+        })?;
+
+        outbound_frames.extend(
+            self.cancel_prompt_turn(session_id, managed_session, cancel_target)
+                .await?,
+        );
+        Ok(outbound_frames)
+    }
+
+    async fn apply_permission_response(
+        &self,
+        session_id: &str,
+        managed_session: &mut ManagedSession,
+        request: &acp::RequestPermissionRequest,
+        response: acp::RequestPermissionResponse,
+    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+        match response.outcome {
+            acp::RequestPermissionOutcome::Cancelled => {
+                let cancel_target =
+                    cancel_target(managed_session.host.state()).ok_or_else(|| {
+                        RpcResponseError::invalid_params(format!(
+                            "session `{session_id}` does not have an active prompt turn to cancel"
+                        ))
+                    })?;
+                self.cancel_prompt_turn(session_id, managed_session, cancel_target)
+                    .await
+            }
+            acp::RequestPermissionOutcome::Selected(selected) => {
+                self.apply_selected_permission_option(
+                    managed_session,
+                    request,
+                    &selected.option_id,
+                )
+                .await?;
+                self.poll_live_prompt_turn(session_id, managed_session)
+                    .await
+                    .map(|result| result.frames)
+            }
+            _ => Err(RpcResponseError::invalid_params(
+                "unsupported ACP permission response outcome",
+            )),
+        }
+    }
+
+    async fn apply_selected_permission_option(
+        &self,
+        managed_session: &mut ManagedSession,
+        request: &acp::RequestPermissionRequest,
+        option_id: &acp::PermissionOptionId,
+    ) -> std::result::Result<(), RpcResponseError> {
+        let option_id = option_id.to_string();
+        if option_id == "reject_always" {
+            remember_rejected_permission_rule(managed_session.host.state_mut(), request)?;
+        }
+
+        let reply = permission_reply_for_option_id(&option_id)?;
+        managed_session
+            .host
+            .handle_message(Msg::ReplyToPendingTool(reply))
+            .await
+            .map_err(|error| RpcResponseError::internal(error.to_string()))
+    }
+
+    #[cfg(test)]
     async fn poll_live_prompt_turns(
         &self,
         connection: &mut AcpConnectionState,
     ) -> std::result::Result<Vec<Value>, RpcResponseError> {
         let mut outbound_frames = Vec::new();
 
-        for managed_session in connection.sessions.values_mut() {
+        for managed_session in connection.sessions.values() {
+            let mut managed_session = managed_session.lock().await;
             let session_id = managed_session.host.state().session.id.to_string();
             if managed_session.live_prompt_turn.is_none() {
-                outbound_frames.extend(self.flush_pending_prompt_response(managed_session)?);
+                outbound_frames.extend(self.flush_pending_prompt_response(&mut managed_session)?);
                 continue;
             }
 
             outbound_frames.extend(
-                self.poll_live_prompt_turn(&session_id, managed_session)
+                self.poll_live_prompt_turn(&session_id, &mut managed_session)
                     .await?
                     .frames,
             );
@@ -1196,6 +2001,7 @@ impl AcpServer {
         Ok(outbound_frames)
     }
 
+    #[cfg(test)]
     fn flush_pending_prompt_response(
         &self,
         managed_session: &mut ManagedSession,
@@ -1255,7 +2061,10 @@ impl AcpServer {
             .map_err(|error| RpcResponseError::internal(error.to_string()))?;
 
         let Some(mut live_prompt_turn) = managed_session.live_prompt_turn.take() else {
-            return Ok(LivePromptPollResult { frames: Vec::new() });
+            return Ok(LivePromptPollResult {
+                frames: Vec::new(),
+                prompt_turn_complete: true,
+            });
         };
         let projection = self
             .mapper
@@ -1282,6 +2091,7 @@ impl AcpServer {
                         stop_reason,
                     ))?);
                 }
+                managed_session.pending_prompt_request_id = None;
             }
             Ok(None) => {
                 managed_session.live_prompt_turn = Some(live_prompt_turn);
@@ -1294,11 +2104,13 @@ impl AcpServer {
                         error.message,
                     ))?);
                 }
+                managed_session.pending_prompt_request_id = None;
             }
         }
 
         Ok(LivePromptPollResult {
             frames: outbound_frames,
+            prompt_turn_complete: managed_session.live_prompt_turn.is_none(),
         })
     }
 
@@ -1318,7 +2130,7 @@ impl AcpServer {
     fn session_load_replay_frames(
         &self,
         session_id: &str,
-        host: &HeadlessAppHost,
+        host: &ManagedAppHost,
     ) -> std::result::Result<Vec<Value>, RpcResponseError> {
         let mut outbound_frames = Vec::new();
 
@@ -1341,7 +2153,7 @@ impl AcpServer {
     async fn run_prompt_turn(
         &self,
         session_id: &str,
-        host: &mut HeadlessAppHost,
+        host: &mut ManagedAppHost,
         prompt: String,
     ) -> std::result::Result<PromptTurnResult, RpcResponseError> {
         host.submit_prompt(prompt)
@@ -1414,6 +2226,7 @@ fn latest_prompt_state(state: &AppState) -> Option<PromptTurnState> {
     None
 }
 
+#[cfg(test)]
 fn frame_ids_from_responses(frames: &[Value]) -> Vec<u64> {
     frames
         .iter()
@@ -1421,12 +2234,16 @@ fn frame_ids_from_responses(frames: &[Value]) -> Vec<u64> {
         .collect()
 }
 
+#[cfg(test)]
 fn clear_written_prompt_responses(connection: &mut AcpConnectionState, written_ids: &[u64]) {
     if written_ids.is_empty() {
         return;
     }
 
-    for managed_session in connection.sessions.values_mut() {
+    for managed_session in connection.sessions.values() {
+        let mut managed_session = managed_session
+            .try_lock()
+            .expect("test harness should not contend on managed sessions");
         if managed_session
             .pending_prompt_request_id
             .is_some_and(|request_id| written_ids.contains(&request_id))
@@ -1436,8 +2253,12 @@ fn clear_written_prompt_responses(connection: &mut AcpConnectionState, written_i
     }
 }
 
+#[cfg(test)]
 fn has_live_prompt_turns(connection: &AcpConnectionState) -> bool {
     connection.sessions.values().any(|managed_session| {
+        let managed_session = managed_session
+            .try_lock()
+            .expect("test harness should not contend on managed sessions");
         managed_session.live_prompt_turn.is_some()
             || managed_session.pending_prompt_request_id.is_some()
     })
@@ -1456,10 +2277,181 @@ fn cancel_target(state: &AppState) -> Option<CancelTarget> {
     })
 }
 
+impl Default for AcpConnectionState {
+    fn default() -> Self {
+        Self {
+            protocol: JsonRpcProtocol::default(),
+            authenticated: false,
+            sessions: HashMap::new(),
+            next_request_id: 1,
+        }
+    }
+}
+
+fn active_session_not_found_error(session_id: &str) -> acp::Error {
+    acp::Error::new(
+        ACP_RESOURCE_NOT_FOUND,
+        format!("session `{session_id}` is not active on this connection"),
+    )
+}
+
+fn official_prompt_text_from_blocks(
+    prompt: &[acp::ContentBlock],
+) -> std::result::Result<String, RpcResponseError> {
+    let prompt = prompt
+        .iter()
+        .map(|block| match block {
+            acp::ContentBlock::Text(text) => Ok(text.text.trim().to_string()),
+            _ => Err(RpcResponseError::invalid_params(
+                "session prompt only supports text ACP content blocks",
+            )),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|block| !block.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    if prompt.is_empty() {
+        return Err(RpcResponseError::invalid_params(
+            "session prompt must include at least one non-empty text block",
+        ));
+    }
+
+    Ok(prompt)
+}
+
+async fn run_official_agent_connection<R, W, A>(
+    adapter: A,
+    reader: R,
+    writer: W,
+    mut outbound_receiver: mpsc::UnboundedReceiver<OutboundClientCall>,
+) -> Result<usize>
+where
+    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin + 'static,
+    A: acp::Agent + 'static,
+{
+    let (connection, io_task) = acp::AgentSideConnection::new(adapter, writer, reader, |future| {
+        tokio::task::spawn_local(future);
+    });
+
+    tokio::task::spawn_local(async move {
+        while let Some(outbound_call) = outbound_receiver.recv().await {
+            match outbound_call {
+                OutboundClientCall::SessionNotification { notification, ack } => {
+                    let _ = ack.send(connection.session_notification(notification).await);
+                }
+                OutboundClientCall::RequestPermission { request, ack } => {
+                    let _ = ack.send(connection.request_permission(request).await);
+                }
+                OutboundClientCall::ReadTextFile { request, ack } => {
+                    let _ = ack.send(connection.read_text_file(request).await);
+                }
+                OutboundClientCall::WriteTextFile { request, ack } => {
+                    let _ = ack.send(connection.write_text_file(request).await);
+                }
+                OutboundClientCall::CreateTerminal { request, ack } => {
+                    let _ = ack.send(connection.create_terminal(request).await);
+                }
+                OutboundClientCall::WaitForTerminalExit { request, ack } => {
+                    let _ = ack.send(connection.wait_for_terminal_exit(request).await);
+                }
+                OutboundClientCall::TerminalOutput { request, ack } => {
+                    let _ = ack.send(connection.terminal_output(request).await);
+                }
+                OutboundClientCall::ReleaseTerminal { request, ack } => {
+                    let _ = ack.send(connection.release_terminal(request).await);
+                }
+            }
+        }
+    });
+
+    io_task
+        .await
+        .map_err(|error| FluentCodeError::Provider(format!("ACP connection error: {error}")))
+        .map(|_| 0)
+}
+
+impl BufferedPromptCompletion {
+    fn into_result(self) -> acp::Result<acp::PromptResponse> {
+        match self {
+            Self::Response(response) => Ok(response),
+            Self::Error { code, message } => Err(acp::Error::new(code, message)),
+        }
+    }
+}
+
+fn next_official_request_id(connection: &mut AcpConnectionState) -> u64 {
+    let request_id = connection.next_request_id;
+    connection.next_request_id = connection.next_request_id.checked_add(1).unwrap_or(1);
+    request_id
+}
+
+fn official_test_probes_enabled() -> bool {
+    std::env::var(ACP_TEST_PROBES_ENV_VAR)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn buffered_prompt_completion_from_outbound_frames(
+    cancel_request_id: u64,
+    outbound_frames: &[Value],
+) -> acp::Result<Option<BufferedPromptCompletion>> {
+    let mut buffered_prompt_completion = None;
+
+    for outbound_frame in outbound_frames {
+        if outbound_frame.get("method").is_some() {
+            continue;
+        }
+
+        if let Some(error) = outbound_frame.get("error") {
+            let frame_id = outbound_frame
+                .get("id")
+                .and_then(Value::as_u64)
+                .ok_or_else(acp::Error::internal_error)?;
+            if frame_id == cancel_request_id {
+                continue;
+            }
+
+            let code = error
+                .get("code")
+                .and_then(Value::as_i64)
+                .ok_or_else(acp::Error::internal_error)? as i32;
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or_else(acp::Error::internal_error)?;
+            buffered_prompt_completion = Some(BufferedPromptCompletion::Error {
+                code,
+                message: message.to_string(),
+            });
+            continue;
+        }
+
+        if let Some(result) = outbound_frame.get("result") {
+            let frame_id = outbound_frame
+                .get("id")
+                .and_then(Value::as_u64)
+                .ok_or_else(acp::Error::internal_error)?;
+            if frame_id == cancel_request_id {
+                continue;
+            }
+
+            let prompt_response = serde_json::from_value::<acp::PromptResponse>(result.clone())
+                .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
+            buffered_prompt_completion = Some(BufferedPromptCompletion::Response(prompt_response));
+        }
+    }
+
+    Ok(buffered_prompt_completion)
+}
+
 fn current_prompt_turn_root_run_id(state: &AppState) -> Option<RunId> {
     root_run_id_for(state, state.active_run_id?)
 }
 
+#[cfg(test)]
 fn latest_root_run_id(state: &AppState) -> Option<RunId> {
     state
         .session
@@ -1539,6 +2531,53 @@ fn terminalize_cancelled_prompt_turn(
     }
 
     changed
+}
+
+fn permission_reply_for_option_id(
+    option_id: &str,
+) -> std::result::Result<PermissionReply, RpcResponseError> {
+    match option_id {
+        "allow_once" => Ok(PermissionReply::Once),
+        "allow_always" => Ok(PermissionReply::Always),
+        "reject_once" | "reject_always" => Ok(PermissionReply::Deny),
+        _ => Err(RpcResponseError::invalid_params(format!(
+            "unsupported ACP permission option `{option_id}`"
+        ))),
+    }
+}
+
+fn remember_rejected_permission_rule(
+    state: &mut AppState,
+    request: &acp::RequestPermissionRequest,
+) -> std::result::Result<(), RpcResponseError> {
+    let pending_invocation = state
+        .session
+        .tool_invocations
+        .iter()
+        .rev()
+        .find(|invocation| {
+            invocation.approval_state == ToolApprovalState::Pending
+                && invocation.tool_call_id == request.tool_call.tool_call_id.to_string()
+        })
+        .ok_or_else(|| {
+            RpcResponseError::invalid_params(format!(
+                "session `{}` does not have a pending tool invocation for `{}`",
+                request.session_id, request.tool_call.tool_call_id
+            ))
+        })?;
+
+    let Some(policy) = state
+        .tool_registry
+        .tool_policy(&pending_invocation.tool_name)
+    else {
+        return Ok(());
+    };
+
+    if can_remember_reply(&policy, PermissionReply::Deny) {
+        remember_reply(&mut state.session, &policy, PermissionReply::Deny);
+    }
+
+    Ok(())
 }
 
 fn decode_params<T: serde::de::DeserializeOwned>(
@@ -1648,6 +2687,31 @@ fn prompt_turn_terminal_error(
     RpcResponseError::internal(message)
 }
 
+fn map_rpc_response_error(error: RpcResponseError) -> acp::Error {
+    acp::Error::new(error.code, error.message)
+}
+
+fn ensure_official_request_order(
+    protocol_state: ProtocolState,
+    method: Method,
+) -> std::result::Result<(), ProtocolError> {
+    match (protocol_state, method) {
+        (ProtocolState::Uninitialized, Method::Initialize) => Ok(()),
+        (ProtocolState::Uninitialized, method) => Err(ProtocolError::InitializeRequired {
+            method: method.as_str().to_string(),
+        }),
+        (ProtocolState::Initialized, Method::Initialize) => {
+            Err(ProtocolError::InitializeOutOfOrder)
+        }
+        (ProtocolState::Initialized, _) => Ok(()),
+    }
+}
+
+fn map_protocol_error_to_acp_error(error: ProtocolError) -> acp::Error {
+    let response = protocol_error_response(Value::Null, error);
+    acp::Error::new(response.error.code, response.error.message)
+}
+
 fn protocol_error_response(id: Value, error: ProtocolError) -> JsonRpcErrorResponse {
     let (code, message) = match error {
         ProtocolError::MalformedJson(parse_error) => (JSONRPC_PARSE_ERROR, parse_error.to_string()),
@@ -1672,6 +2736,7 @@ fn protocol_error_response(id: Value, error: ProtocolError) -> JsonRpcErrorRespo
     JsonRpcErrorResponse::new(id, code, message)
 }
 
+#[cfg(test)]
 fn request_id_from_frame(frame: &str) -> Value {
     serde_json::from_str::<Value>(frame)
         .ok()
@@ -1718,9 +2783,11 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use agent_client_protocol::{self as acp, Agent as _};
     use chrono::Utc;
     use fluent_code_app::agent::AgentRegistry;
     use fluent_code_app::app::{AppStatus, Msg};
@@ -1739,12 +2806,14 @@ mod tests {
     use fluent_code_app::session::store::{FsSessionStore, SessionStore};
     use fluent_code_provider::{MockProvider, ProviderClient};
     use serde_json::Value;
+    use tokio::io::duplex;
     use tokio::sync::{Mutex, mpsc};
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
     use uuid::Uuid;
 
     use super::{
         AcpConnectionState, AcpServer, AcpServerDependencies, CANCELLED_TOOL_MESSAGE,
-        HeadlessAppHost, ManagedSession, ReaderEvent,
+        ManagedAppHost, ManagedSession, ReaderEvent,
     };
     use crate::dev_harness::ScriptedJsonlHarness;
     use crate::protocol::{Method, ParsedRequest};
@@ -2056,7 +3125,9 @@ mod tests {
         );
         let session_id = managed_session.host.state().session.id;
         let run_id = managed_session.host.state().session.runs[0].id;
-        connection.sessions.insert(session_id, managed_session);
+        connection
+            .sessions
+            .insert(session_id, Arc::new(Mutex::new(managed_session)));
 
         let responses = server
             .handle_request(
@@ -2079,8 +3150,10 @@ mod tests {
 
         let managed_session = connection
             .sessions
-            .get_mut(&session_id)
+            .get(&session_id)
+            .cloned()
             .expect("managed session");
+        let mut managed_session = managed_session.lock().await;
         managed_session
             .host
             .runtime_sender()
@@ -2236,7 +3309,9 @@ mod tests {
         let session_id = managed_session.host.state().session.id;
         let run_id = managed_session.host.state().session.runs[0].id;
         let invocation_id = managed_session.host.state().session.tool_invocations[0].id;
-        connection.sessions.insert(session_id, managed_session);
+        connection
+            .sessions
+            .insert(session_id, Arc::new(Mutex::new(managed_session)));
 
         let responses = server
             .handle_request(
@@ -2268,8 +3343,10 @@ mod tests {
 
         let managed_session = connection
             .sessions
-            .get_mut(&session_id)
+            .get(&session_id)
+            .cloned()
             .expect("managed session");
+        let mut managed_session = managed_session.lock().await;
         managed_session
             .host
             .runtime_sender()
@@ -2311,7 +3388,9 @@ mod tests {
             &server,
         );
         let session_id = managed_session.host.state().session.id;
-        connection.sessions.insert(session_id, managed_session);
+        connection
+            .sessions
+            .insert(session_id, Arc::new(Mutex::new(managed_session)));
 
         let responses = server
             .handle_request(
@@ -2348,7 +3427,9 @@ mod tests {
         let managed_session = connection
             .sessions
             .get(&session_id)
+            .cloned()
             .expect("managed session");
+        let managed_session = managed_session.lock().await;
         let root_run = managed_session
             .host
             .state()
@@ -2565,12 +3646,169 @@ mod tests {
         assert!(cancel_ids.contains(&4));
         assert!(
             cancel_ids.contains(&3)
-                || connection
-                    .sessions
-                    .values()
-                    .any(|managed_session| managed_session.pending_prompt_request_id == Some(3)),
+                || connection.sessions.values().any(|managed_session| {
+                    managed_session
+                        .try_lock()
+                        .expect("test harness should not contend on managed sessions")
+                        .pending_prompt_request_id
+                        == Some(3)
+                }),
             "cancel path must either emit or retain the original prompt response",
         );
+
+        cleanup(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn official_sdk_test_probes_are_disabled_by_default() {
+        let _guard = test_lock().lock().await;
+        let temp_dir = unique_temp_dir("fluent-code-acp-official-test-probes-disabled");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let server = AcpServer::build(test_config(temp_dir.clone())).unwrap();
+
+        tokio::task::LocalSet::new()
+            .run_until(async move {
+                let (server_stream, client_stream) = duplex(64 * 1024);
+                let (server_reader, server_writer) = tokio::io::split(server_stream);
+                let server_task = {
+                    let server = server.clone();
+                    tokio::task::spawn_local(async move {
+                        server
+                            .serve_agent_connection(
+                                server_reader.compat(),
+                                server_writer.compat_write(),
+                            )
+                            .await
+                    })
+                };
+
+                let (client_reader, client_writer) = tokio::io::split(client_stream);
+                let (connection, io_future) = acp::ClientSideConnection::new(
+                    RecordingClient::default(),
+                    client_writer.compat_write(),
+                    client_reader.compat(),
+                    |future| {
+                        tokio::task::spawn_local(future);
+                    },
+                );
+                let connection = Arc::new(connection);
+                let io_task = tokio::task::spawn_local(io_future);
+
+                connection
+                    .initialize(acp::InitializeRequest::new(acp::ProtocolVersion::V1))
+                    .await
+                    .unwrap();
+
+                let params = serde_json::value::to_raw_value(&serde_json::json!({})).unwrap();
+                let error = connection
+                    .ext_method(acp::ExtRequest::new(
+                        "fluent_code/test/read_text_file".to_string(),
+                        params.into(),
+                    ))
+                    .await
+                    .expect_err("production official runtime should reject ACP test probes");
+                assert_eq!(error.code, acp::ErrorCode::MethodNotFound);
+
+                drop(connection);
+                io_task.abort();
+                let _ = io_task.await;
+                server_task.await.unwrap().unwrap();
+            })
+            .await;
+
+        cleanup(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn official_sdk_same_connection_cancel_unblocks_live_prompt_and_preserves_streaming() {
+        let _guard = test_lock().lock().await;
+        let temp_dir = unique_temp_dir("fluent-code-acp-official-live-cancel");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let store = FsSessionStore::new(temp_dir.clone());
+        let session = Session::new("official live cancel session");
+        let session_id = session.id.to_string();
+        store.create(&session).unwrap();
+
+        let server = test_server_with_chunk_delay(temp_dir.clone(), Duration::from_millis(50));
+        let test_cwd = temp_dir.clone();
+        let test_session_id = session_id.clone();
+
+        tokio::task::LocalSet::new()
+            .run_until(async move {
+                let (server_stream, client_stream) = duplex(64 * 1024);
+                let (server_reader, server_writer) = tokio::io::split(server_stream);
+                let server_task = {
+                    let server = server.clone();
+                    tokio::task::spawn_local(async move {
+                        server
+                            .serve_agent_connection(
+                                server_reader.compat(),
+                                server_writer.compat_write(),
+                            )
+                            .await
+                    })
+                };
+
+                let client = RecordingClient::default();
+                let agent_chunk_count = Arc::clone(&client.agent_chunk_count);
+                let (client_reader, client_writer) = tokio::io::split(client_stream);
+                let (connection, io_future) = acp::ClientSideConnection::new(
+                    client,
+                    client_writer.compat_write(),
+                    client_reader.compat(),
+                    |future| {
+                        tokio::task::spawn_local(future);
+                    },
+                );
+                let connection = Arc::new(connection);
+                let io_task = tokio::task::spawn_local(io_future);
+
+                connection
+                    .initialize(acp::InitializeRequest::new(acp::ProtocolVersion::V1))
+                    .await
+                    .unwrap();
+                connection
+                    .load_session(acp::LoadSessionRequest::new(
+                        test_session_id.clone(),
+                        test_cwd.clone(),
+                    ))
+                    .await
+                    .unwrap();
+
+                let prompt_connection = Arc::clone(&connection);
+                let prompt_session_id = test_session_id.clone();
+                let prompt_task = tokio::task::spawn_local(async move {
+                    prompt_connection
+                        .prompt(acp::PromptRequest::new(
+                            prompt_session_id,
+                            vec![acp::ContentBlock::Text(acp::TextContent::new(
+                                "interrupt this prompt over the official SDK path",
+                            ))],
+                        ))
+                        .await
+                });
+
+                wait_for_agent_chunk(&agent_chunk_count).await;
+                assert!(
+                    !prompt_task.is_finished(),
+                    "prompt should still be active after the first streamed agent chunk"
+                );
+
+                connection
+                    .cancel(acp::CancelNotification::new(test_session_id))
+                    .await
+                    .unwrap();
+
+                let prompt_response = prompt_task.await.unwrap().unwrap();
+                assert_eq!(prompt_response.stop_reason, acp::StopReason::Cancelled);
+                assert!(agent_chunk_count.load(Ordering::SeqCst) > 0);
+
+                drop(connection);
+                io_task.abort();
+                let _ = io_task.await;
+                server_task.await.unwrap().unwrap();
+            })
+            .await;
 
         cleanup(temp_dir);
     }
@@ -2770,7 +4008,7 @@ mod tests {
             ProviderClient::Mock(MockProvider::with_chunk_delay(Duration::from_millis(10))),
             Arc::clone(&tool_registry),
         );
-        let mut host = HeadlessAppHost::new(
+        let mut host = ManagedAppHost::new(
             Session::new("headless prompt lifecycle"),
             store.clone(),
             runtime,
@@ -2834,7 +4072,7 @@ mod tests {
             timestamp: Utc::now(),
         });
 
-        let mut host = HeadlessAppHost::new(
+        let mut host = ManagedAppHost::new(
             session,
             store.clone(),
             runtime,
@@ -2888,7 +4126,7 @@ mod tests {
             ProviderClient::Mock(MockProvider::new(None)),
             Arc::clone(&tool_registry),
         );
-        let mut host = HeadlessAppHost::new(
+        let mut host = ManagedAppHost::new(
             running_tool_session(),
             store,
             runtime,
@@ -3322,7 +4560,7 @@ mod tests {
         frames
     }
 
-    fn managed_session_for(host: HeadlessAppHost, server: &AcpServer) -> ManagedSession {
+    fn managed_session_for(host: ManagedAppHost, server: &AcpServer) -> ManagedSession {
         let mut host = host;
         if let Some(owner) = host.state().session.foreground_owner.clone() {
             host.state_mut()
@@ -3338,6 +4576,7 @@ mod tests {
             host,
             live_prompt_turn,
             pending_prompt_request_id: None,
+            buffered_prompt_completion: None,
         }
     }
 
@@ -3359,6 +4598,82 @@ mod tests {
             .filter_map(|frame| frame["params"]["update"]["content"]["text"].as_str())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingClient {
+        agent_chunk_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl acp::Client for RecordingClient {
+        async fn request_permission(
+            &self,
+            _args: acp::RequestPermissionRequest,
+        ) -> acp::Result<acp::RequestPermissionResponse> {
+            Err(acp::Error::method_not_found())
+        }
+
+        async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
+            if matches!(args.update, acp::SessionUpdate::AgentMessageChunk(_)) {
+                self.agent_chunk_count.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        async fn read_text_file(
+            &self,
+            _args: acp::ReadTextFileRequest,
+        ) -> acp::Result<acp::ReadTextFileResponse> {
+            Err(acp::Error::method_not_found())
+        }
+
+        async fn write_text_file(
+            &self,
+            _args: acp::WriteTextFileRequest,
+        ) -> acp::Result<acp::WriteTextFileResponse> {
+            Err(acp::Error::method_not_found())
+        }
+
+        async fn create_terminal(
+            &self,
+            _args: acp::CreateTerminalRequest,
+        ) -> acp::Result<acp::CreateTerminalResponse> {
+            Err(acp::Error::method_not_found())
+        }
+
+        async fn wait_for_terminal_exit(
+            &self,
+            _args: acp::WaitForTerminalExitRequest,
+        ) -> acp::Result<acp::WaitForTerminalExitResponse> {
+            Err(acp::Error::method_not_found())
+        }
+
+        async fn terminal_output(
+            &self,
+            _args: acp::TerminalOutputRequest,
+        ) -> acp::Result<acp::TerminalOutputResponse> {
+            Err(acp::Error::method_not_found())
+        }
+
+        async fn release_terminal(
+            &self,
+            _args: acp::ReleaseTerminalRequest,
+        ) -> acp::Result<acp::ReleaseTerminalResponse> {
+            Err(acp::Error::method_not_found())
+        }
+    }
+
+    async fn wait_for_agent_chunk(agent_chunk_count: &Arc<AtomicUsize>) {
+        for _ in 0..100 {
+            if agent_chunk_count.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("timed out waiting for an incrementally delivered agent chunk");
     }
 
     fn test_lock() -> &'static Mutex<()> {
