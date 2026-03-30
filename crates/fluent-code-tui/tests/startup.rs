@@ -463,17 +463,36 @@ async fn tui_prompt_flow_uses_acp_subprocess_end_to_end() {
                 .new_session(root.display().to_string())
                 .await
                 .expect("create ACP session for prompt flow");
+            let full_response = "Mock assistant response: please stream a response over ACP";
 
             {
-                let prompt = runtime.prompt(
-                    new_session.session_id.clone(),
-                    "please stream a response over ACP",
+                let (prompt_result, streaming_snapshot) = tokio::join!(
+                    runtime.prompt(
+                        new_session.session_id.clone(),
+                        "please stream a response over ACP",
+                    ),
+                    wait_for_in_flight_agent_transcript_content(&runtime)
                 );
-                tokio::pin!(prompt);
+                let streaming_agent_rows = streaming_snapshot
+                    .transcript_rows
+                    .iter()
+                    .filter(|row| row.source == TranscriptSource::Agent)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    streaming_agent_rows.len(),
+                    1,
+                    "expected in-flight ACP streaming to grow one agent row in place, got: {streaming_snapshot:?}"
+                );
+                assert!(
+                    !streaming_agent_rows[0].content.is_empty(),
+                    "expected in-flight ACP transcript to contain partial streamed content, got: {streaming_snapshot:?}"
+                );
+                assert!(
+                    !streaming_agent_rows[0].content.contains(full_response),
+                    "expected in-flight ACP transcript snapshot to remain partial rather than final, got: {streaming_snapshot:?}"
+                );
 
-                let prompt_result = prompt
-                    .as_mut()
-                    .await
+                let prompt_result = prompt_result
                     .expect("prompt flow to complete through the ACP subprocess");
                 assert_eq!(prompt_result.stop_reason, agent_client_protocol::StopReason::EndTurn);
             }
@@ -485,17 +504,23 @@ async fn tui_prompt_flow_uses_acp_subprocess_end_to_end() {
                 .iter()
                 .filter(|row| row.source == TranscriptSource::Agent)
                 .collect::<Vec<_>>();
-            assert!(
-                agent_rows.len() > 1,
-                "expected the ACP prompt flow to stream multiple agent chunks, got: {snapshot:?}"
+            assert_eq!(
+                agent_rows.len(),
+                1,
+                "expected the ACP prompt flow to coalesce streamed agent chunks into one transcript row, got: {snapshot:?}"
             );
             let combined_agent_text = agent_rows
                 .iter()
                 .map(|row| row.content.as_str())
                 .collect::<String>();
             assert!(
-                combined_agent_text.contains("Mock assistant response: please stream a response over ACP"),
+                combined_agent_text.contains(full_response),
                 "expected the streamed ACP transcript to contain the final response, got: {combined_agent_text:?}"
+            );
+            assert!(
+                agent_rows[0].content.contains(full_response),
+                "expected the single coalesced ACP transcript row to contain the full response, got: {:?}",
+                agent_rows[0].content
             );
 
             runtime
@@ -920,6 +945,28 @@ async fn wait_for_agent_transcript_content(
         assert!(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for an ACP agent transcript chunk containing `{needle}`"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_in_flight_agent_transcript_content(
+    runtime: &fluent_code_tui::AcpClientRuntime,
+) -> fluent_code_tui::TuiProjectionState {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = runtime.projection_snapshot().await;
+        let agent_rows = snapshot
+            .transcript_rows
+            .iter()
+            .filter(|row| row.source == TranscriptSource::Agent)
+            .collect::<Vec<_>>();
+        if !agent_rows.is_empty() {
+            return snapshot;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for in-flight ACP transcript content"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

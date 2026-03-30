@@ -46,6 +46,7 @@ pub struct TuiProjectionState {
     pub prompt_in_flight: bool,
     pub prompt_error: Option<String>,
     pub startup_error: Option<String>,
+    transcript_merge_start: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -118,6 +119,7 @@ impl TuiProjectionState {
             ..SessionProjection::default()
         };
         self.transcript_rows.clear();
+        self.transcript_merge_start = 0;
         self.tool_statuses.clear();
         self.pending_permission = None;
         self.draft_input.clear();
@@ -147,6 +149,7 @@ impl TuiProjectionState {
     fn mark_startup_error(&mut self, message: String) {
         self.startup_error = Some(message.clone());
         self.prompt_in_flight = false;
+        self.break_transcript_merge();
         self.subprocess.status = SubprocessStatus::Failed { message };
     }
 
@@ -168,15 +171,18 @@ impl TuiProjectionState {
         self.prompt_error = None;
         self.prompt_in_flight = true;
         self.draft_input.clear();
+        self.break_transcript_merge();
     }
 
     fn mark_prompt_finished(&mut self) {
         self.prompt_in_flight = false;
+        self.break_transcript_merge();
     }
 
     fn mark_prompt_error(&mut self, message: String) {
         self.prompt_in_flight = false;
         self.prompt_error = Some(message);
+        self.break_transcript_merge();
     }
 
     fn can_edit_draft(&self) -> bool {
@@ -184,7 +190,17 @@ impl TuiProjectionState {
     }
 
     fn apply_session_notification(&mut self, notification: acp::SessionNotification) {
-        self.session.session_id = Some(notification.session_id.to_string());
+        let session_id = notification.session_id.to_string();
+        if self
+            .session
+            .session_id
+            .as_deref()
+            .is_some_and(|current| current != session_id)
+        {
+            return;
+        }
+
+        self.session.session_id = Some(session_id);
 
         match notification.update {
             acp::SessionUpdate::UserMessageChunk(chunk) => {
@@ -194,18 +210,13 @@ impl TuiProjectionState {
                 });
             }
             acp::SessionUpdate::AgentMessageChunk(chunk) => {
-                self.transcript_rows.push(TranscriptRowProjection {
-                    source: TranscriptSource::Agent,
-                    content: content_block_label(chunk.content),
-                });
+                self.append_transcript_chunk(TranscriptSource::Agent, chunk.content);
             }
             acp::SessionUpdate::AgentThoughtChunk(chunk) => {
-                self.transcript_rows.push(TranscriptRowProjection {
-                    source: TranscriptSource::Thought,
-                    content: content_block_label(chunk.content),
-                });
+                self.append_transcript_chunk(TranscriptSource::Thought, chunk.content);
             }
             acp::SessionUpdate::ToolCall(tool_call) => {
+                self.break_transcript_merge();
                 self.upsert_tool_status(
                     tool_call.tool_call_id.to_string(),
                     tool_call.title,
@@ -213,6 +224,7 @@ impl TuiProjectionState {
                 );
             }
             acp::SessionUpdate::ToolCallUpdate(update) => {
+                self.break_transcript_merge();
                 self.apply_tool_call_update(update);
             }
             acp::SessionUpdate::SessionInfoUpdate(update) => {
@@ -232,7 +244,17 @@ impl TuiProjectionState {
     }
 
     fn apply_permission_request(&mut self, request: &acp::RequestPermissionRequest) {
-        self.session.session_id = Some(request.session_id.to_string());
+        let session_id = request.session_id.to_string();
+        if self
+            .session
+            .session_id
+            .as_deref()
+            .is_some_and(|current| current != session_id)
+        {
+            return;
+        }
+
+        self.session.session_id = Some(session_id);
         self.pending_permission = Some(PendingPermissionProjection {
             tool_call_id: request.tool_call.tool_call_id.to_string(),
             title: request
@@ -250,6 +272,35 @@ impl TuiProjectionState {
                 })
                 .collect(),
         });
+    }
+
+    fn append_transcript_chunk(&mut self, source: TranscriptSource, content: acp::ContentBlock) {
+        let content = content_block_label(content);
+        if content.is_empty() {
+            return;
+        }
+
+        let can_merge_last_row = self.transcript_merge_start < self.transcript_rows.len()
+            && self
+                .transcript_rows
+                .last()
+                .is_some_and(|row| row.source == source);
+
+        if can_merge_last_row {
+            let existing = self
+                .transcript_rows
+                .last_mut()
+                .expect("last row to exist when merge is allowed");
+            existing.content.push_str(&content);
+            return;
+        }
+
+        self.transcript_rows
+            .push(TranscriptRowProjection { source, content });
+    }
+
+    fn break_transcript_merge(&mut self) {
+        self.transcript_merge_start = self.transcript_rows.len();
     }
 
     fn upsert_tool_status(&mut self, tool_call_id: String, title: String, status: String) {
@@ -2552,5 +2603,372 @@ fn content_block_label(content: acp::ContentBlock) -> String {
         acp::ContentBlock::Audio(_) => "<audio>".to_string(),
         acp::ContentBlock::Resource(_) => "<resource>".to_string(),
         _ => "<content>".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_session_notification_coalesces_adjacent_agent_message_chunks() {
+        let mut projection = TuiProjectionState::default();
+
+        projection.apply_session_notification(agent_message_chunk("Mock assistant "));
+        projection.apply_session_notification(agent_message_chunk("response: "));
+        projection.apply_session_notification(agent_message_chunk("hello"));
+
+        assert_eq!(
+            projection.transcript_rows,
+            vec![TranscriptRowProjection {
+                source: TranscriptSource::Agent,
+                content: "Mock assistant response: hello".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_session_notification_coalesces_adjacent_agent_thought_chunks() {
+        let mut projection = TuiProjectionState::default();
+
+        projection.apply_session_notification(agent_thought_chunk("thinking"));
+        projection.apply_session_notification(agent_thought_chunk(" through"));
+        projection.apply_session_notification(agent_thought_chunk(" steps"));
+
+        assert_eq!(
+            projection.transcript_rows,
+            vec![TranscriptRowProjection {
+                source: TranscriptSource::Thought,
+                content: "thinking through steps".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_session_notification_ignores_empty_chunks() {
+        let mut projection = TuiProjectionState::default();
+
+        projection.apply_session_notification(agent_message_chunk(""));
+        projection.apply_session_notification(agent_thought_chunk(""));
+        assert!(projection.transcript_rows.is_empty());
+
+        projection.apply_session_notification(agent_message_chunk("hello"));
+        projection.apply_session_notification(agent_message_chunk(""));
+        projection.apply_session_notification(agent_thought_chunk(""));
+
+        assert_eq!(
+            projection.transcript_rows,
+            vec![TranscriptRowProjection {
+                source: TranscriptSource::Agent,
+                content: "hello".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_session_notification_keeps_thought_and_message_rows_separate() {
+        let mut projection = TuiProjectionState::default();
+
+        projection.apply_session_notification(agent_thought_chunk("thinking"));
+        projection.apply_session_notification(agent_message_chunk("answer"));
+        projection.apply_session_notification(agent_thought_chunk(" more"));
+        projection.apply_session_notification(agent_message_chunk(" done"));
+
+        assert_eq!(
+            projection.transcript_rows,
+            vec![
+                TranscriptRowProjection {
+                    source: TranscriptSource::Thought,
+                    content: "thinking".to_string(),
+                },
+                TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: "answer".to_string(),
+                },
+                TranscriptRowProjection {
+                    source: TranscriptSource::Thought,
+                    content: " more".to_string(),
+                },
+                TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: " done".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_session_notification_does_not_merge_across_user_chunks() {
+        let mut projection = TuiProjectionState::default();
+
+        projection.apply_session_notification(agent_message_chunk("first answer"));
+        projection.apply_session_notification(user_message_chunk("follow-up"));
+        projection.apply_session_notification(agent_message_chunk(" second answer"));
+
+        assert_eq!(
+            projection.transcript_rows,
+            vec![
+                TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: "first answer".to_string(),
+                },
+                TranscriptRowProjection {
+                    source: TranscriptSource::User,
+                    content: "follow-up".to_string(),
+                },
+                TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: " second answer".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_session_notification_does_not_merge_across_tool_updates() {
+        let mut projection = TuiProjectionState::default();
+
+        projection.apply_session_notification(agent_message_chunk("before tool"));
+        projection.apply_session_notification(tool_call_update("tool-1"));
+        projection.apply_session_notification(agent_message_chunk(" after tool"));
+
+        assert_eq!(
+            projection.transcript_rows,
+            vec![
+                TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: "before tool".to_string(),
+                },
+                TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: " after tool".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_session_notification_does_not_merge_across_tool_calls() {
+        let mut projection = TuiProjectionState::default();
+
+        projection.apply_session_notification(agent_message_chunk("before tool"));
+        projection.apply_session_notification(tool_call("tool-1", "Run tool"));
+        projection.apply_session_notification(agent_message_chunk(" after tool"));
+
+        assert_eq!(
+            projection.transcript_rows,
+            vec![
+                TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: "before tool".to_string(),
+                },
+                TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: " after tool".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_session_notification_resets_projection_on_session_reset() {
+        let mut projection = TuiProjectionState::default();
+
+        projection.apply_session_notification(agent_message_chunk("stale output"));
+        projection.apply_session_notification(agent_thought_chunk("stale reasoning"));
+
+        let next_session = acp::SessionId::new("session-2");
+        projection.prepare_session_load(&next_session);
+        projection.apply_session_notification(agent_message_chunk_for_session(
+            next_session.to_string(),
+            "fresh output",
+        ));
+
+        assert_eq!(projection.session.session_id.as_deref(), Some("session-2"));
+        assert_eq!(
+            projection.transcript_rows,
+            vec![TranscriptRowProjection {
+                source: TranscriptSource::Agent,
+                content: "fresh output".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_session_notification_ignores_stale_notifications_from_previous_session() {
+        let mut projection = TuiProjectionState::default();
+
+        projection.mark_session_created(acp::SessionId::new("session-1"));
+        projection.apply_session_notification(agent_message_chunk_for_session(
+            "session-1",
+            "current output",
+        ));
+
+        let next_session = acp::SessionId::new("session-2");
+        projection.prepare_session_load(&next_session);
+        projection.apply_session_notification(agent_message_chunk_for_session(
+            "session-1",
+            "stale output",
+        ));
+
+        assert_eq!(projection.session.session_id.as_deref(), Some("session-2"));
+        assert!(projection.transcript_rows.is_empty());
+
+        projection.apply_session_notification(agent_message_chunk_for_session(
+            "session-2",
+            "fresh output",
+        ));
+
+        assert_eq!(
+            projection.transcript_rows,
+            vec![TranscriptRowProjection {
+                source: TranscriptSource::Agent,
+                content: "fresh output".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_permission_request_ignores_stale_requests_from_previous_session() {
+        let mut projection = TuiProjectionState::default();
+
+        projection.mark_session_created(acp::SessionId::new("session-1"));
+        projection.apply_permission_request(&permission_request("session-1", "tool-1"));
+        assert_eq!(
+            projection
+                .pending_permission
+                .as_ref()
+                .map(|pending| pending.tool_call_id.as_str()),
+            Some("tool-1")
+        );
+
+        let next_session = acp::SessionId::new("session-2");
+        projection.prepare_session_load(&next_session);
+        projection.apply_permission_request(&permission_request("session-1", "tool-stale"));
+
+        assert_eq!(projection.session.session_id.as_deref(), Some("session-2"));
+        assert!(projection.pending_permission.is_none());
+    }
+
+    #[test]
+    fn apply_session_notification_does_not_merge_across_prompt_turn_boundaries() {
+        let mut projection = TuiProjectionState::default();
+
+        projection.mark_prompt_started();
+        projection.apply_session_notification(agent_message_chunk("first turn"));
+        projection.mark_prompt_finished();
+
+        projection.mark_prompt_started();
+        projection.apply_session_notification(agent_message_chunk("second turn"));
+
+        assert_eq!(
+            projection.transcript_rows,
+            vec![
+                TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: "first turn".to_string(),
+                },
+                TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: "second turn".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_session_notification_preserves_image_placeholder_labels() {
+        let mut projection = TuiProjectionState::default();
+
+        projection.apply_session_notification(session_notification(
+            "session-1",
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                acp::ContentBlock::Image(acp::ImageContent::new("ZmFrZQ==", "image/png")),
+            )),
+        ));
+
+        assert_eq!(
+            projection.transcript_rows,
+            vec![TranscriptRowProjection {
+                source: TranscriptSource::Agent,
+                content: "<image>".to_string(),
+            }]
+        );
+    }
+
+    fn agent_message_chunk(text: &str) -> acp::SessionNotification {
+        agent_message_chunk_for_session("session-1", text)
+    }
+
+    fn agent_message_chunk_for_session(
+        session_id: impl Into<acp::SessionId>,
+        text: &str,
+    ) -> acp::SessionNotification {
+        session_notification(
+            session_id,
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
+                acp::TextContent::new(text),
+            ))),
+        )
+    }
+
+    fn agent_thought_chunk(text: &str) -> acp::SessionNotification {
+        session_notification(
+            "session-1",
+            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
+                acp::TextContent::new(text),
+            ))),
+        )
+    }
+
+    fn user_message_chunk(text: &str) -> acp::SessionNotification {
+        session_notification(
+            "session-1",
+            acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
+                acp::TextContent::new(text),
+            ))),
+        )
+    }
+
+    fn tool_call_update(tool_call_id: &str) -> acp::SessionNotification {
+        session_notification(
+            "session-1",
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                tool_call_id.to_string(),
+                acp::ToolCallUpdateFields::new(),
+            )),
+        )
+    }
+
+    fn tool_call(tool_call_id: &str, title: &str) -> acp::SessionNotification {
+        session_notification(
+            "session-1",
+            acp::SessionUpdate::ToolCall(acp::ToolCall::new(
+                tool_call_id.to_string(),
+                title.to_string(),
+            )),
+        )
+    }
+
+    fn permission_request(
+        session_id: impl Into<acp::SessionId>,
+        tool_call_id: &str,
+    ) -> acp::RequestPermissionRequest {
+        acp::RequestPermissionRequest::new(
+            session_id,
+            acp::ToolCallUpdate::new(tool_call_id.to_string(), acp::ToolCallUpdateFields::new()),
+            vec![acp::PermissionOption::new(
+                "allow_once",
+                "Allow once",
+                acp::PermissionOptionKind::AllowOnce,
+            )],
+        )
+    }
+
+    fn session_notification(
+        session_id: impl Into<acp::SessionId>,
+        update: acp::SessionUpdate,
+    ) -> acp::SessionNotification {
+        acp::SessionNotification::new(session_id, update)
     }
 }

@@ -33,26 +33,13 @@ pub(crate) fn render_streaming_markdown_lines(
         content
     };
 
-    let Some(last_newline_idx) = markdown.rfind('\n') else {
-        return render_pending_tail(markdown, base_style, infer_unclosed_code_block(markdown));
-    };
-
-    let (committed, pending_tail) = markdown.split_at(last_newline_idx + 1);
-    let parser = Parser::new_ext(committed, Options::ENABLE_STRIKETHROUGH);
-    let mut renderer = MarkdownRenderer::new(base_style);
+    let plain_fenced_code_block_index = infer_unclosed_code_block(markdown)
+        .then(|| count_fenced_code_block_markers(markdown).div_ceil(2));
+    let parser = Parser::new_ext(markdown, Options::ENABLE_STRIKETHROUGH);
+    let mut renderer = MarkdownRenderer::new(base_style)
+        .with_plain_fenced_code_block_index(plain_fenced_code_block_index);
     renderer.run(parser);
-    let render_result = renderer.finish(false);
-    let mut lines = render_result.lines;
-
-    let pending_is_code = render_result.in_code_block || infer_unclosed_code_block(markdown);
-
-    if !pending_tail.is_empty() {
-        lines.extend(render_pending_tail(
-            pending_tail,
-            base_style,
-            pending_is_code,
-        ));
-    }
+    let lines = renderer.finish(false).lines;
 
     if lines.is_empty() {
         vec![Line::from(vec![Span::styled(
@@ -66,13 +53,15 @@ pub(crate) fn render_streaming_markdown_lines(
 
 struct RenderResult {
     lines: Vec<Line<'static>>,
-    in_code_block: bool,
 }
 
 struct MarkdownRenderer {
     lines: Vec<Line<'static>>,
     current_spans: Vec<Span<'static>>,
     base_style: Style,
+    plain_fenced_code_block_index: Option<usize>,
+    fenced_code_blocks_seen: usize,
+    current_code_block_plain: bool,
     inline_styles: Vec<Style>,
     link_destinations: Vec<String>,
     list_stack: Vec<ListContext>,
@@ -96,6 +85,9 @@ impl MarkdownRenderer {
             lines: Vec::new(),
             current_spans: Vec::new(),
             base_style,
+            plain_fenced_code_block_index: None,
+            fenced_code_blocks_seen: 0,
+            current_code_block_plain: false,
             inline_styles: Vec::new(),
             link_destinations: Vec::new(),
             list_stack: Vec::new(),
@@ -106,6 +98,14 @@ impl MarkdownRenderer {
             suppress_next_softbreak: false,
             previous_block_was_paragraph: false,
         }
+    }
+
+    fn with_plain_fenced_code_block_index(
+        mut self,
+        plain_fenced_code_block_index: Option<usize>,
+    ) -> Self {
+        self.plain_fenced_code_block_index = plain_fenced_code_block_index;
+        self
     }
 
     fn run<'a>(&mut self, parser: Parser<'a>) {
@@ -122,10 +122,7 @@ impl MarkdownRenderer {
                 self.base_style,
             )]));
         }
-        RenderResult {
-            lines: self.lines,
-            in_code_block: self.in_code_block,
-        }
+        RenderResult { lines: self.lines }
     }
 
     fn handle_event<'a>(&mut self, event: Event<'a>) {
@@ -177,8 +174,14 @@ impl MarkdownRenderer {
             Tag::CodeBlock(kind) => {
                 self.flush_line();
                 self.in_code_block = true;
+                self.current_code_block_plain = false;
                 self.code_block_lang = match kind {
-                    CodeBlockKind::Fenced(lang) => Some(lang.into_string()),
+                    CodeBlockKind::Fenced(lang) => {
+                        self.fenced_code_blocks_seen += 1;
+                        self.current_code_block_plain = self.plain_fenced_code_block_index
+                            == Some(self.fenced_code_blocks_seen);
+                        Some(lang.into_string())
+                    }
                     CodeBlockKind::Indented => None,
                 };
                 self.code_block_buffer.clear();
@@ -247,6 +250,7 @@ impl MarkdownRenderer {
                 self.flush_code_block();
                 self.flush_line();
                 self.in_code_block = false;
+                self.current_code_block_plain = false;
                 self.code_block_lang = None;
                 self.previous_block_was_paragraph = false;
             }
@@ -356,8 +360,13 @@ impl MarkdownRenderer {
             .trim()
             .to_ascii_lowercase();
 
-        let highlighted = highlight_code_to_lines(&self.code_block_buffer, &language);
-        for line in highlighted {
+        let rendered_lines = if self.current_code_block_plain {
+            plain_code_lines(&self.code_block_buffer)
+        } else {
+            highlight_code_to_lines(&self.code_block_buffer, &language)
+        };
+
+        for line in rendered_lines {
             self.lines.push(line);
         }
         self.code_block_buffer.clear();
@@ -403,29 +412,6 @@ impl MarkdownRenderer {
             "- ".to_string()
         }
     }
-}
-
-fn render_pending_tail(
-    content: &str,
-    base_style: Style,
-    in_code_block: bool,
-) -> Vec<Line<'static>> {
-    content
-        .lines()
-        .map(|line| {
-            let rendered = if in_code_block {
-                format!("    {line}")
-            } else {
-                line.to_string()
-            };
-            let style = if in_code_block {
-                TUI_THEME.markdown_code_block
-            } else {
-                base_style
-            };
-            Line::from(vec![Span::styled(rendered, style)])
-        })
-        .collect()
 }
 
 fn highlight_code_to_lines(code: &str, language: &str) -> Vec<Line<'static>> {
@@ -551,12 +537,14 @@ fn convert_style(syntect_style: SyntectStyle) -> Style {
 }
 
 fn infer_unclosed_code_block(content: &str) -> bool {
+    count_fenced_code_block_markers(content) % 2 == 1
+}
+
+fn count_fenced_code_block_markers(content: &str) -> usize {
     content
         .lines()
         .filter(|line| line.trim_start().starts_with("```"))
         .count()
-        % 2
-        == 1
 }
 
 #[cfg(test)]
@@ -623,16 +611,27 @@ mod tests {
     }
 
     #[test]
-    fn streaming_renderer_keeps_partial_markdown_tail_raw_until_newline() {
-        let lines = render_streaming_markdown_lines(
+    fn streaming_renderer_normalizes_incomplete_paragraph_tail_without_exposing_chunk_lines() {
+        let streaming_lines = render_streaming_markdown_lines(
             "Committed line\nUse [docs](https://exam",
             TUI_THEME.text,
         );
+        let committed_lines =
+            render_markdown_lines("Committed line\nUse [docs](https://exam", TUI_THEME.text);
 
-        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("Committed line"));
-        assert!(text.contains("Use [docs](https://exam"));
-        assert!(!text.contains("docs (https://exam)"));
+        let streaming_text = streaming_lines.iter().map(line_text).collect::<Vec<_>>();
+        let committed_text = committed_lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert_eq!(streaming_text, committed_text);
+        assert_eq!(
+            streaming_text.first().map(String::as_str),
+            Some("Committed line Use [docs](https://exam")
+        );
+        assert!(
+            !streaming_text
+                .iter()
+                .any(|line| line == "Use [docs](https://exam")
+        );
     }
 
     #[test]
@@ -661,5 +660,27 @@ mod tests {
             .expect("committed code line to exist");
         assert!(committed_code_line.spans.len() > 1);
         assert_eq!(line_text(committed_code_line), "    fn main");
+    }
+
+    #[test]
+    fn streaming_renderer_keeps_completed_fenced_blocks_highlighted_before_plain_unfinished_tail() {
+        let lines = render_streaming_markdown_lines(
+            "```rust\nfn main() {}\n```\n\n```rust\nlet answer = 4",
+            TUI_THEME.text,
+        );
+
+        let completed_code_line = lines
+            .iter()
+            .find(|line| line_text(line).contains("fn main() {}"))
+            .expect("completed code line to exist");
+        let unfinished_code_line = lines
+            .iter()
+            .find(|line| line_text(line).contains("let answer = 4"))
+            .expect("unfinished code line to exist");
+
+        assert!(completed_code_line.spans.len() > 2);
+        assert_eq!(line_text(completed_code_line), "    fn main() {}");
+        assert_eq!(unfinished_code_line.spans.len(), 1);
+        assert_eq!(line_text(unfinished_code_line), "    let answer = 4");
     }
 }
