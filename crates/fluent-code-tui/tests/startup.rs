@@ -22,6 +22,16 @@ use fluent_code_tui::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::Mutex;
 
+#[allow(dead_code)]
+#[path = "../src/acp.rs"]
+mod acp_projection_regression;
+#[allow(dead_code)]
+#[path = "../src/terminal.rs"]
+mod terminal;
+#[allow(dead_code)]
+#[path = "../src/theme.rs"]
+mod theme;
+
 struct StartupRecoveryFixture {
     session: Session,
     child_run_id: uuid::Uuid,
@@ -451,7 +461,7 @@ async fn tui_prompt_flow_uses_acp_subprocess_end_to_end() {
     let _guard = startup_subprocess_test_lock().lock().await;
     let root = unique_test_dir();
     fs::create_dir_all(&root).expect("create ACP prompt-flow test root");
-    write_acp_subprocess_test_config(&root);
+    write_acp_subprocess_test_config_with_chunk_delay(&root, Some(75));
 
     let acp_binary = build_acp_binary();
     tokio::task::LocalSet::new()
@@ -466,38 +476,84 @@ async fn tui_prompt_flow_uses_acp_subprocess_end_to_end() {
             let full_response = "Mock assistant response: please stream a response over ACP";
 
             {
-                let (prompt_result, streaming_snapshot) = tokio::join!(
+                let (prompt_result, streaming_snapshots) = tokio::join!(
                     runtime.prompt(
                         new_session.session_id.clone(),
                         "please stream a response over ACP",
                     ),
-                    wait_for_in_flight_agent_transcript_content(&runtime)
+                    wait_for_monotonic_in_flight_agent_transcript_growth(&runtime, full_response)
                 );
-                let streaming_agent_rows = streaming_snapshot
+                assert_eq!(
+                    streaming_snapshots.len(),
+                    2,
+                    "expected the helper to return two successive in-flight partial snapshots"
+                );
+                let first_partial = &streaming_snapshots[0];
+                let second_partial = &streaming_snapshots[1];
+                let first_partial_agent_rows = first_partial
+                    .transcript_rows
+                    .iter()
+                    .filter(|row| row.source == TranscriptSource::Agent)
+                    .collect::<Vec<_>>();
+                let second_partial_agent_rows = second_partial
                     .transcript_rows
                     .iter()
                     .filter(|row| row.source == TranscriptSource::Agent)
                     .collect::<Vec<_>>();
                 assert_eq!(
-                    streaming_agent_rows.len(),
+                    first_partial_agent_rows.len(),
                     1,
-                    "expected in-flight ACP streaming to grow one agent row in place, got: {streaming_snapshot:?}"
+                    "expected the first in-flight ACP snapshot to keep one coalesced agent row, got: {first_partial:?}"
+                );
+                assert_eq!(
+                    second_partial_agent_rows.len(),
+                    1,
+                    "expected the second in-flight ACP snapshot to keep one coalesced agent row, got: {second_partial:?}"
                 );
                 assert!(
-                    !streaming_agent_rows[0].content.is_empty(),
-                    "expected in-flight ACP transcript to contain partial streamed content, got: {streaming_snapshot:?}"
+                    !first_partial_agent_rows[0].content.is_empty(),
+                    "expected the first in-flight ACP snapshot to contain partial streamed content, got: {first_partial:?}"
                 );
                 assert!(
-                    !streaming_agent_rows[0].content.contains(full_response),
-                    "expected in-flight ACP transcript snapshot to remain partial rather than final, got: {streaming_snapshot:?}"
+                    second_partial_agent_rows[0].content.len()
+                        > first_partial_agent_rows[0].content.len(),
+                    "expected successive in-flight ACP snapshots to show monotonic transcript growth, got first={:?}, second={:?}",
+                    first_partial_agent_rows[0].content,
+                    second_partial_agent_rows[0].content
+                );
+                assert!(
+                    !first_partial_agent_rows[0].content.contains(full_response)
+                        && !second_partial_agent_rows[0].content.contains(full_response),
+                    "expected both in-flight ACP snapshots to remain partial rather than final, got: {streaming_snapshots:?}"
                 );
 
                 let prompt_result = prompt_result
                     .expect("prompt flow to complete through the ACP subprocess");
                 assert_eq!(prompt_result.stop_reason, agent_client_protocol::StopReason::EndTurn);
+
+                let completed_snapshot = runtime.projection_snapshot().await;
+                let completed_agent_rows = completed_snapshot
+                    .transcript_rows
+                    .iter()
+                    .filter(|row| row.source == TranscriptSource::Agent)
+                    .collect::<Vec<_>>();
+                assert!(
+                    !completed_snapshot.prompt_in_flight,
+                    "expected the prompt-finished projection snapshot to be available immediately after ACP completion, got: {completed_snapshot:?}"
+                );
+                assert_eq!(
+                    completed_agent_rows.len(),
+                    1,
+                    "expected ACP prompt completion to leave one coalesced agent row immediately available, got: {completed_snapshot:?}"
+                );
+                assert!(
+                    completed_agent_rows[0].content.contains(full_response),
+                    "expected ACP prompt completion to flush the final streamed chunk into the projection immediately, got: {:?}",
+                    completed_agent_rows[0].content
+                );
             }
 
-            let snapshot = wait_for_agent_transcript_content(&runtime, "Mock assistant").await;
+            let snapshot = wait_for_agent_transcript_content(&runtime, full_response).await;
             assert!(snapshot.pending_permission.is_none());
             let agent_rows = snapshot
                 .transcript_rows
@@ -531,6 +587,21 @@ async fn tui_prompt_flow_uses_acp_subprocess_end_to_end() {
         .await;
 
     cleanup(root);
+}
+
+#[tokio::test]
+async fn projection_loop_redraws_stream_updates_without_waiting_for_full_input_poll() {
+    acp_projection_regression::assert_projection_loop_redraws_stream_updates_without_waiting_for_full_input_poll()
+        .await
+        .expect("projection loop redraw-order regression helper to pass");
+}
+
+#[tokio::test]
+async fn projection_state_flushes_terminal_stream_updates_immediately() {
+    acp_projection_regression::assert_projection_state_flushes_terminal_stream_updates_immediately(
+    )
+    .await
+    .expect("projection terminal-state flush regression helper to pass");
 }
 
 #[tokio::test]
@@ -950,10 +1021,14 @@ async fn wait_for_agent_transcript_content(
     }
 }
 
-async fn wait_for_in_flight_agent_transcript_content(
+async fn wait_for_monotonic_in_flight_agent_transcript_growth(
     runtime: &fluent_code_tui::AcpClientRuntime,
-) -> fluent_code_tui::TuiProjectionState {
+    full_response: &str,
+) -> Vec<fluent_code_tui::TuiProjectionState> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut snapshots = Vec::new();
+    let mut last_content = String::new();
+
     loop {
         let snapshot = runtime.projection_snapshot().await;
         let agent_rows = snapshot
@@ -961,14 +1036,32 @@ async fn wait_for_in_flight_agent_transcript_content(
             .iter()
             .filter(|row| row.source == TranscriptSource::Agent)
             .collect::<Vec<_>>();
-        if !agent_rows.is_empty() {
-            return snapshot;
+
+        if agent_rows.len() == 1 {
+            let content = agent_rows[0].content.as_str();
+            if !content.is_empty() && !content.contains(full_response) {
+                if !last_content.is_empty() {
+                    assert!(
+                        content.len() >= last_content.len(),
+                        "expected in-flight ACP transcript content to grow monotonically, got previous={last_content:?}, current={content:?}"
+                    );
+                }
+
+                if content.len() > last_content.len() {
+                    snapshots.push(snapshot.clone());
+                    last_content = content.to_string();
+                    if snapshots.len() == 2 {
+                        return snapshots;
+                    }
+                }
+            }
         }
+
         assert!(
             tokio::time::Instant::now() < deadline,
-            "timed out waiting for in-flight ACP transcript content"
+            "timed out waiting for successive in-flight ACP transcript growth before completion"
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -1041,9 +1134,17 @@ fn cargo_target_dir() -> PathBuf {
 }
 
 fn write_acp_subprocess_test_config(root: &Path) {
+    write_acp_subprocess_test_config_with_chunk_delay(root, None);
+}
+
+fn write_acp_subprocess_test_config_with_chunk_delay(root: &Path, chunk_delay_ms: Option<u64>) {
+    let mock_provider_config = chunk_delay_ms.map_or_else(String::new, |chunk_delay_ms| {
+        format!("\n[model_providers.mock]\nchunk_delay_ms = {chunk_delay_ms}\n")
+    });
     fs::write(
         root.join("fluent-code.toml"),
-        r#"data_dir = ".fluent-code"
+        format!(
+            r#"data_dir = ".fluent-code"
 
 [logging.file]
 enabled = false
@@ -1056,7 +1157,8 @@ enable_project_plugins = false
 enable_global_plugins = false
 project_dir = "plugins/project"
 global_dir = "plugins/global"
-"#,
+{mock_provider_config}"#
+        ),
     )
     .expect("write ACP subprocess test config");
 }

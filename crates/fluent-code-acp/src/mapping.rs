@@ -112,7 +112,7 @@ impl SessionUpdateMapper {
         for turn in session
             .turns
             .iter()
-            .filter(|turn| turn.run_id == run_id)
+            .filter(|turn| run_belongs_to_prompt_turn(session, run_id, turn.run_id))
             .filter(|turn| is_valid_sequence(session, turn.sequence_number))
         {
             match turn.role {
@@ -161,7 +161,7 @@ impl SessionUpdateMapper {
         for invocation in session
             .tool_invocations
             .iter()
-            .filter(|invocation| invocation.run_id == run_id)
+            .filter(|invocation| run_belongs_to_prompt_turn(session, run_id, invocation.run_id))
             .filter(|invocation| is_valid_sequence(session, invocation.sequence_number))
         {
             events.push(OrderedPromptTurnEvent::new(
@@ -357,6 +357,27 @@ pub enum TerminalStopProjection {
 
 fn is_valid_sequence(session: &Session, sequence: ReplaySequence) -> bool {
     sequence > 0 && sequence < session.next_replay_sequence
+}
+
+fn run_belongs_to_prompt_turn(
+    session: &Session,
+    root_run_id: RunId,
+    mut candidate_run_id: RunId,
+) -> bool {
+    loop {
+        let Some(run) = session.find_run(candidate_run_id) else {
+            return false;
+        };
+
+        if run.id == root_run_id {
+            return true;
+        }
+
+        let Some(parent_run_id) = run.parent_run_id else {
+            return false;
+        };
+        candidate_run_id = parent_run_id;
+    }
 }
 
 fn final_tool_status(invocation: &ToolInvocationRecord) -> ToolCallStatus {
@@ -1080,6 +1101,120 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![first_run_id, second_run_id]
         );
+    }
+
+    #[test]
+    fn delegated_child_events_are_projected_into_the_root_prompt_turn() {
+        let mapper = SessionUpdateMapper::new();
+        let root_run_id = Uuid::new_v4();
+        let child_run_id = Uuid::new_v4();
+        let root_task_invocation_id = Uuid::new_v4();
+        let child_tool_invocation_id = Uuid::new_v4();
+        let child_assistant_turn_id = Uuid::new_v4();
+        let now = Utc::now();
+        let mut session = Session::new("delegated projection");
+        session.runs = vec![
+            RunRecord {
+                id: root_run_id,
+                status: RunStatus::InProgress,
+                parent_run_id: None,
+                parent_tool_invocation_id: None,
+                created_sequence: 2,
+                terminal_sequence: None,
+                terminal_stop_reason: None,
+                created_at: now,
+                updated_at: now,
+            },
+            RunRecord {
+                id: child_run_id,
+                status: RunStatus::InProgress,
+                parent_run_id: Some(root_run_id),
+                parent_tool_invocation_id: Some(root_task_invocation_id),
+                created_sequence: 6,
+                terminal_sequence: None,
+                terminal_stop_reason: None,
+                created_at: now,
+                updated_at: now,
+            },
+        ];
+        session.turns = vec![
+            user_turn(root_run_id, 1, "delegate work"),
+            assistant_turn(root_run_id, 3, "I will delegate that task.", "planning"),
+            user_turn(child_run_id, 7, "Inspect cancellation flow"),
+            Turn {
+                id: child_assistant_turn_id,
+                run_id: child_run_id,
+                role: Role::Assistant,
+                content: "Child summary".to_string(),
+                reasoning: "child reasoning".to_string(),
+                sequence_number: 8,
+                timestamp: now,
+            },
+        ];
+
+        let mut root_task_invocation = tool_invocation(
+            root_task_invocation_id,
+            root_run_id,
+            ("task-call-1", "task"),
+            5,
+            ToolApprovalState::Approved,
+            ToolExecutionState::Running,
+            (None, None),
+        );
+        root_task_invocation.preceding_turn_id = Some(session.turns[1].id);
+
+        let mut child_tool_invocation = tool_invocation(
+            child_tool_invocation_id,
+            child_run_id,
+            ("read-call-2", "read"),
+            9,
+            ToolApprovalState::Approved,
+            ToolExecutionState::Running,
+            (None, None),
+        );
+        child_tool_invocation.preceding_turn_id = Some(child_assistant_turn_id);
+        child_tool_invocation.arguments = json!({"path":"/tmp/child.txt"});
+
+        session.tool_invocations = vec![root_task_invocation, child_tool_invocation];
+        session.next_replay_sequence = 10;
+
+        let projection = mapper
+            .project_prompt_turn(&AppState::new(session), root_run_id)
+            .unwrap();
+
+        assert_eq!(
+            projection
+                .events
+                .iter()
+                .map(event_signature)
+                .collect::<Vec<_>>(),
+            vec![
+                (1, ProjectionEventPhase::UserMessage, "session_update"),
+                (3, ProjectionEventPhase::AgentThought, "session_update"),
+                (3, ProjectionEventPhase::AgentMessage, "session_update"),
+                (5, ProjectionEventPhase::ToolCallCreate, "session_update"),
+                (5, ProjectionEventPhase::ToolCallPatch, "session_update"),
+                (7, ProjectionEventPhase::UserMessage, "session_update"),
+                (8, ProjectionEventPhase::AgentThought, "session_update"),
+                (8, ProjectionEventPhase::AgentMessage, "session_update"),
+                (9, ProjectionEventPhase::ToolCallCreate, "session_update"),
+                (9, ProjectionEventPhase::ToolCallPatch, "session_update"),
+            ]
+        );
+
+        match &projection.events[6].event {
+            PromptTurnEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(chunk)) => {
+                assert_eq!(chunk.content, ContentBlock::text("child reasoning"));
+            }
+            other => panic!("expected delegated child reasoning update, got {other:?}"),
+        }
+
+        match &projection.events[7].event {
+            PromptTurnEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(chunk)) => {
+                assert_eq!(chunk.content, ContentBlock::text("Child summary"));
+            }
+            other => panic!("expected delegated child message update, got {other:?}"),
+        }
     }
 
     fn event_signature(

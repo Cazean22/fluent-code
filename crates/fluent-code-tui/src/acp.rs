@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc as StdArc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -34,6 +36,8 @@ use crate::theme::TUI_THEME;
 const ACP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const ACP_TEST_PROBES_ENV_VAR: &str = "FLUENT_CODE_ACP_ENABLE_TEST_PROBES";
+const PROJECTION_IDLE_INPUT_POLL: Duration = Duration::from_millis(50);
+const PROMPT_IN_FLIGHT_REDRAW_CADENCE: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TuiProjectionState {
@@ -1821,29 +1825,70 @@ async fn run_projection_loop(
     controller: &mut ProjectionController,
 ) -> Result<()> {
     loop {
-        controller.poll_active_prompt().await?;
-        let snapshot = controller.snapshot().await;
-        terminal.draw(|frame| render_projection(frame, &snapshot))?;
-
-        match next_projection_action(&snapshot)? {
-            ProjectionAction::None => {}
-            ProjectionAction::Quit => break,
-            ProjectionAction::NewSession => controller.create_new_session().await?,
-            ProjectionAction::UpdateDraft(draft_input) => {
-                controller.set_draft_input(draft_input).await;
-            }
-            ProjectionAction::SubmitPrompt => controller.submit_prompt().await?,
-            ProjectionAction::Select(option_id) => {
-                resolve_pending_permission_selection(controller.projection(), &option_id).await?;
-            }
-            ProjectionAction::CancelPendingPermission => {
-                cancel_pending_permission(controller.projection()).await?;
-            }
-            ProjectionAction::CancelActivePrompt => controller.cancel_prompt().await?,
+        if run_projection_iteration(
+            controller,
+            |snapshot| {
+                terminal.draw(|frame| render_projection(frame, snapshot))?;
+                Ok(())
+            },
+            next_projection_action,
+        )
+        .await?
+        {
+            break;
         }
     }
 
     Ok(())
+}
+
+async fn run_projection_iteration<Draw, NextAction>(
+    controller: &mut ProjectionController,
+    draw: Draw,
+    next_action: NextAction,
+) -> Result<bool>
+where
+    Draw: FnOnce(&TuiProjectionState) -> Result<()>,
+    NextAction: FnOnce(&TuiProjectionState) -> Result<ProjectionAction>,
+{
+    controller.poll_active_prompt().await?;
+    let snapshot = controller.snapshot().await;
+    draw(&snapshot)?;
+    apply_projection_action(controller, next_action(&snapshot)?).await
+}
+
+async fn apply_projection_action(
+    controller: &mut ProjectionController,
+    action: ProjectionAction,
+) -> Result<bool> {
+    match action {
+        ProjectionAction::None => Ok(false),
+        ProjectionAction::Quit => Ok(true),
+        ProjectionAction::NewSession => {
+            controller.create_new_session().await?;
+            Ok(false)
+        }
+        ProjectionAction::UpdateDraft(draft_input) => {
+            controller.set_draft_input(draft_input).await;
+            Ok(false)
+        }
+        ProjectionAction::SubmitPrompt => {
+            controller.submit_prompt().await?;
+            Ok(false)
+        }
+        ProjectionAction::Select(option_id) => {
+            resolve_pending_permission_selection(controller.projection(), &option_id).await?;
+            Ok(false)
+        }
+        ProjectionAction::CancelPendingPermission => {
+            cancel_pending_permission(controller.projection()).await?;
+            Ok(false)
+        }
+        ProjectionAction::CancelActivePrompt => {
+            controller.cancel_prompt().await?;
+            Ok(false)
+        }
+    }
 }
 
 fn render_projection(frame: &mut Frame, projection: &TuiProjectionState) {
@@ -2164,7 +2209,7 @@ enum ProjectionAction {
 }
 
 fn next_projection_action(snapshot: &TuiProjectionState) -> Result<ProjectionAction> {
-    if !event::poll(Duration::from_millis(50))? {
+    if !event::poll(projection_poll_timeout(snapshot))? {
         return Ok(ProjectionAction::None);
     }
 
@@ -2199,6 +2244,14 @@ fn next_projection_action(snapshot: &TuiProjectionState) -> Result<ProjectionAct
         }
         _ => ProjectionAction::None,
     })
+}
+
+fn projection_poll_timeout(snapshot: &TuiProjectionState) -> Duration {
+    if snapshot.prompt_in_flight {
+        PROMPT_IN_FLIGHT_REDRAW_CADENCE
+    } else {
+        PROJECTION_IDLE_INPUT_POLL
+    }
 }
 
 fn permission_action_for_key(
@@ -2607,6 +2660,186 @@ fn content_block_label(content: acp::ContentBlock) -> String {
 }
 
 #[cfg(test)]
+pub(crate) async fn assert_projection_loop_redraws_stream_updates_without_waiting_for_full_input_poll()
+-> Result<()> {
+    let projection = Arc::new(Mutex::new(ProjectionSharedState::default()));
+    let mut controller =
+        ProjectionController::new(Arc::clone(&projection), None, PathBuf::default());
+
+    {
+        let mut state = projection.lock().await;
+        state
+            .projection
+            .mark_session_created(acp::SessionId::new("session-1"));
+        state.projection.mark_prompt_started();
+        state
+            .projection
+            .apply_session_notification(acp::SessionNotification::new(
+                "session-1",
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::Text(acp::TextContent::new("Mock assistant ")),
+                )),
+            ));
+        state
+            .projection
+            .apply_session_notification(acp::SessionNotification::new(
+                "session-1",
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::Text(acp::TextContent::new("response")),
+                )),
+            ));
+    }
+
+    let redraw_happened = AtomicBool::new(false);
+    let should_quit = run_projection_iteration(
+        &mut controller,
+        |snapshot| {
+            let agent_rows = snapshot
+                .transcript_rows
+                .iter()
+                .filter(|row| row.source == TranscriptSource::Agent)
+                .collect::<Vec<_>>();
+            assert_eq!(agent_rows.len(), 1);
+            assert_eq!(agent_rows[0].content, "Mock assistant response");
+            assert!(snapshot.prompt_in_flight);
+            redraw_happened.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+        |_snapshot| {
+            assert!(
+                redraw_happened.load(Ordering::SeqCst),
+                "expected redraw to happen before the loop handed control to the input poll"
+            );
+            Ok(ProjectionAction::Quit)
+        },
+    )
+    .await?;
+
+    assert!(should_quit);
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn assert_projection_state_flushes_terminal_stream_updates_immediately()
+-> Result<()> {
+    for outcome in [
+        PromptTerminalOutcome::Done,
+        PromptTerminalOutcome::Cancelled,
+        PromptTerminalOutcome::Failed,
+    ] {
+        assert_projection_state_flushes_terminal_stream_updates_immediately_for_outcome(outcome)
+            .await?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum PromptTerminalOutcome {
+    Done,
+    Cancelled,
+    Failed,
+}
+
+#[cfg(test)]
+async fn assert_projection_state_flushes_terminal_stream_updates_immediately_for_outcome(
+    outcome: PromptTerminalOutcome,
+) -> Result<()> {
+    let projection = Arc::new(Mutex::new(ProjectionSharedState::default()));
+    let mut controller =
+        ProjectionController::new(Arc::clone(&projection), None, PathBuf::default());
+
+    {
+        let mut state = projection.lock().await;
+        state
+            .projection
+            .mark_session_created(acp::SessionId::new("session-1"));
+        state.projection.mark_prompt_started();
+        state
+            .projection
+            .apply_session_notification(acp::SessionNotification::new(
+                "session-1",
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::Text(acp::TextContent::new("final streamed chunk")),
+                )),
+            ));
+    }
+
+    controller.active_prompt = Some(ActivePromptRequest {
+        session_id: acp::SessionId::new("session-1"),
+        task: tokio::spawn(async move {
+            match outcome {
+                PromptTerminalOutcome::Done => {
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                }
+                PromptTerminalOutcome::Cancelled => {
+                    Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
+                }
+                PromptTerminalOutcome::Failed => {
+                    Err(acp::Error::internal_error().data(serde_json::json!({
+                        "message": "mock ACP prompt failure"
+                    })))
+                }
+            }
+        }),
+    });
+    tokio::task::yield_now().await;
+
+    let redraw_happened = AtomicBool::new(false);
+    let should_quit = run_projection_iteration(
+        &mut controller,
+        |snapshot| {
+            assert!(
+                !snapshot.prompt_in_flight,
+                "expected {outcome:?} prompt completion to flush the terminal projection before waiting for more input"
+            );
+            assert_eq!(
+                snapshot.transcript_rows,
+                vec![TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: "final streamed chunk".to_string(),
+                }]
+            );
+            match outcome {
+                PromptTerminalOutcome::Done | PromptTerminalOutcome::Cancelled => {
+                    assert!(
+                        snapshot.prompt_error.is_none(),
+                        "expected {outcome:?} prompt completion to leave no prompt error"
+                    );
+                }
+                PromptTerminalOutcome::Failed => {
+                    assert!(
+                        snapshot
+                            .prompt_error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("mock ACP prompt failure")),
+                        "expected failed prompt completion to surface an immediate prompt error, got: {snapshot:?}"
+                    );
+                }
+            }
+            redraw_happened.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+        |_snapshot| {
+            assert!(
+                redraw_happened.load(Ordering::SeqCst),
+                "expected the final {outcome:?} terminal-state redraw to happen before the next input wait"
+            );
+            Ok(ProjectionAction::Quit)
+        },
+    )
+    .await?;
+
+    assert!(should_quit);
+    assert!(
+        controller.active_prompt.is_none(),
+        "expected polling the {outcome:?} prompt terminal outcome to clear the active prompt handle"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2874,6 +3107,20 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn projection_loop_redraws_stream_updates_without_waiting_for_full_input_poll() {
+        assert_projection_loop_redraws_stream_updates_without_waiting_for_full_input_poll()
+            .await
+            .expect("projection iteration to accept the redraw-order regression assertion");
+    }
+
+    #[tokio::test]
+    async fn projection_state_flushes_terminal_stream_updates_immediately() {
+        assert_projection_state_flushes_terminal_stream_updates_immediately()
+            .await
+            .expect("projection iteration to flush the terminal-state snapshot");
     }
 
     #[test]

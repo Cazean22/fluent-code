@@ -428,12 +428,26 @@ async fn contract_live_same_connection_cancel_resolves_prompt_over_stdio_loop() 
         .iter()
         .filter_map(|frame| frame.get("id").and_then(Value::as_u64))
         .collect::<Vec<_>>();
+    let session_update_indices = responses
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| {
+            (frame.get("method").and_then(Value::as_str) == Some(SESSION_UPDATE_METHOD))
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
     let cancel_response_index = responses.iter().position(|frame| frame["id"] == 4).unwrap();
     let prompt_response_index = responses.iter().position(|frame| frame["id"] == 3).unwrap();
 
     assert_eq!(frames_processed, 4);
     assert_eq!(response_ids, vec![1, 2, 4, 3]);
     assert!(responses.iter().all(|frame| frame.get("error").is_none()));
+    assert!(
+        session_update_indices
+            .iter()
+            .all(|index| *index < prompt_response_index),
+        "expected streamed session/update notifications to flush before the prompt response"
+    );
     assert_eq!(
         responses[cancel_response_index]["result"]["stopReason"],
         "cancelled"
@@ -443,6 +457,12 @@ async fn contract_live_same_connection_cancel_resolves_prompt_over_stdio_loop() 
         "cancelled"
     );
     assert!(cancel_response_index < prompt_response_index);
+    assert!(
+        session_update_indices
+            .iter()
+            .any(|index| *index < cancel_response_index),
+        "expected the prompt request to remain in-flight with streamed updates before cancel resolves"
+    );
     assert!(
         output
             .split(|byte| *byte == b'\n')

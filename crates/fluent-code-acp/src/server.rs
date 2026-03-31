@@ -2352,28 +2352,52 @@ impl AcpServer {
         let mut emission_state = PromptTurnEmissionState::default();
         let mut outbound_frames = Vec::new();
 
-        loop {
-            let projection = self
-                .mapper
-                .project_prompt_turn(host.state(), run_id)
-                .ok_or_else(|| {
-                    RpcResponseError::internal(format!(
-                        "session `{session_id}` lost prompt turn projection for run `{run_id}`"
-                    ))
-                })?;
-            outbound_frames.extend(emission_state.project_frames(session_id, &projection)?);
+        let emit_prompt_turn_projection =
+            |host: &ManagedAppHost,
+             emission_state: &mut PromptTurnEmissionState,
+             outbound_frames: &mut Vec<Value>|
+             -> std::result::Result<Option<SessionPromptResponse>, RpcResponseError> {
+                let projection = self
+                    .mapper
+                    .project_prompt_turn(host.state(), run_id)
+                    .ok_or_else(|| {
+                        RpcResponseError::internal(format!(
+                            "session `{session_id}` lost prompt turn projection for run `{run_id}`"
+                        ))
+                    })?;
+                outbound_frames.extend(emission_state.project_frames(session_id, &projection)?);
 
-            if let Some(stop_reason) = prompt_turn_response(host.state(), run_id, &projection)? {
+                prompt_turn_response(host.state(), run_id, &projection)
+            };
+
+        loop {
+            let emitted_frame_count_before_pass = outbound_frames.len();
+
+            if let Some(stop_reason) =
+                emit_prompt_turn_projection(host, &mut emission_state, &mut outbound_frames)?
+            {
                 return Ok(PromptTurnResult {
                     frames: outbound_frames,
                     stop_reason,
                 });
             }
 
-            tokio::time::sleep(PROMPT_POLL_INTERVAL).await;
             host.drain_runtime_messages()
                 .await
                 .map_err(|error| RpcResponseError::internal(error.to_string()))?;
+
+            if let Some(stop_reason) =
+                emit_prompt_turn_projection(host, &mut emission_state, &mut outbound_frames)?
+            {
+                return Ok(PromptTurnResult {
+                    frames: outbound_frames,
+                    stop_reason,
+                });
+            }
+
+            if outbound_frames.len() == emitted_frame_count_before_pass {
+                tokio::time::sleep(PROMPT_POLL_INTERVAL).await;
+            }
         }
     }
 }
@@ -3054,7 +3078,7 @@ mod tests {
         ToolSource, Turn,
     };
     use fluent_code_app::session::store::{FsSessionStore, SessionStore};
-    use fluent_code_provider::{MockProvider, ProviderClient};
+    use fluent_code_provider::{MockProvider, ProviderClient, ProviderToolCall};
     use serde_json::Value;
     use tokio::io::duplex;
     use tokio::sync::{Mutex, mpsc};
@@ -3717,6 +3741,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_live_prompt_turn_streams_foreground_delegated_child_updates_before_completion() {
+        let _guard = test_lock().lock().await;
+        let temp_dir = unique_temp_dir("fluent-code-acp-live-delegated-child");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let server = AcpServer::build(test_config(temp_dir.clone())).unwrap();
+        let mut managed_session = managed_session_for(
+            server.build_host_for_session(active_delegated_child_session()),
+            &server,
+        );
+        let session_id = managed_session.host.state().session.id.to_string();
+        let child_run_id = managed_session
+            .host
+            .state()
+            .session
+            .foreground_owner
+            .as_ref()
+            .expect("delegated child owns the foreground")
+            .run_id;
+
+        managed_session
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantReasoningChunk {
+                run_id: child_run_id,
+                delta: "child reasoning".to_string(),
+            })
+            .unwrap();
+        managed_session
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantChunk {
+                run_id: child_run_id,
+                delta: "child answer".to_string(),
+            })
+            .unwrap();
+        managed_session
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantToolCall {
+                run_id: child_run_id,
+                tool_call: ProviderToolCall {
+                    id: "read-call-2".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"path":"/tmp/child.txt"}),
+                },
+            })
+            .unwrap();
+
+        let poll_result = server
+            .poll_live_prompt_turn(&session_id, &mut managed_session)
+            .await
+            .unwrap();
+        let session_updates = session_update_frames(&poll_result.frames);
+        let tool_call_frame_index = poll_result
+            .frames
+            .iter()
+            .position(|frame| session_update_kind(frame) == Some("tool_call"))
+            .expect("delegated child tool call frame");
+        let permission_request_frame_index = poll_result
+            .frames
+            .iter()
+            .position(|frame| frame["method"] == "session/request_permission")
+            .expect("delegated child permission request frame");
+
+        assert!(!poll_result.prompt_turn_complete);
+        assert_eq!(session_updates.len(), 3);
+        assert_eq!(
+            session_update_kind(session_updates[0]),
+            Some("agent_thought_chunk")
+        );
+        assert_eq!(
+            session_updates[0]["params"]["update"]["content"]["text"],
+            "child reasoning"
+        );
+        assert_eq!(
+            session_update_kind(session_updates[1]),
+            Some("agent_message_chunk")
+        );
+        assert_eq!(
+            session_updates[1]["params"]["update"]["content"]["text"],
+            "child answer"
+        );
+        assert_eq!(session_update_kind(session_updates[2]), Some("tool_call"));
+        assert_eq!(
+            session_updates[2]["params"]["update"]["toolCallId"],
+            "read-call-2"
+        );
+        assert!(tool_call_frame_index < permission_request_frame_index);
+
+        cleanup(temp_dir);
+    }
+
+    #[tokio::test]
     async fn session_load_surfaces_interrupted_running_tool_state_explicitly() {
         let temp_dir = unique_temp_dir("fluent-code-acp-load-interrupted-running-tool");
         fs::create_dir_all(&temp_dir).unwrap();
@@ -4118,6 +4235,110 @@ mod tests {
         assert_eq!(
             root_runs[0].terminal_stop_reason,
             Some(RunTerminalStopReason::Completed)
+        );
+
+        cleanup(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn session_prompt_flushes_pending_agent_delta_before_terminal_stop_reason() {
+        let _guard = test_lock().lock().await;
+        let temp_dir = unique_temp_dir("fluent-code-acp-session-prompt-terminal-flush");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let store = FsSessionStore::new(temp_dir.clone());
+        let session = Session::new("terminal flush prompt session");
+        store.create(&session).unwrap();
+
+        let server = test_server_with_chunk_delay(temp_dir.clone(), Duration::from_millis(4));
+        let prompt_text = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen";
+        let expected_response = format!("Mock assistant response: {prompt_text}");
+        let request = format!(
+            concat!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/load\",\"params\":{{\"sessionId\":\"{}\",\"cwd\":\"/tmp\",\"mcpServers\":[]}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/prompt\",\"params\":{{\"sessionId\":\"{}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n"
+            ),
+            session.id, session.id, prompt_text,
+        );
+        let mut reader = Cursor::new(request.into_bytes());
+        let mut output = Vec::new();
+
+        server.serve_frames(&mut reader, &mut output).await.unwrap();
+
+        let responses = output_frames(output);
+        let prompt_response_index = responses
+            .iter()
+            .position(|frame| frame["id"] == 3)
+            .expect("session/prompt response frame");
+        let session_updates = session_update_frames(&responses);
+        let agent_chunks = collect_agent_message_chunk_texts(&session_updates);
+        let emitted_prefix_length = agent_chunks[..agent_chunks.len() - 1]
+            .iter()
+            .map(String::len)
+            .sum::<usize>();
+
+        assert_eq!(
+            responses[prompt_response_index]["result"]["stopReason"],
+            "end_turn"
+        );
+        assert!(agent_chunks.len() >= 2);
+        assert_eq!(
+            collect_agent_message_chunks(&session_updates),
+            expected_response
+        );
+        assert_eq!(
+            session_update_kind(&responses[prompt_response_index - 1]),
+            Some("agent_message_chunk")
+        );
+        assert!(emitted_prefix_length > 0);
+        assert!(emitted_prefix_length < expected_response.len());
+        assert_eq!(
+            agent_chunks.last().unwrap(),
+            &expected_response[emitted_prefix_length..]
+        );
+
+        cleanup(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn session_prompt_preserves_many_chunk_continuity_without_duplicate_text() {
+        let _guard = test_lock().lock().await;
+        let temp_dir = unique_temp_dir("fluent-code-acp-session-prompt-chunk-continuity");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let store = FsSessionStore::new(temp_dir.clone());
+        let session = Session::new("chunk continuity prompt session");
+        store.create(&session).unwrap();
+
+        let server = test_server_with_chunk_delay(temp_dir.clone(), Duration::from_millis(15));
+        let prompt_text = "alpha  beta   gamma    delta     epsilon      zeta";
+        let expected_response = format!("Mock assistant response: {prompt_text}");
+        let expected_chunks = split_text_like_mock_provider(&expected_response);
+        let request = format!(
+            concat!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/load\",\"params\":{{\"sessionId\":\"{}\",\"cwd\":\"/tmp\",\"mcpServers\":[]}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/prompt\",\"params\":{{\"sessionId\":\"{}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n"
+            ),
+            session.id, session.id, prompt_text,
+        );
+        let mut reader = Cursor::new(request.into_bytes());
+        let mut output = Vec::new();
+
+        server.serve_frames(&mut reader, &mut output).await.unwrap();
+
+        let responses = output_frames(output);
+        let session_updates = session_update_frames(&responses);
+        let agent_chunks = collect_agent_message_chunk_texts(&session_updates);
+
+        assert_eq!(
+            responses.last().unwrap()["result"]["stopReason"],
+            "end_turn"
+        );
+        assert_eq!(agent_chunks, expected_chunks);
+        assert_eq!(agent_chunks.concat(), expected_response);
+        assert_eq!(
+            collect_agent_message_chunks(&session_updates),
+            expected_response
         );
 
         cleanup(temp_dir);
@@ -4848,6 +5069,26 @@ mod tests {
             .filter_map(|frame| frame["params"]["update"]["content"]["text"].as_str())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    fn collect_agent_message_chunk_texts(frames: &[&Value]) -> Vec<String> {
+        frames
+            .iter()
+            .filter(|frame| session_update_kind(frame) == Some("agent_message_chunk"))
+            .filter_map(|frame| frame["params"]["update"]["content"]["text"].as_str())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn split_text_like_mock_provider(text: &str) -> Vec<String> {
+        let mut chunks = text
+            .split_inclusive(' ')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if chunks.is_empty() {
+            chunks.push(text.to_string());
+        }
+        chunks
     }
 
     #[derive(Clone, Default)]
