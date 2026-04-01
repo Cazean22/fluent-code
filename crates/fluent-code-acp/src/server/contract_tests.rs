@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -20,11 +20,11 @@ use fluent_code_app::session::model::{
 use fluent_code_app::session::store::{FsSessionStore, SessionStore};
 use fluent_code_provider::{MockProvider, ProviderClient};
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::{AcpServer, AcpServerDependencies, ReaderEvent};
-use crate::dev_harness::{ScriptedJsonlCapture, ScriptedJsonlHarness};
+use super::{AcpServer, AcpServerDependencies};
+use crate::dev_harness::{LiveJsonlSession, ScriptedJsonlCapture, ScriptedJsonlHarness};
 
 const SESSION_UPDATE_METHOD: &str = "session/update";
 const SESSION_REQUEST_PERMISSION_METHOD: &str = "session/request_permission";
@@ -147,12 +147,12 @@ async fn contract_session_load_replays_history_and_config_over_jsonl_harness() {
     );
 
     let capture = harness.run_script(&server, &script).await.unwrap();
-    let load_response_index = frame_index_for_response(&capture, 2).unwrap();
-    let session_update_indices = frame_indices_for_method(&capture, SESSION_UPDATE_METHOD);
+    let load_response_index = capture.frame_index_for_response(2).unwrap();
+    let session_update_indices = capture.frame_indices_for_method(SESSION_UPDATE_METHOD);
 
     assert_eq!(capture.frames_processed, 2);
     assert_eq!(
-        session_update_kinds(&capture),
+        capture.session_update_kinds(),
         vec![
             "user_message_chunk",
             "agent_message_chunk",
@@ -215,11 +215,16 @@ async fn contract_session_prompt_streams_tool_lifecycle_over_jsonl_harness() {
 
     let capture = harness.run_script(&server, &script).await.unwrap();
     let session_updates = capture.notification_frames(SESSION_UPDATE_METHOD);
-    let update_kinds = session_update_kinds(&capture);
+    let update_kinds = capture.session_update_kinds();
     let first_tool_update_index = update_kinds
         .iter()
         .position(|kind| *kind == "tool_call_update")
         .unwrap();
+    let resumed_agent_chunks = session_updates[first_tool_update_index + 2..]
+        .iter()
+        .filter(|frame| frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|frame| frame["params"]["update"]["content"]["text"].as_str())
+        .collect::<Vec<_>>();
 
     assert_eq!(
         capture.response_frame(3).unwrap()["result"]["stopReason"],
@@ -239,10 +244,58 @@ async fn contract_session_prompt_streams_tool_lifecycle_over_jsonl_harness() {
         session_updates[first_tool_update_index + 1]["params"]["update"]["rawOutput"]["result"],
         "HELLO WORLD"
     );
+    assert!(!resumed_agent_chunks.is_empty());
+    assert_eq!(
+        resumed_agent_chunks.concat(),
+        "Mock assistant response after tool: HELLO WORLD"
+    );
     assert!(
-        collect_agent_message_chunks(&session_updates)
+        capture
+            .collect_agent_message_chunks()
             .contains("Mock assistant response after tool: HELLO WORLD")
     );
+
+    cleanup(temp_dir);
+}
+
+#[tokio::test]
+async fn contract_session_load_preserves_permission_request_order_for_pending_tool_batch_over_jsonl_harness()
+ {
+    let temp_dir = unique_temp_dir("fluent-code-acp-contract-permission-order");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let store = FsSessionStore::new(temp_dir.clone());
+    let session = pending_permission_batch_session(&store);
+    let server = AcpServer::build(test_config(temp_dir.clone())).unwrap();
+    let harness = ScriptedJsonlHarness::new();
+    let script = format!(
+        concat!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1}}}}\n",
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/load\",\"params\":{{\"sessionId\":\"{}\",\"cwd\":\"{}\",\"mcpServers\":[]}}}}\n"
+        ),
+        session.id,
+        temp_dir.display(),
+    );
+
+    let capture = harness.run_script(&server, &script).await.unwrap();
+    let tool_call_indices = capture.frame_indices_for_session_update_kind("tool_call");
+    let permission_request_indices =
+        capture.frame_indices_for_method(SESSION_REQUEST_PERMISSION_METHOD);
+    let load_response_index = capture.frame_index_for_response(2).unwrap();
+
+    assert_eq!(tool_call_indices.len(), 2);
+    assert_eq!(permission_request_indices.len(), 1);
+    assert_eq!(
+        capture.notification_frames(SESSION_REQUEST_PERMISSION_METHOD)[0]["params"]["toolCall"]["toolCallId"],
+        "glob-call-2"
+    );
+    assert!(
+        tool_call_indices
+            .iter()
+            .all(|index| *index < permission_request_indices[0]),
+        "expected all replayed tool_call updates before the pending permission request"
+    );
+    assert!(permission_request_indices[0] < load_response_index);
+    assert_stdout_contains_only_jsonrpc_frames(&capture);
 
     cleanup(temp_dir);
 }
@@ -269,9 +322,9 @@ async fn contract_permission_round_trip_cancel_and_reload_over_jsonl_harness() {
 
     let cancel_capture = harness.run_script(&server, &cancel_script).await.unwrap();
     let permission_requests = cancel_capture.notification_frames(SESSION_REQUEST_PERMISSION_METHOD);
-    let load_response_index = frame_index_for_response(&cancel_capture, 2).unwrap();
+    let load_response_index = cancel_capture.frame_index_for_response(2).unwrap();
     let permission_request_indices =
-        frame_indices_for_method(&cancel_capture, SESSION_REQUEST_PERMISSION_METHOD);
+        cancel_capture.frame_indices_for_method(SESSION_REQUEST_PERMISSION_METHOD);
     let permission_option_ids = permission_requests[0]["params"]["options"]
         .as_array()
         .unwrap()
@@ -380,95 +433,172 @@ async fn contract_live_same_connection_cancel_resolves_prompt_over_stdio_loop() 
     store.create(&session).unwrap();
 
     let server = test_server_with_chunk_delay(temp_dir.clone(), Duration::from_millis(50));
-    let (frame_sender, mut frame_receiver) = mpsc::unbounded_channel();
-    let live_cwd = temp_dir.clone();
-    let sender = tokio::spawn(async move {
-        frame_sender
-            .send(ReaderEvent::Frame(
-                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}"#
-                    .to_string(),
-            ))
-            .unwrap();
-        frame_sender
-            .send(ReaderEvent::Frame(format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/load\",\"params\":{{\"sessionId\":\"{}\",\"cwd\":\"{}\",\"mcpServers\":[]}}}}",
-                session_id,
-                live_cwd.display(),
-            )))
-            .unwrap();
-        frame_sender
-            .send(ReaderEvent::Frame(format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/prompt\",\"params\":{{\"sessionId\":\"{}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"interrupt this prompt\"}}]}}}}",
-                session_id,
-            )))
-            .unwrap();
+    let harness = ScriptedJsonlHarness::new();
+    let live = harness.start_live_session(&server);
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    live.send_frame(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}"#,
+    )
+    .unwrap();
+    live.send_frame(format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/load\",\"params\":{{\"sessionId\":\"{}\",\"cwd\":\"{}\",\"mcpServers\":[]}}}}",
+        session_id,
+        temp_dir.display(),
+    ))
+    .unwrap();
+    live.send_frame(format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/prompt\",\"params\":{{\"sessionId\":\"{}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"interrupt this prompt\"}}]}}}}",
+        session_id,
+    ))
+    .unwrap();
 
-        frame_sender
-            .send(ReaderEvent::Frame(format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"session/cancel\",\"params\":{{\"sessionId\":\"{}\"}}}}",
-                session_id,
-            )))
-            .unwrap();
+    let first_agent_chunk_capture = wait_for_first_agent_chunk(&live).await;
+    assert!(first_agent_chunk_capture.response_frame(3).is_none());
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        frame_sender.send(ReaderEvent::Eof).unwrap();
-    });
+    live.send_frame(format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"session/cancel\",\"params\":{{\"sessionId\":\"{}\"}}}}",
+        session_id,
+    ))
+    .unwrap();
 
-    let mut output = Vec::new();
-    let frames_processed = server
-        .serve_live_frames(&mut frame_receiver, &mut output)
-        .await
-        .unwrap();
-    sender.await.unwrap();
+    live.wait_until("cancel and prompt responses", |capture| {
+        capture.response_frame(4).is_some() && capture.response_frame(3).is_some()
+    })
+    .await
+    .unwrap();
+    let capture = live.finish().await.unwrap();
+    let cancel_response_index = capture.frame_index_for_response(4).unwrap();
+    let prompt_response_index = capture.frame_index_for_response(3).unwrap();
+    let agent_chunk_indices = capture.frame_indices_for_session_update_kind("agent_message_chunk");
+    let session_update_indices = capture.frame_indices_for_method(SESSION_UPDATE_METHOD);
 
-    let responses = stdout_frames(&output);
-    let response_ids = responses
-        .iter()
-        .filter_map(|frame| frame.get("id").and_then(Value::as_u64))
-        .collect::<Vec<_>>();
-    let session_update_indices = responses
-        .iter()
-        .enumerate()
-        .filter_map(|(index, frame)| {
-            (frame.get("method").and_then(Value::as_str) == Some(SESSION_UPDATE_METHOD))
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let cancel_response_index = responses.iter().position(|frame| frame["id"] == 4).unwrap();
-    let prompt_response_index = responses.iter().position(|frame| frame["id"] == 3).unwrap();
-
-    assert_eq!(frames_processed, 4);
-    assert_eq!(response_ids, vec![1, 2, 4, 3]);
-    assert!(responses.iter().all(|frame| frame.get("error").is_none()));
+    assert_eq!(capture.frames_processed, 4);
+    assert_eq!(capture.response_ids(), vec![1, 2, 4, 3]);
+    assert!(
+        capture
+            .stdout_frames()
+            .iter()
+            .all(|frame| frame.get("error").is_none())
+    );
+    assert!(!agent_chunk_indices.is_empty());
+    assert!(agent_chunk_indices[0] < cancel_response_index);
+    assert!(agent_chunk_indices[0] < prompt_response_index);
     assert!(
         session_update_indices
             .iter()
-            .all(|index| *index < prompt_response_index),
-        "expected streamed session/update notifications to flush before the prompt response"
+            .all(|index| *index < cancel_response_index),
+        "expected cancel during idle polling to suppress stale post-cancel session/update frames"
     );
     assert_eq!(
-        responses[cancel_response_index]["result"]["stopReason"],
+        capture.response_frame(4).unwrap()["result"]["stopReason"],
         "cancelled"
     );
     assert_eq!(
-        responses[prompt_response_index]["result"]["stopReason"],
+        capture.response_frame(3).unwrap()["result"]["stopReason"],
         "cancelled"
     );
     assert!(cancel_response_index < prompt_response_index);
-    assert!(
-        session_update_indices
-            .iter()
-            .any(|index| *index < cancel_response_index),
-        "expected the prompt request to remain in-flight with streamed updates before cancel resolves"
+    assert_stdout_contains_only_jsonrpc_frames(&capture);
+
+    cleanup(temp_dir);
+}
+
+#[tokio::test]
+async fn contract_session_prompt_flushes_first_delta_before_terminal_over_jsonl_harness() {
+    let _guard = contract_test_lock().lock().await;
+    let temp_dir = unique_temp_dir("fluent-code-acp-contract-prompt-first-delta");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let store = FsSessionStore::new(temp_dir.clone());
+    let session = Session::new("contract first delta prompt session");
+    store.create(&session).unwrap();
+
+    let server = test_server_with_chunk_delay(temp_dir.clone(), Duration::from_millis(4));
+    let prompt_text = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen";
+    let expected_response = format!("Mock assistant response: {prompt_text}");
+    let harness = ScriptedJsonlHarness::new();
+    let script = format!(
+        concat!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1}}}}\n",
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/load\",\"params\":{{\"sessionId\":\"{}\",\"cwd\":\"{}\",\"mcpServers\":[]}}}}\n",
+            "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/prompt\",\"params\":{{\"sessionId\":\"{}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n"
+        ),
+        session.id,
+        temp_dir.display(),
+        session.id,
+        prompt_text,
     );
-    assert!(
-        output
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .all(|line| serde_json::from_slice::<Value>(line).is_ok())
+
+    let capture = harness.run_script(&server, &script).await.unwrap();
+    let prompt_response_index = capture.frame_index_for_response(3).unwrap();
+    let agent_chunk_indices = capture.frame_indices_for_session_update_kind("agent_message_chunk");
+    let agent_chunks = capture.collect_agent_message_chunk_texts();
+    let emitted_prefix_length = agent_chunks[..agent_chunks.len() - 1]
+        .iter()
+        .map(String::len)
+        .sum::<usize>();
+
+    assert_eq!(
+        capture.response_frame(3).unwrap()["result"]["stopReason"],
+        "end_turn"
     );
+    assert!(agent_chunks.len() >= 2);
+    assert_eq!(capture.collect_agent_message_chunks(), expected_response);
+    assert!(agent_chunk_indices[0] < prompt_response_index);
+    assert_eq!(
+        capture.stdout_frames()[prompt_response_index - 1]["params"]["update"]["sessionUpdate"],
+        "agent_message_chunk"
+    );
+    assert!(emitted_prefix_length > 0);
+    assert!(emitted_prefix_length < expected_response.len());
+    assert_eq!(
+        agent_chunks.last().unwrap(),
+        &expected_response[emitted_prefix_length..]
+    );
+    assert_stdout_contains_only_jsonrpc_frames(&capture);
+
+    cleanup(temp_dir);
+}
+
+#[tokio::test]
+async fn contract_session_prompt_preserves_chunk_continuity_without_duplicate_text_over_jsonl_harness()
+ {
+    let _guard = contract_test_lock().lock().await;
+    let temp_dir = unique_temp_dir("fluent-code-acp-contract-prompt-chunk-continuity");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let store = FsSessionStore::new(temp_dir.clone());
+    let session = Session::new("contract chunk continuity prompt session");
+    store.create(&session).unwrap();
+
+    let server = test_server_with_chunk_delay(temp_dir.clone(), Duration::from_millis(15));
+    let prompt_text = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+    let expected_response = format!("Mock assistant response: {prompt_text}");
+    let expected_chunks = split_text_like_mock_provider(&expected_response);
+    let harness = ScriptedJsonlHarness::new();
+    let script = format!(
+        concat!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1}}}}\n",
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/load\",\"params\":{{\"sessionId\":\"{}\",\"cwd\":\"{}\",\"mcpServers\":[]}}}}\n",
+            "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/prompt\",\"params\":{{\"sessionId\":\"{}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n"
+        ),
+        session.id,
+        temp_dir.display(),
+        session.id,
+        prompt_text,
+    );
+
+    let capture = harness.run_script(&server, &script).await.unwrap();
+    let agent_chunks = capture.collect_agent_message_chunk_texts();
+    let unique_agent_chunks = agent_chunks.iter().cloned().collect::<HashSet<_>>();
+
+    assert_eq!(
+        capture.response_frame(3).unwrap()["result"]["stopReason"],
+        "end_turn"
+    );
+    assert_eq!(agent_chunks, expected_chunks);
+    assert_eq!(agent_chunks.concat(), expected_response);
+    assert_eq!(capture.collect_agent_message_chunks(), expected_response);
+    assert_eq!(unique_agent_chunks.len(), agent_chunks.len());
+    assert_stdout_contains_only_jsonrpc_frames(&capture);
 
     cleanup(temp_dir);
 }
@@ -503,41 +633,6 @@ fn config_option_current_value<'a>(response_frame: &'a Value, option_id: &str) -
         .and_then(|option| option["currentValue"].as_str())
 }
 
-fn session_update_kinds(capture: &ScriptedJsonlCapture) -> Vec<&str> {
-    capture
-        .notification_frames(SESSION_UPDATE_METHOD)
-        .into_iter()
-        .filter_map(|frame| frame["params"]["update"]["sessionUpdate"].as_str())
-        .collect()
-}
-
-fn collect_agent_message_chunks(frames: &[&Value]) -> String {
-    frames
-        .iter()
-        .filter(|frame| frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
-        .filter_map(|frame| frame["params"]["update"]["content"]["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn frame_index_for_response(capture: &ScriptedJsonlCapture, id: u64) -> Option<usize> {
-    capture
-        .stdout_frames()
-        .iter()
-        .position(|frame| frame.get("id").and_then(Value::as_u64) == Some(id))
-}
-
-fn frame_indices_for_method(capture: &ScriptedJsonlCapture, method: &str) -> Vec<usize> {
-    capture
-        .stdout_frames()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, frame)| {
-            (frame.get("method").and_then(Value::as_str) == Some(method)).then_some(index)
-        })
-        .collect()
-}
-
 fn assert_stdout_contains_only_jsonrpc_frames(capture: &ScriptedJsonlCapture) {
     let stdout_lines = capture
         .stdout_text()
@@ -561,13 +656,23 @@ fn assert_stdout_contains_only_jsonrpc_frames(capture: &ScriptedJsonlCapture) {
     }));
 }
 
-fn stdout_frames(stdout: &[u8]) -> Vec<Value> {
-    String::from_utf8(stdout.to_vec())
-        .unwrap()
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
+async fn wait_for_first_agent_chunk(live: &LiveJsonlSession) -> ScriptedJsonlCapture {
+    live.wait_until("the first agent message chunk", |capture| {
+        !capture.collect_agent_message_chunk_texts().is_empty()
+    })
+    .await
+    .unwrap()
+}
+
+fn split_text_like_mock_provider(text: &str) -> Vec<String> {
+    let mut chunks = text
+        .split_inclusive(' ')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if chunks.is_empty() {
+        chunks.push(text.to_string());
+    }
+    chunks
 }
 
 fn test_config(data_dir: PathBuf) -> Config {

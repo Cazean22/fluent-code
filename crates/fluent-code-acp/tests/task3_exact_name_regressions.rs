@@ -10,6 +10,13 @@ fn session_prompt_flushes_pending_agent_delta_before_terminal_stop_reason() {
 }
 
 #[test]
+fn task3_exact_name_regressions_cover_burst_continuity_and_cancel_paths() {
+    session_prompt_flushes_pending_agent_delta_before_terminal_stop_reason();
+    session_prompt_preserves_many_chunk_continuity_without_duplicate_text();
+    contract_live_same_connection_cancel_resolves_prompt_over_stdio_loop();
+}
+
+#[test]
 fn session_prompt_preserves_many_chunk_continuity_without_duplicate_text() {
     run_exact_acp_libtest(
         "server::tests::session_prompt_preserves_many_chunk_continuity_without_duplicate_text",
