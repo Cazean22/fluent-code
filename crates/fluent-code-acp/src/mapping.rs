@@ -107,12 +107,15 @@ impl SessionUpdateMapper {
     ) -> Option<PromptTurnProjection> {
         let session = &state.session;
         let run = session.find_run(run_id)?;
+        if session.root_run_id(run_id) != Some(run_id) {
+            return None;
+        }
         let mut events = Vec::new();
 
         for turn in session
             .turns
             .iter()
-            .filter(|turn| run_belongs_to_prompt_turn(session, run_id, turn.run_id))
+            .filter(|turn| session.root_run_id(turn.run_id) == Some(run_id))
             .filter(|turn| is_valid_sequence(session, turn.sequence_number))
         {
             match turn.role {
@@ -161,7 +164,7 @@ impl SessionUpdateMapper {
         for invocation in session
             .tool_invocations
             .iter()
-            .filter(|invocation| run_belongs_to_prompt_turn(session, run_id, invocation.run_id))
+            .filter(|invocation| session.root_run_id(invocation.run_id) == Some(run_id))
             .filter(|invocation| is_valid_sequence(session, invocation.sequence_number))
         {
             events.push(OrderedPromptTurnEvent::new(
@@ -357,27 +360,6 @@ pub enum TerminalStopProjection {
 
 fn is_valid_sequence(session: &Session, sequence: ReplaySequence) -> bool {
     sequence > 0 && sequence < session.next_replay_sequence
-}
-
-fn run_belongs_to_prompt_turn(
-    session: &Session,
-    root_run_id: RunId,
-    mut candidate_run_id: RunId,
-) -> bool {
-    loop {
-        let Some(run) = session.find_run(candidate_run_id) else {
-            return false;
-        };
-
-        if run.id == root_run_id {
-            return true;
-        }
-
-        let Some(parent_run_id) = run.parent_run_id else {
-            return false;
-        };
-        candidate_run_id = parent_run_id;
-    }
 }
 
 fn final_tool_status(invocation: &ToolInvocationRecord) -> ToolCallStatus {
@@ -1091,6 +1073,7 @@ mod tests {
             user_turn(second_run_id, 8, "second"),
         ];
         session.next_replay_sequence = 11;
+        session.rebuild_run_indexes();
 
         let projections = mapper.project_prompt_turns(&AppState::new(session));
 
@@ -1104,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn delegated_child_events_are_projected_into_the_root_prompt_turn() {
+    fn project_prompt_turn_preserves_root_grouping_with_cached_root_lookup() {
         let mapper = SessionUpdateMapper::new();
         let root_run_id = Uuid::new_v4();
         let child_run_id = Uuid::new_v4();
@@ -1177,10 +1160,11 @@ mod tests {
 
         session.tool_invocations = vec![root_task_invocation, child_tool_invocation];
         session.next_replay_sequence = 10;
+        session.rebuild_run_indexes();
 
-        let projection = mapper
-            .project_prompt_turn(&AppState::new(session), root_run_id)
-            .unwrap();
+        let state = AppState::new(session);
+        let projection = mapper.project_prompt_turn(&state, root_run_id).unwrap();
+        assert!(mapper.project_prompt_turn(&state, child_run_id).is_none());
 
         assert_eq!(
             projection
@@ -1217,6 +1201,190 @@ mod tests {
         }
     }
 
+    #[test]
+    fn delegated_child_projection_ignores_broken_lineage_with_cached_lookup() {
+        let mapper = SessionUpdateMapper::new();
+        let root_run_id = Uuid::new_v4();
+        let valid_child_run_id = Uuid::new_v4();
+        let broken_child_run_id = Uuid::new_v4();
+        let cycle_a_run_id = Uuid::new_v4();
+        let cycle_b_run_id = Uuid::new_v4();
+        let missing_parent_run_id = Uuid::new_v4();
+        let root_task_invocation_id = Uuid::new_v4();
+        let valid_child_tool_invocation_id = Uuid::new_v4();
+        let broken_child_tool_invocation_id = Uuid::new_v4();
+        let cycle_tool_invocation_id = Uuid::new_v4();
+        let now = Utc::now();
+        let mut session = Session::new("broken delegated projection");
+        session.runs = vec![
+            RunRecord {
+                id: root_run_id,
+                status: RunStatus::InProgress,
+                parent_run_id: None,
+                parent_tool_invocation_id: None,
+                created_sequence: 2,
+                terminal_sequence: None,
+                terminal_stop_reason: None,
+                created_at: now,
+                updated_at: now,
+            },
+            RunRecord {
+                id: valid_child_run_id,
+                status: RunStatus::InProgress,
+                parent_run_id: Some(root_run_id),
+                parent_tool_invocation_id: Some(root_task_invocation_id),
+                created_sequence: 6,
+                terminal_sequence: None,
+                terminal_stop_reason: None,
+                created_at: now,
+                updated_at: now,
+            },
+            RunRecord {
+                id: broken_child_run_id,
+                status: RunStatus::InProgress,
+                parent_run_id: Some(missing_parent_run_id),
+                parent_tool_invocation_id: Some(root_task_invocation_id),
+                created_sequence: 7,
+                terminal_sequence: None,
+                terminal_stop_reason: None,
+                created_at: now,
+                updated_at: now,
+            },
+            RunRecord {
+                id: cycle_a_run_id,
+                status: RunStatus::InProgress,
+                parent_run_id: Some(cycle_b_run_id),
+                parent_tool_invocation_id: Some(root_task_invocation_id),
+                created_sequence: 8,
+                terminal_sequence: None,
+                terminal_stop_reason: None,
+                created_at: now,
+                updated_at: now,
+            },
+            RunRecord {
+                id: cycle_b_run_id,
+                status: RunStatus::InProgress,
+                parent_run_id: Some(cycle_a_run_id),
+                parent_tool_invocation_id: Some(root_task_invocation_id),
+                created_sequence: 9,
+                terminal_sequence: None,
+                terminal_stop_reason: None,
+                created_at: now,
+                updated_at: now,
+            },
+        ];
+        session.turns = vec![
+            user_turn(root_run_id, 1, "delegate work"),
+            assistant_turn(root_run_id, 3, "I will delegate that task.", "planning"),
+            user_turn(valid_child_run_id, 10, "Inspect cancellation flow"),
+            assistant_turn(valid_child_run_id, 11, "Child summary", "child reasoning"),
+            user_turn(broken_child_run_id, 12, "broken lineage should not replay"),
+            assistant_turn(
+                cycle_a_run_id,
+                13,
+                "cycle should not replay",
+                "cycle reasoning",
+            ),
+        ];
+
+        let mut root_task_invocation = tool_invocation(
+            root_task_invocation_id,
+            root_run_id,
+            ("task-call-1", "task"),
+            5,
+            ToolApprovalState::Approved,
+            ToolExecutionState::Running,
+            (None, None),
+        );
+        root_task_invocation.preceding_turn_id = Some(session.turns[1].id);
+
+        let mut valid_child_tool_invocation = tool_invocation(
+            valid_child_tool_invocation_id,
+            valid_child_run_id,
+            ("read-call-2", "read"),
+            14,
+            ToolApprovalState::Approved,
+            ToolExecutionState::Running,
+            (None, None),
+        );
+        valid_child_tool_invocation.preceding_turn_id = Some(session.turns[3].id);
+        valid_child_tool_invocation.arguments = json!({"path":"/tmp/child.txt"});
+
+        let mut broken_child_tool_invocation = tool_invocation(
+            broken_child_tool_invocation_id,
+            broken_child_run_id,
+            ("read-call-broken", "read"),
+            15,
+            ToolApprovalState::Approved,
+            ToolExecutionState::Running,
+            (None, None),
+        );
+        broken_child_tool_invocation.preceding_turn_id = Some(session.turns[4].id);
+        broken_child_tool_invocation.arguments = json!({"path":"/tmp/broken.txt"});
+
+        let mut cycle_tool_invocation = tool_invocation(
+            cycle_tool_invocation_id,
+            cycle_a_run_id,
+            ("read-call-cycle", "read"),
+            16,
+            ToolApprovalState::Approved,
+            ToolExecutionState::Running,
+            (None, None),
+        );
+        cycle_tool_invocation.preceding_turn_id = Some(session.turns[5].id);
+        cycle_tool_invocation.arguments = json!({"path":"/tmp/cycle.txt"});
+
+        session.tool_invocations = vec![
+            root_task_invocation,
+            valid_child_tool_invocation,
+            broken_child_tool_invocation,
+            cycle_tool_invocation,
+        ];
+        session.next_replay_sequence = 17;
+        session.rebuild_run_indexes();
+
+        let state = AppState::new(session);
+        let projection = mapper.project_prompt_turn(&state, root_run_id).unwrap();
+
+        assert_eq!(
+            projection
+                .events
+                .iter()
+                .map(event_signature)
+                .collect::<Vec<_>>(),
+            vec![
+                (1, ProjectionEventPhase::UserMessage, "session_update"),
+                (3, ProjectionEventPhase::AgentThought, "session_update"),
+                (3, ProjectionEventPhase::AgentMessage, "session_update"),
+                (5, ProjectionEventPhase::ToolCallCreate, "session_update"),
+                (5, ProjectionEventPhase::ToolCallPatch, "session_update"),
+                (10, ProjectionEventPhase::UserMessage, "session_update"),
+                (11, ProjectionEventPhase::AgentThought, "session_update"),
+                (11, ProjectionEventPhase::AgentMessage, "session_update"),
+                (14, ProjectionEventPhase::ToolCallCreate, "session_update"),
+                (14, ProjectionEventPhase::ToolCallPatch, "session_update"),
+            ]
+        );
+        assert!(
+            projection
+                .events
+                .iter()
+                .all(|event| { !matches!(event.sequence, 12 | 13 | 15 | 16) })
+        );
+        assert!(
+            mapper
+                .project_prompt_turn(&state, valid_child_run_id)
+                .is_none()
+        );
+        assert!(
+            mapper
+                .project_prompt_turn(&state, broken_child_run_id)
+                .is_none()
+        );
+        assert!(mapper.project_prompt_turn(&state, cycle_a_run_id).is_none());
+        assert!(mapper.project_prompt_turn(&state, cycle_b_run_id).is_none());
+    }
+
     fn event_signature(
         event: &OrderedPromptTurnEvent,
     ) -> (u64, ProjectionEventPhase, &'static str) {
@@ -1240,29 +1408,25 @@ mod tests {
     ) -> Session {
         let now = Utc::now();
         let terminal_sequence = status.is_terminal().then_some(next_replay_sequence - 1);
-
-        Session {
-            id: Uuid::new_v4(),
-            title: "mapping test".to_string(),
+        let mut session = Session::new("mapping test");
+        session.created_at = now;
+        session.updated_at = now;
+        session.next_replay_sequence = next_replay_sequence;
+        session.runs = vec![RunRecord {
+            id: run_id,
+            status,
+            parent_run_id: None,
+            parent_tool_invocation_id: None,
+            created_sequence: 2,
+            terminal_sequence,
+            terminal_stop_reason,
             created_at: now,
             updated_at: now,
-            next_replay_sequence,
-            permissions: Default::default(),
-            runs: vec![RunRecord {
-                id: run_id,
-                status,
-                parent_run_id: None,
-                parent_tool_invocation_id: None,
-                created_sequence: 2,
-                terminal_sequence,
-                terminal_stop_reason,
-                created_at: now,
-                updated_at: now,
-            }],
-            turns,
-            tool_invocations,
-            foreground_owner: None,
-        }
+        }];
+        session.turns = turns;
+        session.tool_invocations = tool_invocations;
+        session.rebuild_run_indexes();
+        session
     }
 
     fn user_turn(run_id: Uuid, sequence_number: u64, content: &str) -> Turn {
