@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-
 #[cfg(test)]
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agent_client_protocol::{self as acp, Client as _};
 use fluent_code_app::agent::AgentRegistry;
@@ -23,6 +21,8 @@ use fluent_code_app::session::model::{
 use fluent_code_app::session::store::FsSessionStore;
 use fluent_code_app::{FluentCodeError, Result};
 use futures::io::{AsyncRead, AsyncWrite};
+#[cfg(test)]
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::{RawValue, to_raw_value};
@@ -59,7 +59,6 @@ const ACP_ACTIVE_PROMPT: i32 = -32003;
 const ACP_TEST_PROBES_ENV_VAR: &str = "FLUENT_CODE_ACP_ENABLE_TEST_PROBES";
 const SESSION_UPDATE_METHOD: &str = "session/update";
 const SESSION_REQUEST_PERMISSION_METHOD: &str = "session/request_permission";
-const PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CANCELLED_TOOL_MESSAGE: &str =
     "Tool execution was cancelled because the prompt turn was cancelled.";
 
@@ -157,7 +156,7 @@ enum BufferedPromptCompletion {
 }
 
 #[cfg(test)]
-enum ReaderEvent {
+pub(crate) enum ReaderEvent {
     Frame(String),
     Eof,
 }
@@ -403,7 +402,7 @@ impl OfficialAgentAdapter {
                 let follow_up_frames = self
                     .process_permission_response(&request, client_response)
                     .await?;
-                outbound_frames.extend(follow_up_frames);
+                prepend_outbound_frames(&mut outbound_frames, follow_up_frames);
                 continue;
             }
 
@@ -681,6 +680,30 @@ impl OfficialAgentAdapter {
         }
 
         loop {
+            let woke_for_runtime_activity = {
+                let mut managed_session = managed_session.lock().await;
+                if let Some(buffered_completion) = managed_session.buffered_prompt_completion.take()
+                {
+                    return buffered_completion.into_result();
+                }
+                if managed_session.live_prompt_turn.is_none() {
+                    if let Some(prompt_completion) =
+                        prompt_completion_from_terminal_state(managed_session.host.state())
+                    {
+                        return prompt_completion;
+                    }
+
+                    return Err(acp::Error::new(
+                        JSONRPC_INTERNAL_ERROR,
+                        format!(
+                            "session `{session_id}` completed the live prompt turn without producing a prompt response"
+                        ),
+                    ));
+                }
+
+                managed_session.host.wait_for_runtime_activity().await
+            };
+
             let poll_result = {
                 let mut managed_session = managed_session.lock().await;
                 if let Some(buffered_completion) = managed_session.buffered_prompt_completion.take()
@@ -688,6 +711,12 @@ impl OfficialAgentAdapter {
                     return buffered_completion.into_result();
                 }
                 if managed_session.live_prompt_turn.is_none() {
+                    if let Some(prompt_completion) =
+                        prompt_completion_from_terminal_state(managed_session.host.state())
+                    {
+                        return prompt_completion;
+                    }
+
                     return Err(acp::Error::new(
                         JSONRPC_INTERNAL_ERROR,
                         format!(
@@ -717,7 +746,14 @@ impl OfficialAgentAdapter {
                 ));
             }
 
-            tokio::time::sleep(PROMPT_POLL_INTERVAL).await;
+            if !woke_for_runtime_activity {
+                return Err(acp::Error::new(
+                    JSONRPC_INTERNAL_ERROR,
+                    format!(
+                        "session `{session_id}` stopped receiving runtime activity before producing a prompt response"
+                    ),
+                ));
+            }
         }
     }
 
@@ -756,7 +792,7 @@ impl OfficialAgentAdapter {
                 let follow_up_frames = self
                     .process_permission_response(&request, client_response)
                     .await?;
-                outbound_frames.extend(follow_up_frames);
+                prepend_outbound_frames(&mut outbound_frames, follow_up_frames);
                 continue;
             }
 
@@ -883,6 +919,12 @@ impl OfficialAgentAdapter {
         }
 
         Ok(())
+    }
+}
+
+fn prepend_outbound_frames(queue: &mut VecDeque<Value>, frames: Vec<Value>) {
+    for frame in frames.into_iter().rev() {
+        queue.push_front(frame);
     }
 }
 
@@ -1509,7 +1551,7 @@ impl AcpServer {
     }
 
     #[cfg(test)]
-    async fn serve_live_frames<W: Write>(
+    pub(crate) async fn serve_live_frames<W: Write>(
         &self,
         frame_receiver: &mut mpsc::UnboundedReceiver<ReaderEvent>,
         writer: &mut W,
@@ -1519,6 +1561,14 @@ impl AcpServer {
         let mut reader_closed = false;
 
         while !reader_closed || has_live_prompt_turns(&connection) {
+            if self
+                .flush_live_prompt_turn_updates(&mut connection, writer)
+                .await?
+            {
+                continue;
+            }
+
+            let active_live_prompt_turns = active_live_prompt_turn_handles(&connection);
             tokio::select! {
                 maybe_event = frame_receiver.recv(), if !reader_closed => {
                     let Some(event) = maybe_event else {
@@ -1542,15 +1592,8 @@ impl AcpServer {
                             );
 
                             if has_live_prompt_turns(&connection) {
-                                let outbound_frames = self
-                                    .poll_live_prompt_turns(&mut connection)
-                                    .await
-                                    .map_err(|error| FluentCodeError::Provider(error.message))?;
-                                self.write_outbound_frames(writer, outbound_frames.clone())?;
-                                clear_written_prompt_responses(
-                                    &mut connection,
-                                    &frame_ids_from_responses(&outbound_frames),
-                                );
+                                self.flush_live_prompt_turn_updates(&mut connection, writer)
+                                    .await?;
                             }
                         }
                         ReaderEvent::Eof => {
@@ -1558,16 +1601,15 @@ impl AcpServer {
                         }
                     }
                 }
-                _ = tokio::time::sleep(PROMPT_POLL_INTERVAL), if has_live_prompt_turns(&connection) => {
-                    let outbound_frames = self
-                        .poll_live_prompt_turns(&mut connection)
-                        .await
-                        .map_err(|error| FluentCodeError::Provider(error.message))?;
-                    self.write_outbound_frames(writer, outbound_frames.clone())?;
-                    clear_written_prompt_responses(
-                        &mut connection,
-                        &frame_ids_from_responses(&outbound_frames),
-                    );
+                woke_for_runtime_activity = wait_for_live_prompt_turn_activity(active_live_prompt_turns), if !active_live_prompt_turns.is_empty() => {
+                    let wrote_frames = self
+                        .flush_live_prompt_turn_updates(&mut connection, writer)
+                        .await?;
+                    if !woke_for_runtime_activity && !wrote_frames && has_live_prompt_turns(&connection) {
+                        return Err(FluentCodeError::Provider(
+                            "live ACP prompt turns stopped receiving runtime activity before completing".to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -2186,6 +2228,29 @@ impl AcpServer {
     }
 
     #[cfg(test)]
+    async fn flush_live_prompt_turn_updates<W: Write>(
+        &self,
+        connection: &mut AcpConnectionState,
+        writer: &mut W,
+    ) -> Result<bool> {
+        if !has_live_prompt_turns(connection) {
+            return Ok(false);
+        }
+
+        let outbound_frames = self
+            .poll_live_prompt_turns(connection)
+            .await
+            .map_err(|error| FluentCodeError::Provider(error.message))?;
+        if outbound_frames.is_empty() {
+            return Ok(false);
+        }
+
+        self.write_outbound_frames(writer, outbound_frames.clone())?;
+        clear_written_prompt_responses(connection, &frame_ids_from_responses(&outbound_frames));
+        Ok(true)
+    }
+
+    #[cfg(test)]
     fn flush_pending_prompt_response(
         &self,
         managed_session: &mut ManagedSession,
@@ -2371,7 +2436,9 @@ impl AcpServer {
             };
 
         loop {
-            let emitted_frame_count_before_pass = outbound_frames.len();
+            host.drain_runtime_messages()
+                .await
+                .map_err(|error| RpcResponseError::internal(error.to_string()))?;
 
             if let Some(stop_reason) =
                 emit_prompt_turn_projection(host, &mut emission_state, &mut outbound_frames)?
@@ -2381,6 +2448,8 @@ impl AcpServer {
                     stop_reason,
                 });
             }
+
+            let woke_for_runtime_activity = host.wait_for_runtime_activity().await;
 
             host.drain_runtime_messages()
                 .await
@@ -2395,8 +2464,10 @@ impl AcpServer {
                 });
             }
 
-            if outbound_frames.len() == emitted_frame_count_before_pass {
-                tokio::time::sleep(PROMPT_POLL_INTERVAL).await;
+            if !woke_for_runtime_activity {
+                return Err(RpcResponseError::internal(format!(
+                    "session `{session_id}` stopped receiving runtime activity before completing prompt turn run `{run_id}`"
+                )));
             }
         }
     }
@@ -2470,6 +2541,42 @@ fn has_live_prompt_turns(connection: &AcpConnectionState) -> bool {
         managed_session.live_prompt_turn.is_some()
             || managed_session.pending_prompt_request_id.is_some()
     })
+}
+
+#[cfg(test)]
+fn active_live_prompt_turn_handles(connection: &AcpConnectionState) -> Vec<ManagedSessionHandle> {
+    connection
+        .sessions
+        .values()
+        .filter_map(|managed_session| {
+            let has_live_prompt_turn = managed_session
+                .try_lock()
+                .expect("test harness should not contend on managed sessions")
+                .live_prompt_turn
+                .is_some();
+            has_live_prompt_turn.then(|| Arc::clone(managed_session))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+async fn wait_for_live_prompt_turn_activity(managed_sessions: Vec<ManagedSessionHandle>) -> bool {
+    let mut waits = FuturesUnordered::new();
+
+    for managed_session in managed_sessions {
+        waits.push(async move {
+            let mut managed_session = managed_session.lock().await;
+            managed_session.host.wait_for_runtime_activity().await
+        });
+    }
+
+    while let Some(woke_for_runtime_activity) = waits.next().await {
+        if woke_for_runtime_activity {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn cancel_target(state: &AppState) -> Option<CancelTarget> {
@@ -2725,7 +2832,6 @@ fn current_prompt_turn_root_run_id(state: &AppState) -> Option<RunId> {
     root_run_id_for(state, state.active_run_id?)
 }
 
-#[cfg(test)]
 fn latest_root_run_id(state: &AppState) -> Option<RunId> {
     state
         .session
@@ -2734,6 +2840,26 @@ fn latest_root_run_id(state: &AppState) -> Option<RunId> {
         .filter(|run| run.parent_run_id.is_none())
         .max_by_key(|run| run.latest_replay_sequence())
         .map(|run| run.id)
+}
+
+fn prompt_completion_from_terminal_state(
+    state: &AppState,
+) -> Option<acp::Result<acp::PromptResponse>> {
+    let run_id = latest_root_run_id(state)?;
+    let run = state.session.find_run(run_id)?;
+    let reason = run
+        .terminal_stop_reason
+        .or_else(|| run.status.default_terminal_stop_reason())?;
+
+    Some(match reason {
+        RunTerminalStopReason::Completed => Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)),
+        RunTerminalStopReason::Cancelled => {
+            Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
+        }
+        RunTerminalStopReason::Failed | RunTerminalStopReason::Interrupted => Err(
+            map_rpc_response_error(prompt_turn_terminal_error(state, run_id, reason)),
+        ),
+    })
 }
 
 fn root_run_id_for(state: &AppState, mut run_id: RunId) -> Option<RunId> {
@@ -3055,7 +3181,7 @@ mod contract_tests;
 mod tests {
     use std::collections::HashMap;
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock};
@@ -3081,13 +3207,14 @@ mod tests {
     use fluent_code_provider::{MockProvider, ProviderClient, ProviderToolCall};
     use serde_json::Value;
     use tokio::io::duplex;
-    use tokio::sync::{Mutex, mpsc};
+    use tokio::sync::{Mutex, Notify, mpsc};
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
     use uuid::Uuid;
 
     use super::{
         AcpConnectionState, AcpServer, AcpServerDependencies, CANCELLED_TOOL_MESSAGE,
-        ManagedAppHost, ManagedSession, ReaderEvent,
+        JSONRPC_INTERNAL_ERROR, LivePromptTurnState, ManagedAppHost, ManagedSession,
+        PromptTurnEmissionState, ReaderEvent, wait_for_live_prompt_turn_activity,
     };
     use crate::dev_harness::ScriptedJsonlHarness;
     use crate::protocol::{Method, ParsedRequest};
@@ -3367,10 +3494,21 @@ mod tests {
             .iter()
             .filter(|frame| session_update_kind(frame) == Some("tool_call"))
             .collect::<Vec<_>>();
+        let tool_call_indices = responses
+            .iter()
+            .enumerate()
+            .filter_map(|(index, frame)| {
+                (session_update_kind(frame) == Some("tool_call")).then_some(index)
+            })
+            .collect::<Vec<_>>();
         let permission_requests = responses
             .iter()
             .filter(|frame| frame["method"] == "session/request_permission")
             .collect::<Vec<_>>();
+        let permission_request_index = responses
+            .iter()
+            .position(|frame| frame["method"] == "session/request_permission")
+            .expect("single permission request frame");
 
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(permission_requests.len(), 1);
@@ -3381,6 +3519,12 @@ mod tests {
         assert_eq!(
             permission_requests[0]["params"]["toolCall"]["locations"][0]["path"],
             "/tmp/project"
+        );
+        assert!(
+            tool_call_indices
+                .iter()
+                .all(|index| *index < permission_request_index),
+            "expected tool_call replays before the pending permission request"
         );
 
         cleanup(temp_dir);
@@ -3834,6 +3978,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_live_prompt_turn_resumes_foreground_delegated_child_agent_chunks_without_duplicate_text()
+     {
+        let _guard = test_lock().lock().await;
+        let temp_dir = unique_temp_dir("fluent-code-acp-live-delegated-child-resume");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let server = AcpServer::build(test_config(temp_dir.clone())).unwrap();
+        let mut managed_session = managed_session_for(
+            server.build_host_for_session(active_delegated_child_session()),
+            &server,
+        );
+        let session_id = managed_session.host.state().session.id.to_string();
+        let child_run_id = managed_session
+            .host
+            .state()
+            .session
+            .foreground_owner
+            .as_ref()
+            .expect("delegated child owns the foreground")
+            .run_id;
+
+        managed_session
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantChunk {
+                run_id: child_run_id,
+                delta: "delegated partial ".to_string(),
+            })
+            .unwrap();
+
+        let first_poll = server
+            .poll_live_prompt_turn(&session_id, &mut managed_session)
+            .await
+            .unwrap();
+        let first_updates = session_update_frames(&first_poll.frames);
+
+        assert!(!first_poll.prompt_turn_complete);
+        assert_eq!(
+            collect_agent_message_chunk_texts(&first_updates),
+            vec!["delegated partial "]
+        );
+
+        managed_session
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantChunk {
+                run_id: child_run_id,
+                delta: "resumed output".to_string(),
+            })
+            .unwrap();
+
+        let second_poll = server
+            .poll_live_prompt_turn(&session_id, &mut managed_session)
+            .await
+            .unwrap();
+        let second_updates = session_update_frames(&second_poll.frames);
+
+        assert!(!second_poll.prompt_turn_complete);
+        assert_eq!(
+            collect_agent_message_chunk_texts(&second_updates),
+            vec!["resumed output"]
+        );
+        assert_eq!(
+            managed_session
+                .host
+                .state()
+                .session
+                .turns
+                .iter()
+                .find(|turn| turn.run_id == child_run_id && matches!(turn.role, Role::Assistant))
+                .expect("delegated child assistant turn")
+                .content,
+            "delegated partial resumed output"
+        );
+
+        cleanup(temp_dir);
+    }
+
+    #[tokio::test]
     async fn session_load_surfaces_interrupted_running_tool_state_explicitly() {
         let temp_dir = unique_temp_dir("fluent-code-acp-load-interrupted-running-tool");
         fs::create_dir_all(&temp_dir).unwrap();
@@ -3884,6 +4106,8 @@ mod tests {
 
         let server = test_server_with_chunk_delay(temp_dir.clone(), Duration::from_millis(50));
         let (frame_sender, mut frame_receiver) = mpsc::unbounded_channel();
+        let mut output = NotifyingFrameCapture::default();
+        let output_for_sender = output.clone();
         let sender = tokio::spawn(async move {
             frame_sender
                 .send(ReaderEvent::Frame(
@@ -3904,7 +4128,7 @@ mod tests {
                 )))
                 .unwrap();
 
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            wait_for_capture_agent_chunk(&output_for_sender).await;
 
             frame_sender
                 .send(ReaderEvent::Frame(format!(
@@ -3913,18 +4137,16 @@ mod tests {
                 )))
                 .unwrap();
 
-            tokio::time::sleep(Duration::from_millis(200)).await;
             frame_sender.send(ReaderEvent::Eof).unwrap();
         });
 
-        let mut output = Vec::new();
         let frames_processed = server
             .serve_live_frames(&mut frame_receiver, &mut output)
             .await
             .unwrap();
         sender.await.unwrap();
 
-        let responses = output_frames(output);
+        let responses = output.output_frames();
         let cancel_response_index = responses
             .iter()
             .position(|frame| frame["id"] == 4)
@@ -3956,7 +4178,7 @@ mod tests {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-live-session-new-cancel");
         fs::create_dir_all(&temp_dir).unwrap();
-        let server = AcpServer::build(test_config(temp_dir.clone())).unwrap();
+        let server = test_server_with_chunk_delay(temp_dir.clone(), Duration::from_millis(50));
         let mut connection = AcpConnectionState::default();
 
         server
@@ -3992,8 +4214,6 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
         let cancel_frames = server
             .handle_live_frame(
                 &mut connection,
@@ -4021,6 +4241,60 @@ mod tests {
                         == Some(3)
                 }),
             "cancel path must either emit or retain the original prompt response",
+        );
+
+        cleanup(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn live_prompt_wait_path_stays_idle_until_runtime_activity() {
+        let temp_dir = unique_temp_dir("fluent-code-acp-live-wait-idle");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let server = AcpServer::build(test_config(temp_dir.clone())).unwrap();
+        let session = active_generating_session();
+        let root_run_id = session
+            .foreground_owner
+            .as_ref()
+            .expect("active generating session should retain a foreground owner")
+            .run_id;
+        let managed_session = Arc::new(Mutex::new(ManagedSession {
+            _cwd: temp_dir.clone(),
+            _mcp_servers: Vec::new(),
+            host: server.build_host_for_session(session),
+            live_prompt_turn: Some(LivePromptTurnState {
+                root_run_id,
+                emission_state: PromptTurnEmissionState::default(),
+            }),
+            pending_prompt_request_id: Some(1),
+            buffered_prompt_completion: None,
+        }));
+
+        let wait_task = tokio::spawn(wait_for_live_prompt_turn_activity(vec![Arc::clone(
+            &managed_session,
+        )]));
+        tokio::task::yield_now().await;
+        assert!(
+            !wait_task.is_finished(),
+            "expected the live ACP prompt wait path to remain idle until runtime activity arrives"
+        );
+
+        managed_session
+            .lock()
+            .await
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantChunk {
+                run_id: root_run_id,
+                delta: "wake".to_string(),
+            })
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), wait_task)
+                .await
+                .expect("live ACP wait path should wake after runtime activity")
+                .expect("live ACP wait task should join cleanly"),
+            "expected runtime activity to wake the live ACP wait path"
         );
 
         cleanup(temp_dir);
@@ -4118,6 +4392,7 @@ mod tests {
 
                 let client = RecordingClient::default();
                 let agent_chunk_count = Arc::clone(&client.agent_chunk_count);
+                let chunk_notifications = client.clone();
                 let (client_reader, client_writer) = tokio::io::split(client_stream);
                 let (connection, io_future) = acp::ClientSideConnection::new(
                     client,
@@ -4155,7 +4430,7 @@ mod tests {
                         .await
                 });
 
-                wait_for_agent_chunk(&agent_chunk_count).await;
+                wait_for_agent_chunk(&chunk_notifications).await;
                 assert!(
                     !prompt_task.is_finished(),
                     "prompt should still be active after the first streamed agent chunk"
@@ -4169,6 +4444,138 @@ mod tests {
                 let prompt_response = prompt_task.await.unwrap().unwrap();
                 assert_eq!(prompt_response.stop_reason, acp::StopReason::Cancelled);
                 assert!(agent_chunk_count.load(Ordering::SeqCst) > 0);
+
+                drop(connection);
+                io_task.abort();
+                let _ = io_task.await;
+                server_task.await.unwrap().unwrap();
+            })
+            .await;
+
+        cleanup(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn official_sdk_prompt_permission_request_stays_ordered_across_wake_driven_resume() {
+        let _guard = test_lock().lock().await;
+        let temp_dir = unique_temp_dir("fluent-code-acp-official-permission-order");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let store = FsSessionStore::new(temp_dir.clone());
+        let session = Session::new("official prompt permission ordering session");
+        let session_id = session.id.to_string();
+        store.create(&session).unwrap();
+
+        let server = AcpServer::build(test_config(temp_dir.clone())).unwrap();
+        let test_cwd = temp_dir.clone();
+        let test_session_id = session_id.clone();
+
+        tokio::task::LocalSet::new()
+            .run_until(async move {
+                let (server_stream, client_stream) = duplex(64 * 1024);
+                let (server_reader, server_writer) = tokio::io::split(server_stream);
+                let server_task = {
+                    let server = server.clone();
+                    tokio::task::spawn_local(async move {
+                        server
+                            .serve_agent_connection(
+                                server_reader.compat(),
+                                server_writer.compat_write(),
+                            )
+                            .await
+                    })
+                };
+
+                let client = PermissionOrderingClient::default();
+                let client_events = client.clone();
+                let (client_reader, client_writer) = tokio::io::split(client_stream);
+                let (connection, io_future) = acp::ClientSideConnection::new(
+                    client,
+                    client_writer.compat_write(),
+                    client_reader.compat(),
+                    |future| {
+                        tokio::task::spawn_local(future);
+                    },
+                );
+                let connection = Arc::new(connection);
+                let io_task = tokio::task::spawn_local(io_future);
+
+                connection
+                    .initialize(acp::InitializeRequest::new(acp::ProtocolVersion::V1))
+                    .await
+                    .unwrap();
+                connection
+                    .load_session(acp::LoadSessionRequest::new(
+                        test_session_id.clone(),
+                        test_cwd.clone(),
+                    ))
+                    .await
+                    .unwrap();
+
+                let prompt_response = connection
+                    .prompt(acp::PromptRequest::new(
+                        test_session_id,
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "use uppercase_text: hello world",
+                        ))],
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(prompt_response.stop_reason, acp::StopReason::EndTurn);
+                let expected_resumed_response = "Mock assistant response after tool: HELLO WORLD";
+
+                wait_for_client_event(
+                    &client_events,
+                    "resumed assistant output after permission approval",
+                    |events| {
+                        collect_agent_message_chunk_texts_from_events(events)
+                            .join("")
+                            .contains(expected_resumed_response)
+                    },
+                )
+                .await;
+                let events = client_events.snapshot_events();
+                let permission_index = events
+                    .iter()
+                    .position(|event| event.starts_with("request_permission:"))
+                    .expect("permission request event");
+                let completed_tool_update_index = events
+                    .iter()
+                    .position(|event| event.ends_with(":completed:HELLO WORLD"))
+                    .expect("completed tool update event");
+                let resumed_chunk_index = events
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, event)| {
+                        (index > completed_tool_update_index
+                            && event.starts_with("agent_message_chunk:"))
+                        .then_some(index)
+                    })
+                    .expect("resumed assistant chunk event after tool completion");
+                let resumed_chunk_text = collect_agent_message_chunk_texts_from_events(
+                    &events[completed_tool_update_index + 1..],
+                )
+                .join("");
+
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event.starts_with("request_permission:"))
+                        .count(),
+                    1,
+                    "expected a single permission request before wake-driven resume"
+                );
+                assert!(
+                    permission_index < completed_tool_update_index,
+                    "expected permission approval to precede the completed tool patch\nevents: {events:?}"
+                );
+                assert!(
+                    completed_tool_update_index < resumed_chunk_index,
+                    "expected tool completion to precede resumed assistant output\nevents: {events:?}"
+                );
+                assert_eq!(
+                    resumed_chunk_text, expected_resumed_response,
+                    "expected resumed assistant chunks after approval to reconstruct the post-tool response\nevents: {events:?}"
+                );
 
                 drop(connection);
                 io_task.abort();
@@ -4392,6 +4799,11 @@ mod tests {
             .iter()
             .position(|kind| *kind == "tool_call_update")
             .expect("tool_call_update should be emitted");
+        let resumed_agent_chunks = session_updates[first_tool_update_index + 2..]
+            .iter()
+            .filter(|frame| session_update_kind(frame) == Some("agent_message_chunk"))
+            .filter_map(|frame| frame["params"]["update"]["content"]["text"].as_str())
+            .collect::<Vec<_>>();
         assert!(tool_call_index > 0);
         assert!(first_tool_update_index > tool_call_index);
         assert_eq!(
@@ -4410,6 +4822,11 @@ mod tests {
             update_kinds[first_tool_update_index + 2..]
                 .iter()
                 .all(|kind| *kind == "agent_message_chunk")
+        );
+        assert!(!resumed_agent_chunks.is_empty());
+        assert_eq!(
+            resumed_agent_chunks.concat(),
+            "Mock assistant response after tool: HELLO WORLD"
         );
         assert!(
             collect_agent_message_chunks(&session_updates)
@@ -5094,6 +5511,94 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingClient {
         agent_chunk_count: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+    }
+
+    #[derive(Clone, Default)]
+    struct NotifyingFrameCapture {
+        state: Arc<std::sync::Mutex<NotifyingFrameCaptureState>>,
+        agent_chunk_count: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+    }
+
+    #[derive(Default)]
+    struct NotifyingFrameCaptureState {
+        bytes: Vec<u8>,
+        parsed_offset: usize,
+    }
+
+    impl NotifyingFrameCapture {
+        fn output_frames(&self) -> Vec<Value> {
+            output_frames(
+                self.state
+                    .lock()
+                    .expect("notifying frame capture mutex poisoned")
+                    .bytes
+                    .clone(),
+            )
+        }
+    }
+
+    impl Write for NotifyingFrameCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("notifying frame capture mutex poisoned");
+            state.bytes.extend_from_slice(buf);
+
+            while let Some(relative_newline_index) = state.bytes[state.parsed_offset..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+            {
+                let newline_index = state.parsed_offset + relative_newline_index;
+                let line =
+                    String::from_utf8_lossy(&state.bytes[state.parsed_offset..newline_index])
+                        .into_owned();
+                state.parsed_offset = newline_index + 1;
+
+                if line.is_empty() {
+                    continue;
+                }
+
+                if let Ok(frame) = serde_json::from_str::<Value>(&line)
+                    && session_update_kind(&frame) == Some("agent_message_chunk")
+                {
+                    self.agent_chunk_count.fetch_add(1, Ordering::SeqCst);
+                    self.notify.notify_waiters();
+                }
+            }
+
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct PermissionOrderingClient {
+        events: Arc<std::sync::Mutex<Vec<String>>>,
+        notify: Arc<Notify>,
+    }
+
+    impl PermissionOrderingClient {
+        fn record_event(&self, event: impl Into<String>) {
+            let mut events = self
+                .events
+                .lock()
+                .expect("permission-ordering client events mutex poisoned");
+            events.push(event.into());
+            self.notify.notify_waiters();
+        }
+
+        fn snapshot_events(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .expect("permission-ordering client events mutex poisoned")
+                .clone()
+        }
     }
 
     #[async_trait::async_trait(?Send)]
@@ -5108,6 +5613,7 @@ mod tests {
         async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
             if matches!(args.update, acp::SessionUpdate::AgentMessageChunk(_)) {
                 self.agent_chunk_count.fetch_add(1, Ordering::SeqCst);
+                self.notify.notify_waiters();
             }
             Ok(())
         }
@@ -5155,16 +5661,162 @@ mod tests {
         }
     }
 
-    async fn wait_for_agent_chunk(agent_chunk_count: &Arc<AtomicUsize>) {
-        for _ in 0..100 {
-            if agent_chunk_count.load(Ordering::SeqCst) > 0 {
-                return;
-            }
+    #[async_trait::async_trait(?Send)]
+    impl acp::Client for PermissionOrderingClient {
+        async fn request_permission(
+            &self,
+            args: acp::RequestPermissionRequest,
+        ) -> acp::Result<acp::RequestPermissionResponse> {
+            self.record_event(format!(
+                "request_permission:{}",
+                args.tool_call.tool_call_id
+            ));
+            let allow_once = args
+                .options
+                .iter()
+                .find(|option| option.option_id.to_string() == "allow_once")
+                .expect("permission request should expose allow_once");
 
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                    allow_once.option_id.to_string(),
+                )),
+            ))
         }
 
-        panic!("timed out waiting for an incrementally delivered agent chunk");
+        async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
+            let notification = serde_json::to_value(&args)
+                .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
+            let event = match notification["update"]["sessionUpdate"].as_str() {
+                Some("tool_call") => format!(
+                    "tool_call:{}",
+                    notification["update"]["toolCallId"]
+                        .as_str()
+                        .unwrap_or_default()
+                ),
+                Some("tool_call_update") => format!(
+                    "tool_call_update:{}:{}:{}",
+                    notification["update"]["toolCallId"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    notification["update"]["status"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    notification["update"]["rawOutput"]["result"]
+                        .as_str()
+                        .unwrap_or_default(),
+                ),
+                Some("agent_message_chunk") => format!(
+                    "agent_message_chunk:{}",
+                    notification["update"]["content"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                ),
+                Some(kind) => format!("session_update:{kind}"),
+                None => "session_notification".to_string(),
+            };
+            self.record_event(event);
+            Ok(())
+        }
+
+        async fn read_text_file(
+            &self,
+            _args: acp::ReadTextFileRequest,
+        ) -> acp::Result<acp::ReadTextFileResponse> {
+            Err(acp::Error::method_not_found())
+        }
+
+        async fn write_text_file(
+            &self,
+            _args: acp::WriteTextFileRequest,
+        ) -> acp::Result<acp::WriteTextFileResponse> {
+            Err(acp::Error::method_not_found())
+        }
+
+        async fn create_terminal(
+            &self,
+            _args: acp::CreateTerminalRequest,
+        ) -> acp::Result<acp::CreateTerminalResponse> {
+            Err(acp::Error::method_not_found())
+        }
+
+        async fn wait_for_terminal_exit(
+            &self,
+            _args: acp::WaitForTerminalExitRequest,
+        ) -> acp::Result<acp::WaitForTerminalExitResponse> {
+            Err(acp::Error::method_not_found())
+        }
+
+        async fn terminal_output(
+            &self,
+            _args: acp::TerminalOutputRequest,
+        ) -> acp::Result<acp::TerminalOutputResponse> {
+            Err(acp::Error::method_not_found())
+        }
+
+        async fn release_terminal(
+            &self,
+            _args: acp::ReleaseTerminalRequest,
+        ) -> acp::Result<acp::ReleaseTerminalResponse> {
+            Err(acp::Error::method_not_found())
+        }
+    }
+
+    async fn wait_for_agent_chunk(client: &RecordingClient) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let notified = client.notify.notified();
+                if client.agent_chunk_count.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("timed out waiting for an incrementally delivered agent chunk");
+    }
+
+    async fn wait_for_capture_agent_chunk(capture: &NotifyingFrameCapture) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let notified = capture.notify.notified();
+                if capture.agent_chunk_count.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("timed out waiting for an incrementally delivered ACP stdio agent chunk");
+    }
+
+    async fn wait_for_client_event<F>(
+        client: &PermissionOrderingClient,
+        description: &str,
+        predicate: F,
+    ) where
+        F: Fn(&[String]) -> bool,
+    {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let notified = client.notify.notified();
+                let events = client.snapshot_events();
+                if predicate(&events) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+    }
+
+    fn collect_agent_message_chunk_texts_from_events(events: &[String]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| event.strip_prefix("agent_message_chunk:"))
+            .map(str::to_owned)
+            .collect()
     }
 
     fn test_lock() -> &'static Mutex<()> {
