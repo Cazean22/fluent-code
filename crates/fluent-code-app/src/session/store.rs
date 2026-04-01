@@ -177,18 +177,16 @@ impl SessionStore for FsSessionStore {
         let metadata: SessionMetadata = serde_json::from_str(&fs::read_to_string(meta_path)?)?;
         let turns = self.read_turns(&self.turns_path(id))?;
 
-        let mut session = Session {
-            id: metadata.id,
-            title: metadata.title,
-            created_at: metadata.created_at,
-            updated_at: metadata.updated_at,
-            next_replay_sequence: metadata.next_replay_sequence,
-            permissions: metadata.permissions,
-            runs: metadata.runs,
-            turns,
-            tool_invocations: metadata.tool_invocations,
-            foreground_owner: metadata.foreground_owner,
-        };
+        let mut session = Session::new(metadata.title);
+        session.id = metadata.id;
+        session.created_at = metadata.created_at;
+        session.updated_at = metadata.updated_at;
+        session.next_replay_sequence = metadata.next_replay_sequence;
+        session.permissions = metadata.permissions;
+        session.runs = metadata.runs;
+        session.turns = turns;
+        session.tool_invocations = metadata.tool_invocations;
+        session.foreground_owner = metadata.foreground_owner;
         session.normalize_persistence();
 
         info!(

@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
@@ -30,13 +32,17 @@ pub struct Session {
     pub tool_invocations: Vec<ToolInvocationRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_owner: Option<ForegroundOwnerRecord>,
+    #[serde(skip)]
+    run_index: HashMap<RunId, usize>,
+    #[serde(skip)]
+    root_run_map: HashMap<RunId, RunId>,
 }
 
 impl Session {
     pub fn new(title: impl Into<String>) -> Self {
         let now = Utc::now();
 
-        Self {
+        let mut session = Self {
             id: Uuid::new_v4(),
             title: title.into(),
             created_at: now,
@@ -47,7 +53,11 @@ impl Session {
             turns: Vec::new(),
             tool_invocations: Vec::new(),
             foreground_owner: None,
-        }
+            run_index: HashMap::new(),
+            root_run_map: HashMap::new(),
+        };
+        session.rebuild_run_indexes();
+        session
     }
 
     pub fn remember_tool_permission_rule(&mut self, rule: ToolPermissionRule) {
@@ -95,7 +105,7 @@ impl Session {
         let resolved_stop_reason = stop_reason.or_else(|| status.default_terminal_stop_reason());
         let now = Utc::now();
 
-        if let Some(run_index) = self.runs.iter().position(|run| run.id == run_id) {
+        if let Some(run_index) = self.run_index.get(&run_id).copied() {
             let needs_terminal_sequence = {
                 let run = &self.runs[run_index];
                 status.is_terminal()
@@ -125,6 +135,7 @@ impl Session {
                 run.terminal_stop_reason = None;
             }
 
+            self.rebuild_run_indexes();
             return;
         }
 
@@ -144,6 +155,7 @@ impl Session {
             created_at: now,
             updated_at: now,
         });
+        self.rebuild_run_indexes();
     }
 
     pub fn upsert_run_with_parent(
@@ -188,14 +200,40 @@ impl Session {
             .max_replay_sequence()
             .map(|sequence| sequence.saturating_add(1))
             .unwrap_or(FIRST_REPLAY_SEQUENCE);
+        self.rebuild_run_indexes();
     }
 
     pub fn find_run(&self, run_id: RunId) -> Option<&RunRecord> {
-        self.runs.iter().find(|run| run.id == run_id)
+        let run_index = self.run_index.get(&run_id).copied()?;
+        self.runs.get(run_index)
     }
 
     pub fn find_run_mut(&mut self, run_id: RunId) -> Option<&mut RunRecord> {
-        self.runs.iter_mut().find(|run| run.id == run_id)
+        let run_index = self.run_index.get(&run_id).copied()?;
+        self.runs.get_mut(run_index)
+    }
+
+    pub fn rebuild_run_indexes(&mut self) {
+        self.run_index.clear();
+        for (run_index, run) in self.runs.iter().enumerate() {
+            self.run_index.entry(run.id).or_insert(run_index);
+        }
+
+        self.root_run_map.clear();
+        let run_ids = self.runs.iter().map(|run| run.id).collect::<Vec<_>>();
+        for run_id in run_ids {
+            if self.root_run_map.contains_key(&run_id) {
+                continue;
+            }
+
+            if let Some(root_run_id) = self.resolve_root_run_id(run_id) {
+                self.root_run_map.entry(run_id).or_insert(root_run_id);
+            }
+        }
+    }
+
+    pub fn root_run_id(&self, run_id: RunId) -> Option<RunId> {
+        self.root_run_map.get(&run_id).copied()
     }
 
     pub fn pending_tool_invocation(&self) -> Option<&ToolInvocationRecord> {
@@ -276,6 +314,42 @@ impl Session {
             )
             .filter(|sequence| *sequence >= FIRST_REPLAY_SEQUENCE)
             .max()
+    }
+
+    fn resolve_root_run_id(&mut self, run_id: RunId) -> Option<RunId> {
+        let mut lineage = Vec::new();
+        let mut seen_run_ids = HashSet::new();
+        let mut current_run_id = run_id;
+
+        let resolved_root_run_id = loop {
+            if let Some(cached_root_run_id) = self.root_run_map.get(&current_run_id).copied() {
+                break Some(cached_root_run_id);
+            }
+
+            if !seen_run_ids.insert(current_run_id) {
+                break None;
+            }
+
+            let Some(run_index) = self.run_index.get(&current_run_id).copied() else {
+                break None;
+            };
+
+            lineage.push(current_run_id);
+            match self.runs[run_index].parent_run_id {
+                Some(parent_run_id) => current_run_id = parent_run_id,
+                None => break Some(current_run_id),
+            }
+        };
+
+        if let Some(root_run_id) = resolved_root_run_id {
+            for lineage_run_id in lineage {
+                self.root_run_map
+                    .entry(lineage_run_id)
+                    .or_insert(root_run_id);
+            }
+        }
+
+        resolved_root_run_id
     }
 
     fn resequence_from_legacy_timestamps(&mut self) {
@@ -758,4 +832,183 @@ pub enum Role {
     Assistant,
     System,
     Tool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RunRecord, RunStatus, Session};
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    #[test]
+    fn rebuilds_run_indexes_after_normalize_and_preserves_first_match_semantics() {
+        let mut session = Session::new("duplicate runs");
+        let duplicated_run_id = Uuid::new_v4();
+        let child_run_id = Uuid::new_v4();
+
+        let first_duplicate_run =
+            run_record(&mut session, duplicated_run_id, RunStatus::InProgress, None);
+        let second_duplicate_run = run_record(
+            &mut session,
+            duplicated_run_id,
+            RunStatus::Failed,
+            Some(Uuid::new_v4()),
+        );
+        let child_run = run_record(
+            &mut session,
+            child_run_id,
+            RunStatus::InProgress,
+            Some(duplicated_run_id),
+        );
+
+        session.runs.push(first_duplicate_run);
+        session.runs.push(second_duplicate_run);
+        session.runs.push(child_run);
+
+        assert!(session.find_run(duplicated_run_id).is_none());
+
+        session.normalize_persistence();
+
+        assert_eq!(
+            session
+                .find_run(duplicated_run_id)
+                .expect("normalize rebuilds run index")
+                .parent_run_id,
+            None
+        );
+        session
+            .find_run_mut(duplicated_run_id)
+            .expect("find_run_mut uses rebuilt first-match index")
+            .status = RunStatus::Completed;
+        assert_eq!(session.runs[0].status, RunStatus::Completed);
+        assert_eq!(session.runs[1].status, RunStatus::Failed);
+        assert_eq!(session.root_run_id(child_run_id), Some(duplicated_run_id));
+    }
+
+    #[test]
+    fn root_run_id_returns_none_for_missing_and_cyclic_lineage() {
+        let mut session = Session::new("broken ancestry");
+        let root_run_id = Uuid::new_v4();
+        let child_run_id = Uuid::new_v4();
+        let missing_parent_child_run_id = Uuid::new_v4();
+        let missing_parent_run_id = Uuid::new_v4();
+        let self_cycle_run_id = Uuid::new_v4();
+        let cycle_a_run_id = Uuid::new_v4();
+        let cycle_b_run_id = Uuid::new_v4();
+
+        let root_run = run_record(&mut session, root_run_id, RunStatus::InProgress, None);
+        let child_run = run_record(
+            &mut session,
+            child_run_id,
+            RunStatus::InProgress,
+            Some(root_run_id),
+        );
+        let missing_parent_child_run = run_record(
+            &mut session,
+            missing_parent_child_run_id,
+            RunStatus::InProgress,
+            Some(missing_parent_run_id),
+        );
+        let self_cycle_run = run_record(
+            &mut session,
+            self_cycle_run_id,
+            RunStatus::InProgress,
+            Some(self_cycle_run_id),
+        );
+        let cycle_a_run = run_record(
+            &mut session,
+            cycle_a_run_id,
+            RunStatus::InProgress,
+            Some(cycle_b_run_id),
+        );
+        let cycle_b_run = run_record(
+            &mut session,
+            cycle_b_run_id,
+            RunStatus::InProgress,
+            Some(cycle_a_run_id),
+        );
+
+        session.runs.push(root_run);
+        session.runs.push(child_run);
+        session.runs.push(missing_parent_child_run);
+        session.runs.push(self_cycle_run);
+        session.runs.push(cycle_a_run);
+        session.runs.push(cycle_b_run);
+
+        session.rebuild_run_indexes();
+
+        assert_eq!(session.root_run_id(root_run_id), Some(root_run_id));
+        assert_eq!(session.root_run_id(child_run_id), Some(root_run_id));
+        assert_eq!(session.root_run_id(missing_parent_child_run_id), None);
+        assert_eq!(session.root_run_id(self_cycle_run_id), None);
+        assert_eq!(session.root_run_id(cycle_a_run_id), None);
+        assert_eq!(session.root_run_id(cycle_b_run_id), None);
+    }
+
+    #[test]
+    fn parent_change_rebuilds_descendant_root_cache() {
+        let mut session = Session::new("parent changes");
+        let first_root_run_id = Uuid::new_v4();
+        let second_root_run_id = Uuid::new_v4();
+        let child_run_id = Uuid::new_v4();
+        let grandchild_run_id = Uuid::new_v4();
+
+        session.upsert_run(first_root_run_id, RunStatus::InProgress);
+        session.upsert_run(second_root_run_id, RunStatus::InProgress);
+        session.upsert_run_with_parent(
+            child_run_id,
+            RunStatus::InProgress,
+            Some(first_root_run_id),
+            None,
+        );
+        session.upsert_run_with_parent(
+            grandchild_run_id,
+            RunStatus::InProgress,
+            Some(child_run_id),
+            None,
+        );
+
+        assert_eq!(
+            session.root_run_id(grandchild_run_id),
+            Some(first_root_run_id)
+        );
+
+        session.upsert_run_with_parent(
+            child_run_id,
+            RunStatus::InProgress,
+            Some(second_root_run_id),
+            None,
+        );
+
+        assert_eq!(session.root_run_id(child_run_id), Some(second_root_run_id));
+        assert_eq!(
+            session.root_run_id(grandchild_run_id),
+            Some(second_root_run_id)
+        );
+    }
+
+    fn run_record(
+        session: &mut Session,
+        id: Uuid,
+        status: RunStatus,
+        parent_run_id: Option<Uuid>,
+    ) -> RunRecord {
+        let now = Utc::now();
+        let created_sequence = session.allocate_replay_sequence();
+        let terminal_sequence = status
+            .is_terminal()
+            .then(|| session.allocate_replay_sequence());
+
+        RunRecord {
+            id,
+            status,
+            parent_run_id,
+            parent_tool_invocation_id: None,
+            created_sequence,
+            terminal_sequence,
+            terminal_stop_reason: status.default_terminal_stop_reason(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
 }
