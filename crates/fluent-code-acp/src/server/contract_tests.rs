@@ -125,7 +125,7 @@ async fn contract_initialize_and_session_new_negotiate_config_over_jsonl_harness
 }
 
 #[tokio::test]
-async fn contract_session_load_replays_history_and_config_over_jsonl_harness() {
+async fn contract_session_load_replay_notifications_precede_response_after_by_value_routing() {
     let temp_dir = unique_temp_dir("fluent-code-acp-contract-load");
     fs::create_dir_all(&temp_dir).unwrap();
     let store = FsSessionStore::new(temp_dir.clone());
@@ -938,6 +938,7 @@ fn running_tool_session() -> Session {
         phase: ForegroundPhase::RunningTool,
         batch_anchor_turn_id: Some(assistant_turn_id),
     });
+    session.rebuild_run_indexes();
     session
 }
 

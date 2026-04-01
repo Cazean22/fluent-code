@@ -389,28 +389,31 @@ impl OfficialAgentAdapter {
 
     async fn try_route_notification_frame(
         &self,
-        frame: &Value,
+        frame: Value,
         outbound_frames: &mut VecDeque<Value>,
-    ) -> acp::Result<FrameRouteResult> {
-        if frame.get("method").and_then(Value::as_str) == Some(SESSION_UPDATE_METHOD) {
+    ) -> acp::Result<(FrameRouteResult, Option<Value>)> {
+        let mut frame_object = match frame {
+            Value::Object(frame_object) => frame_object,
+            frame => return Ok((FrameRouteResult::NotRouted, Some(frame))),
+        };
+
+        if frame_object.get("method").and_then(Value::as_str) == Some(SESSION_UPDATE_METHOD) {
             let notification = serde_json::from_value::<acp::SessionNotification>(
-                frame
-                    .get("params")
-                    .cloned()
+                frame_object
+                    .remove("params")
                     .ok_or_else(acp::Error::internal_error)?,
             )
             .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
             self.send_session_notification(notification).await?;
-            return Ok(FrameRouteResult::Dispatched);
+            return Ok((FrameRouteResult::Dispatched, None));
         }
 
-        if frame.get("method").and_then(Value::as_str)
+        if frame_object.get("method").and_then(Value::as_str)
             == Some(SESSION_REQUEST_PERMISSION_METHOD)
         {
             let request = serde_json::from_value::<acp::RequestPermissionRequest>(
-                frame
-                    .get("params")
-                    .cloned()
+                frame_object
+                    .remove("params")
                     .ok_or_else(acp::Error::internal_error)?,
             )
             .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
@@ -419,10 +422,13 @@ impl OfficialAgentAdapter {
                 .process_permission_response(&request, client_response)
                 .await?;
             prepend_outbound_frames(outbound_frames, follow_up_frames);
-            return Ok(FrameRouteResult::PermissionFollowUp);
+            return Ok((FrameRouteResult::PermissionFollowUp, None));
         }
 
-        Ok(FrameRouteResult::NotRouted)
+        Ok((
+            FrameRouteResult::NotRouted,
+            Some(Value::Object(frame_object)),
+        ))
     }
 
     async fn process_outbound_frames<TResponse>(
@@ -436,13 +442,15 @@ impl OfficialAgentAdapter {
         let mut outbound_frames = VecDeque::from(outbound_frames);
 
         while let Some(outbound_frame) = outbound_frames.pop_front() {
-            match self
-                .try_route_notification_frame(&outbound_frame, &mut outbound_frames)
-                .await?
-            {
+            let (frame_route_result, routed_frame) = self
+                .try_route_notification_frame(outbound_frame, &mut outbound_frames)
+                .await?;
+            match frame_route_result {
                 FrameRouteResult::Dispatched | FrameRouteResult::PermissionFollowUp => continue,
                 FrameRouteResult::NotRouted => {}
             }
+
+            let outbound_frame = routed_frame.ok_or_else(acp::Error::internal_error)?;
 
             if let Some(error) = outbound_frame.get("error") {
                 let code = error
@@ -732,13 +740,15 @@ impl OfficialAgentAdapter {
         let mut outbound_frames = VecDeque::from(outbound_frames);
 
         while let Some(outbound_frame) = outbound_frames.pop_front() {
-            match self
-                .try_route_notification_frame(&outbound_frame, &mut outbound_frames)
-                .await?
-            {
+            let (frame_route_result, routed_frame) = self
+                .try_route_notification_frame(outbound_frame, &mut outbound_frames)
+                .await?;
+            match frame_route_result {
                 FrameRouteResult::Dispatched | FrameRouteResult::PermissionFollowUp => continue,
                 FrameRouteResult::NotRouted => {}
             }
+
+            let outbound_frame = routed_frame.ok_or_else(acp::Error::internal_error)?;
 
             if let Some(error) = outbound_frame.get("error") {
                 let frame_id = outbound_frame
@@ -2554,10 +2564,7 @@ fn official_prompt_text_from_blocks(
     }))
 }
 
-async fn dispatch_outbound_call(
-    connection: &acp::AgentSideConnection,
-    call: OutboundClientCall,
-) {
+async fn dispatch_outbound_call(connection: &acp::AgentSideConnection, call: OutboundClientCall) {
     match call {
         OutboundClientCall::SessionNotification { request, ack } => {
             let _ = ack.send(connection.session_notification(request).await);
@@ -4363,7 +4370,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn official_sdk_prompt_permission_request_stays_ordered_across_wake_driven_resume() {
+    async fn permission_notification_routing_preserves_follow_up_order() {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-official-permission-order");
         fs::create_dir_all(&temp_dir).unwrap();
@@ -5009,6 +5016,7 @@ mod tests {
             phase: ForegroundPhase::RunningTool,
             batch_anchor_turn_id: Some(assistant_turn_id),
         });
+        session.rebuild_run_indexes();
         session
     }
 
@@ -5262,6 +5270,7 @@ mod tests {
             phase: ForegroundPhase::Generating,
             batch_anchor_turn_id: None,
         });
+        session.rebuild_run_indexes();
         session
     }
 
