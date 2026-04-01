@@ -8,7 +8,8 @@ agent-client-protocol = "0.10.3"
 async-trait = "0.1"
 fluent-code-app = { path = "../fluent-code-app" }
 chrono.workspace = true
-crossterm.workspace = true
+crossterm = { workspace = true, features = ["event-stream"] }
+futures.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde.workspace = true

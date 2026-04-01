@@ -12,9 +12,9 @@ use fluent_code_app::error::Result;
 #[doc(hidden)]
 pub use acp::{
     AcpClientRuntime, AcpFilesystemService, AcpLaunchOptions, AcpTerminalService,
-    PendingPermissionProjection, PermissionOptionProjection, SubprocessStatus,
-    TerminalCommandProbeResponse, TranscriptSource, TuiProjectionState, bootstrap_client_for_tests,
-    initialize_default_session_for_tests,
+    PendingPermissionProjection, PermissionOptionProjection, ProjectionActivitySnapshot,
+    SubprocessStatus, TerminalCommandProbeResponse, TranscriptSource, TuiProjectionState,
+    bootstrap_client_for_tests, initialize_default_session_for_tests,
 };
 
 fn merge_run_and_restore_results(run_result: Result<()>, restore_result: Result<()>) -> Result<()> {
