@@ -5,15 +5,17 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc as StdArc;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use agent_client_protocol::{self as acp, Agent as _};
 use async_trait::async_trait;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use fluent_code_app::config::Config;
 use fluent_code_app::error::{FluentCodeError, Result};
+use futures::StreamExt;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
@@ -24,7 +26,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, oneshot};
+#[cfg(test)]
+use tokio::sync::mpsc;
+use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -36,8 +40,6 @@ use crate::theme::TUI_THEME;
 const ACP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const ACP_TEST_PROBES_ENV_VAR: &str = "FLUENT_CODE_ACP_ENABLE_TEST_PROBES";
-const PROJECTION_IDLE_INPUT_POLL: Duration = Duration::from_millis(50);
-const PROMPT_IN_FLIGHT_REDRAW_CADENCE: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TuiProjectionState {
@@ -114,6 +116,13 @@ pub enum SubprocessStatus {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SubprocessProjection {
     pub status: SubprocessStatus,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionActivitySnapshot {
+    pub projection: TuiProjectionState,
+    pub activity_sequence: u64,
 }
 
 impl TuiProjectionState {
@@ -494,21 +503,42 @@ struct ProjectionSharedState {
     pending_permission_request: Option<PendingPermissionRequest>,
     filesystem: AcpFilesystemService,
     terminal: AcpTerminalService,
+    activity_sequence: u64,
+    wake_signal: Arc<ProjectionWakeSignal>,
 }
 
 impl Default for ProjectionSharedState {
     fn default() -> Self {
         let session_roots = AcpSessionRoots::default();
+        let wake_signal = Arc::new(ProjectionWakeSignal::default());
         Self {
             projection: TuiProjectionState::default(),
             pending_permission_request: None,
             filesystem: AcpFilesystemService::with_session_roots(session_roots.clone()),
             terminal: AcpTerminalService::with_session_roots(session_roots),
+            activity_sequence: 0,
+            wake_signal,
         }
     }
 }
 
 impl ProjectionSharedState {
+    fn snapshot(&self) -> ProjectionSnapshot {
+        ProjectionSnapshot {
+            projection: self.projection.clone(),
+            activity_sequence: self.activity_sequence,
+        }
+    }
+
+    fn wake_signal(&self) -> Arc<ProjectionWakeSignal> {
+        Arc::clone(&self.wake_signal)
+    }
+
+    fn mark_activity(&mut self) {
+        self.activity_sequence = self.activity_sequence.wrapping_add(1);
+        self.wake_signal.wake();
+    }
+
     fn clear_pending_permission_request(&mut self) {
         if let Some(pending_request) = self.pending_permission_request.take() {
             let _ = pending_request
@@ -516,6 +546,7 @@ impl ProjectionSharedState {
                 .send(cancelled_permission_response());
         }
         self.projection.pending_permission = None;
+        self.mark_activity();
     }
 
     fn apply_permission_request(
@@ -534,6 +565,7 @@ impl ProjectionSharedState {
             request,
             response_sender,
         });
+        self.mark_activity();
     }
 
     fn take_pending_selection(
@@ -593,30 +625,97 @@ impl ProjectionSharedState {
         self.filesystem.register_session_cwd(session_id, cwd)
     }
 
+    fn mark_spawned(&mut self, binary_path: PathBuf, pid: u32) {
+        self.projection.mark_spawned(binary_path, pid);
+        self.mark_activity();
+    }
+
+    fn mark_initialized(
+        &mut self,
+        binary_path: PathBuf,
+        pid: u32,
+        response: &acp::InitializeResponse,
+    ) {
+        self.projection.mark_initialized(binary_path, pid, response);
+        self.mark_activity();
+    }
+
+    fn mark_startup_error(&mut self, message: String) {
+        self.projection.mark_startup_error(message);
+        self.mark_activity();
+    }
+
     fn mark_session_created(&mut self, session_id: acp::SessionId) {
         self.clear_pending_permission_request();
         self.projection.mark_session_created(session_id);
+        self.mark_activity();
     }
 
     fn prepare_session_load(&mut self, session_id: &acp::SessionId) {
         self.clear_pending_permission_request();
         self.projection.prepare_session_load(session_id);
+        self.mark_activity();
     }
 
     fn set_draft_input(&mut self, draft_input: impl Into<String>) {
         self.projection.set_draft_input(draft_input);
+        self.mark_activity();
     }
 
     fn mark_prompt_started(&mut self) {
         self.projection.mark_prompt_started();
+        self.mark_activity();
     }
 
     fn mark_prompt_finished(&mut self) {
         self.projection.mark_prompt_finished();
+        self.mark_activity();
     }
 
     fn mark_prompt_error(&mut self, message: String) {
         self.projection.mark_prompt_error(message);
+        self.mark_activity();
+    }
+
+    fn apply_session_notification(&mut self, notification: acp::SessionNotification) {
+        self.projection.apply_session_notification(notification);
+        self.mark_activity();
+    }
+
+    fn mark_external_activity(&mut self) {
+        self.mark_activity();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionSnapshot {
+    projection: TuiProjectionState,
+    activity_sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct ProjectionWakeSignal {
+    sequence: AtomicU64,
+    notify: Notify,
+}
+
+impl ProjectionWakeSignal {
+    fn wake(&self) {
+        self.sequence.fetch_add(1, Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+
+    async fn wait_for_activity(&self, observed_sequence: u64) {
+        loop {
+            let notified = self.notify.notified();
+            if self.sequence.load(Ordering::SeqCst) > observed_sequence {
+                return;
+            }
+            notified.await;
+            if self.sequence.load(Ordering::SeqCst) > observed_sequence {
+                return;
+            }
+        }
     }
 }
 
@@ -1231,6 +1330,23 @@ impl AcpClientRuntimeInner {
         self.projection.lock().await.projection.clone()
     }
 
+    async fn projection_activity_snapshot(&self) -> ProjectionActivitySnapshot {
+        let snapshot = self.projection.lock().await.snapshot();
+        ProjectionActivitySnapshot {
+            projection: snapshot.projection,
+            activity_sequence: snapshot.activity_sequence,
+        }
+    }
+
+    async fn wait_for_projection_activity(
+        &self,
+        observed_sequence: u64,
+    ) -> ProjectionActivitySnapshot {
+        let wake_signal = { self.projection.lock().await.wake_signal() };
+        wake_signal.wait_for_activity(observed_sequence).await;
+        self.projection_activity_snapshot().await
+    }
+
     async fn register_session_cwd(
         &self,
         session_id: acp::SessionId,
@@ -1299,7 +1415,6 @@ impl AcpClientRuntimeInner {
         self.projection
             .lock()
             .await
-            .projection
             .apply_session_notification(args);
         Ok(())
     }
@@ -1453,6 +1568,21 @@ impl AcpClientRuntime {
 
     pub async fn projection_snapshot(&self) -> TuiProjectionState {
         self.inner.projection_snapshot().await
+    }
+
+    #[doc(hidden)]
+    pub async fn projection_activity_snapshot_for_tests(&self) -> ProjectionActivitySnapshot {
+        self.inner.projection_activity_snapshot().await
+    }
+
+    #[doc(hidden)]
+    pub async fn wait_for_projection_activity_for_tests(
+        &self,
+        observed_sequence: u64,
+    ) -> ProjectionActivitySnapshot {
+        self.inner
+            .wait_for_projection_activity(observed_sequence)
+            .await
     }
 
     #[doc(hidden)]
@@ -1738,7 +1868,6 @@ async fn run_projection_client(terminal: &mut terminal::AppTerminal) -> Result<(
                 projection
                     .lock()
                     .await
-                    .projection
                     .mark_startup_error(error.to_string());
                 None
             }
@@ -1750,7 +1879,6 @@ async fn run_projection_client(terminal: &mut terminal::AppTerminal) -> Result<(
         projection
             .lock()
             .await
-            .projection
             .mark_startup_error(error.to_string());
     }
 
@@ -1824,15 +1952,12 @@ async fn run_projection_loop(
     terminal: &mut terminal::AppTerminal,
     controller: &mut ProjectionController,
 ) -> Result<()> {
+    let mut input = ProjectionLoopInput::spawn()?;
     loop {
-        if run_projection_iteration(
-            controller,
-            |snapshot| {
-                terminal.draw(|frame| render_projection(frame, snapshot))?;
-                Ok(())
-            },
-            next_projection_action,
-        )
+        if run_projection_iteration(controller, &mut input, |snapshot| {
+            terminal.draw(|frame| render_projection(frame, snapshot))?;
+            Ok(())
+        })
         .await?
         {
             break;
@@ -1842,19 +1967,37 @@ async fn run_projection_loop(
     Ok(())
 }
 
-async fn run_projection_iteration<Draw, NextAction>(
+async fn run_projection_iteration<Draw>(
     controller: &mut ProjectionController,
+    input: &mut ProjectionLoopInput,
     draw: Draw,
-    next_action: NextAction,
 ) -> Result<bool>
 where
     Draw: FnOnce(&TuiProjectionState) -> Result<()>,
-    NextAction: FnOnce(&TuiProjectionState) -> Result<ProjectionAction>,
 {
     controller.poll_active_prompt().await?;
     let snapshot = controller.snapshot().await;
-    draw(&snapshot)?;
-    apply_projection_action(controller, next_action(&snapshot)?).await
+    draw(&snapshot.projection)?;
+    let action = wait_for_projection_action(controller, input, &snapshot).await?;
+    apply_projection_action(controller, action).await
+}
+
+async fn wait_for_projection_action(
+    controller: &ProjectionController,
+    input: &mut ProjectionLoopInput,
+    snapshot: &ProjectionSnapshot,
+) -> Result<ProjectionAction> {
+    let activity_wait = controller.wait_for_activity(snapshot.activity_sequence);
+    tokio::pin!(activity_wait);
+
+    let input_wait = input.next_event();
+    tokio::pin!(input_wait);
+
+    tokio::select! {
+        biased;
+        () = &mut activity_wait => Ok(ProjectionAction::None),
+        event = &mut input_wait => Ok(projection_action_from_event(&snapshot.projection, event?)),
+    }
 }
 
 async fn apply_projection_action(
@@ -2095,7 +2238,6 @@ async fn bootstrap_client(
     projection
         .lock()
         .await
-        .projection
         .mark_spawned(options.binary_path.clone(), pid);
 
     let stdin = child.stdin.take().ok_or_else(|| {
@@ -2165,7 +2307,7 @@ async fn bootstrap_client(
         }
     };
 
-    projection.lock().await.projection.mark_initialized(
+    projection.lock().await.mark_initialized(
         options.binary_path.clone(),
         pid,
         &initialize_response,
@@ -2208,13 +2350,8 @@ enum ProjectionAction {
     CancelActivePrompt,
 }
 
-fn next_projection_action(snapshot: &TuiProjectionState) -> Result<ProjectionAction> {
-    if !event::poll(projection_poll_timeout(snapshot))? {
-        return Ok(ProjectionAction::None);
-    }
-
-    let event = event::read()?;
-    Ok(match event {
+fn projection_action_from_event(snapshot: &TuiProjectionState, event: Event) -> ProjectionAction {
+    match event {
         Event::Paste(text) if snapshot.can_edit_draft() => {
             let mut next = snapshot.draft_input.clone();
             next.push_str(&text);
@@ -2243,14 +2380,6 @@ fn next_projection_action(snapshot: &TuiProjectionState) -> Result<ProjectionAct
             }
         }
         _ => ProjectionAction::None,
-    })
-}
-
-fn projection_poll_timeout(snapshot: &TuiProjectionState) -> Duration {
-    if snapshot.prompt_in_flight {
-        PROMPT_IN_FLIGHT_REDRAW_CADENCE
-    } else {
-        PROJECTION_IDLE_INPUT_POLL
     }
 }
 
@@ -2368,8 +2497,13 @@ impl ProjectionController {
         self.runtime
     }
 
-    async fn snapshot(&self) -> TuiProjectionState {
-        self.projection.lock().await.projection.clone()
+    async fn snapshot(&self) -> ProjectionSnapshot {
+        self.projection.lock().await.snapshot()
+    }
+
+    async fn wait_for_activity(&self, observed_sequence: u64) {
+        let wake_signal = { self.projection.lock().await.wake_signal() };
+        wake_signal.wait_for_activity(observed_sequence).await;
     }
 
     async fn set_draft_input(&self, draft_input: impl Into<String>) {
@@ -2426,13 +2560,16 @@ impl ProjectionController {
 
         let connection = StdArc::clone(&runtime.connection);
         let prompt_session_id = session_id.clone();
+        let projection = Arc::clone(&self.projection);
         let task = tokio::task::spawn_local(async move {
-            connection
+            let result = connection
                 .prompt(acp::PromptRequest::new(
                     prompt_session_id,
                     vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
                 ))
-                .await
+                .await;
+            projection.lock().await.mark_external_activity();
+            result
         });
         self.active_prompt = Some(ActivePromptRequest { task, session_id });
         Ok(())
@@ -2488,6 +2625,47 @@ impl ProjectionController {
         }
 
         Ok(())
+    }
+}
+
+struct ProjectionLoopInput {
+    source: ProjectionLoopInputSource,
+}
+
+enum ProjectionLoopInputSource {
+    Stream(EventStream),
+    #[cfg(test)]
+    Receiver(mpsc::UnboundedReceiver<std::io::Result<Event>>),
+}
+
+impl ProjectionLoopInput {
+    fn spawn() -> Result<Self> {
+        Ok(Self {
+            source: ProjectionLoopInputSource::Stream(EventStream::new()),
+        })
+    }
+
+    #[cfg(test)]
+    fn from_receiver(receiver: mpsc::UnboundedReceiver<std::io::Result<Event>>) -> Self {
+        Self {
+            source: ProjectionLoopInputSource::Receiver(receiver),
+        }
+    }
+
+    async fn next_event(&mut self) -> Result<Event> {
+        let next_event = match &mut self.source {
+            ProjectionLoopInputSource::Stream(stream) => stream.next().await,
+            #[cfg(test)]
+            ProjectionLoopInputSource::Receiver(receiver) => receiver.recv().await,
+        };
+
+        match next_event {
+            Some(Ok(event)) => Ok(event),
+            Some(Err(error)) => Err(error.into()),
+            None => Err(FluentCodeError::Provider(
+                "ACP projection input pump stopped unexpectedly".to_string(),
+            )),
+        }
     }
 }
 
@@ -2665,6 +2843,8 @@ pub(crate) async fn assert_projection_loop_redraws_stream_updates_without_waitin
     let projection = Arc::new(Mutex::new(ProjectionSharedState::default()));
     let mut controller =
         ProjectionController::new(Arc::clone(&projection), None, PathBuf::default());
+    let (input_sender, input_receiver) = mpsc::unbounded_channel();
+    let mut input = ProjectionLoopInput::from_receiver(input_receiver);
 
     {
         let mut state = projection.lock().await;
@@ -2691,9 +2871,10 @@ pub(crate) async fn assert_projection_loop_redraws_stream_updates_without_waitin
     }
 
     let redraw_happened = AtomicBool::new(false);
-    let should_quit = run_projection_iteration(
-        &mut controller,
-        |snapshot| {
+    let projection_for_wake = Arc::clone(&projection);
+    let should_quit = timeout(
+        Duration::from_millis(100),
+        run_projection_iteration(&mut controller, &mut input, |snapshot| {
             let agent_rows = snapshot
                 .transcript_rows
                 .iter()
@@ -2703,19 +2884,27 @@ pub(crate) async fn assert_projection_loop_redraws_stream_updates_without_waitin
             assert_eq!(agent_rows[0].content, "Mock assistant response");
             assert!(snapshot.prompt_in_flight);
             redraw_happened.store(true, Ordering::SeqCst);
-            Ok(())
-        },
-        |_snapshot| {
-            assert!(
-                redraw_happened.load(Ordering::SeqCst),
-                "expected redraw to happen before the loop handed control to the input poll"
-            );
-            Ok(ProjectionAction::Quit)
-        },
-    )
-    .await?;
 
-    assert!(should_quit);
+            let projection_for_wake = Arc::clone(&projection_for_wake);
+            tokio::spawn(async move {
+                projection_for_wake.lock().await.mark_external_activity();
+            });
+            Ok(())
+        }),
+    )
+    .await
+    .map_err(|_| {
+        FluentCodeError::Provider(
+            "timed out waiting for the ACP redraw loop to react to projection activity".to_string(),
+        )
+    })??;
+
+    drop(input_sender);
+    assert!(!should_quit);
+    assert!(
+        redraw_happened.load(Ordering::SeqCst),
+        "expected streamed ACP output to redraw before the loop waited on any terminal input"
+    );
     Ok(())
 }
 
@@ -2735,6 +2924,35 @@ pub(crate) async fn assert_projection_state_flushes_terminal_stream_updates_imme
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
+pub(crate) async fn assert_projection_wait_path_stays_idle_until_activity_wake() -> Result<()> {
+    let projection = Arc::new(Mutex::new(ProjectionSharedState::default()));
+    let wake_signal = { projection.lock().await.wake_signal() };
+    let wait_task = tokio::spawn(async move {
+        wake_signal.wait_for_activity(0).await;
+    });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !wait_task.is_finished(),
+        "expected the ACP projection wait path to remain idle until projection activity arrives"
+    );
+
+    projection.lock().await.mark_external_activity();
+    timeout(Duration::from_millis(100), wait_task)
+        .await
+        .map_err(|_| {
+            FluentCodeError::Provider(
+                "timed out waiting for the ACP projection wait path to wake after activity"
+                    .to_string(),
+            )
+        })?
+        .expect("projection wait task should join cleanly");
+
+    Ok(())
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 enum PromptTerminalOutcome {
     Done,
@@ -2749,6 +2967,8 @@ async fn assert_projection_state_flushes_terminal_stream_updates_immediately_for
     let projection = Arc::new(Mutex::new(ProjectionSharedState::default()));
     let mut controller =
         ProjectionController::new(Arc::clone(&projection), None, PathBuf::default());
+    let (input_sender, input_receiver) = mpsc::unbounded_channel();
+    let mut input = ProjectionLoopInput::from_receiver(input_receiver);
 
     {
         let mut state = projection.lock().await;
@@ -2785,11 +3005,23 @@ async fn assert_projection_state_flushes_terminal_stream_updates_immediately_for
         }),
     });
     tokio::task::yield_now().await;
+    input_sender
+        .send(Ok(Event::Key(crossterm::event::KeyEvent {
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        })))
+        .map_err(|_| {
+            FluentCodeError::Provider(
+                "failed to queue the ACP projection quit input for the regression test".to_string(),
+            )
+        })?;
 
     let redraw_happened = AtomicBool::new(false);
-    let should_quit = run_projection_iteration(
-        &mut controller,
-        |snapshot| {
+    let should_quit = timeout(
+        Duration::from_millis(100),
+        run_projection_iteration(&mut controller, &mut input, |snapshot| {
             assert!(
                 !snapshot.prompt_in_flight,
                 "expected {outcome:?} prompt completion to flush the terminal projection before waiting for more input"
@@ -2820,18 +3052,22 @@ async fn assert_projection_state_flushes_terminal_stream_updates_immediately_for
             }
             redraw_happened.store(true, Ordering::SeqCst);
             Ok(())
-        },
-        |_snapshot| {
-            assert!(
-                redraw_happened.load(Ordering::SeqCst),
-                "expected the final {outcome:?} terminal-state redraw to happen before the next input wait"
-            );
-            Ok(ProjectionAction::Quit)
-        },
+        }),
     )
-    .await?;
+    .await
+    .map_err(|_| {
+        FluentCodeError::Provider(
+            format!(
+                "timed out waiting for the final {outcome:?} ACP prompt state to flush"
+            ),
+        )
+    })??;
 
     assert!(should_quit);
+    assert!(
+        redraw_happened.load(Ordering::SeqCst),
+        "expected the final {outcome:?} terminal-state redraw to happen before the queued quit input was handled"
+    );
     assert!(
         controller.active_prompt.is_none(),
         "expected polling the {outcome:?} prompt terminal outcome to clear the active prompt handle"

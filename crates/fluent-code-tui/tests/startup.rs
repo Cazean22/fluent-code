@@ -15,12 +15,13 @@ use fluent_code_app::session::model::{
 };
 use fluent_code_app::session::store::{FsSessionStore, SessionStore};
 use fluent_code_tui::{
-    AcpFilesystemService, AcpLaunchOptions, AcpTerminalService, SubprocessStatus, TranscriptSource,
-    bootstrap_client_for_tests, initialize_default_session_for_tests,
-    run_with_terminal_hooks_for_tests,
+    AcpFilesystemService, AcpLaunchOptions, AcpTerminalService, ProjectionActivitySnapshot,
+    SubprocessStatus, TranscriptSource, bootstrap_client_for_tests,
+    initialize_default_session_for_tests, run_with_terminal_hooks_for_tests,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 #[allow(dead_code)]
 #[path = "../src/acp.rs"]
@@ -605,6 +606,13 @@ async fn projection_state_flushes_terminal_stream_updates_immediately() {
 }
 
 #[tokio::test]
+async fn projection_wait_path_stays_idle_until_activity_wake() {
+    acp_projection_regression::assert_projection_wait_path_stays_idle_until_activity_wake()
+        .await
+        .expect("projection idle-wait regression helper to pass");
+}
+
+#[tokio::test]
 async fn tui_permission_and_tool_lifecycle_use_acp_end_to_end() {
     let _guard = startup_subprocess_test_lock().lock().await;
     let root = unique_test_dir();
@@ -983,42 +991,34 @@ fn build_acp_binary() -> PathBuf {
 async fn wait_for_pending_permission(
     runtime: &fluent_code_tui::AcpClientRuntime,
 ) -> fluent_code_tui::PendingPermissionProjection {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let snapshot = runtime.projection_snapshot().await;
-        if let Some(permission) = snapshot.pending_permission {
-            return permission;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for ACP permission request to reach the TUI projection"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_for_projection_match(
+        runtime,
+        "an ACP permission request to reach the TUI projection",
+        |snapshot| snapshot.pending_permission.is_some(),
+    )
+    .await
+    .pending_permission
+    .expect("wait helper should only return after a permission is projected")
 }
 
 async fn wait_for_agent_transcript_content(
     runtime: &fluent_code_tui::AcpClientRuntime,
     needle: &str,
 ) -> fluent_code_tui::TuiProjectionState {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let snapshot = runtime.projection_snapshot().await;
-        let combined_agent_text = snapshot
-            .transcript_rows
-            .iter()
-            .filter(|row| row.source == TranscriptSource::Agent)
-            .map(|row| row.content.as_str())
-            .collect::<String>();
-        if combined_agent_text.contains(needle) {
-            return snapshot;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for an ACP agent transcript chunk containing `{needle}`"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_for_projection_match(
+        runtime,
+        &format!("an ACP agent transcript chunk containing `{needle}`"),
+        |snapshot| {
+            snapshot
+                .transcript_rows
+                .iter()
+                .filter(|row| row.source == TranscriptSource::Agent)
+                .map(|row| row.content.as_str())
+                .collect::<String>()
+                .contains(needle)
+        },
+    )
+    .await
 }
 
 async fn wait_for_monotonic_in_flight_agent_transcript_growth(
@@ -1028,10 +1028,11 @@ async fn wait_for_monotonic_in_flight_agent_transcript_growth(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let mut snapshots = Vec::new();
     let mut last_content = String::new();
+    let mut snapshot = runtime.projection_activity_snapshot_for_tests().await;
 
     loop {
-        let snapshot = runtime.projection_snapshot().await;
         let agent_rows = snapshot
+            .projection
             .transcript_rows
             .iter()
             .filter(|row| row.source == TranscriptSource::Agent)
@@ -1048,7 +1049,7 @@ async fn wait_for_monotonic_in_flight_agent_transcript_growth(
                 }
 
                 if content.len() > last_content.len() {
-                    snapshots.push(snapshot.clone());
+                    snapshots.push(snapshot.projection.clone());
                     last_content = content.to_string();
                     if snapshots.len() == 2 {
                         return snapshots;
@@ -1061,7 +1062,11 @@ async fn wait_for_monotonic_in_flight_agent_transcript_growth(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for successive in-flight ACP transcript growth before completion"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        snapshot = wait_for_projection_activity(runtime, snapshot, deadline, || {
+            "successive in-flight ACP transcript growth before completion".to_string()
+        })
+        .await;
     }
 }
 
@@ -1069,40 +1074,73 @@ async fn wait_for_tool_status(
     runtime: &fluent_code_tui::AcpClientRuntime,
     expected_status: &str,
 ) -> fluent_code_tui::TuiProjectionState {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let snapshot = runtime.projection_snapshot().await;
-        if snapshot
-            .tool_statuses
-            .iter()
-            .any(|status| status.status == expected_status)
-        {
-            return snapshot;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for ACP tool status `{expected_status}`"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_for_projection_match(
+        runtime,
+        &format!("ACP tool status `{expected_status}`"),
+        |snapshot| {
+            snapshot
+                .tool_statuses
+                .iter()
+                .any(|status| status.status == expected_status)
+        },
+    )
+    .await
 }
 
 async fn wait_for_projected_session(
     runtime: &fluent_code_tui::AcpClientRuntime,
     session_id: &str,
 ) -> fluent_code_tui::TuiProjectionState {
+    wait_for_projection_match(
+        runtime,
+        &format!("ACP load replay to project session `{session_id}`"),
+        |snapshot| snapshot.session.session_id.as_deref() == Some(session_id),
+    )
+    .await
+}
+
+async fn wait_for_projection_match<F>(
+    runtime: &fluent_code_tui::AcpClientRuntime,
+    description: &str,
+    predicate: F,
+) -> fluent_code_tui::TuiProjectionState
+where
+    F: Fn(&fluent_code_tui::TuiProjectionState) -> bool,
+{
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut snapshot = runtime.projection_activity_snapshot_for_tests().await;
+
     loop {
-        let snapshot = runtime.projection_snapshot().await;
-        if snapshot.session.session_id.as_deref() == Some(session_id) {
-            return snapshot;
+        if predicate(&snapshot.projection) {
+            return snapshot.projection;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for ACP load replay to project session `{session_id}`"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        snapshot =
+            wait_for_projection_activity(runtime, snapshot, deadline, || description.to_string())
+                .await;
     }
+}
+
+async fn wait_for_projection_activity<Describe>(
+    runtime: &fluent_code_tui::AcpClientRuntime,
+    snapshot: ProjectionActivitySnapshot,
+    deadline: tokio::time::Instant,
+    describe: Describe,
+) -> ProjectionActivitySnapshot
+where
+    Describe: FnOnce() -> String,
+{
+    let description = describe();
+    let remaining = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_else(|| panic!("timed out waiting for {description}"));
+
+    timeout(
+        remaining,
+        runtime.wait_for_projection_activity_for_tests(snapshot.activity_sequence),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {description}"))
 }
 
 fn workspace_root() -> PathBuf {
