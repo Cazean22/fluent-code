@@ -40,6 +40,7 @@ use crate::theme::TUI_THEME;
 const ACP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const ACP_TEST_PROBES_ENV_VAR: &str = "FLUENT_CODE_ACP_ENABLE_TEST_PROBES";
+const PROJECTION_ACTIVITY_BURST_DRAIN_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TuiProjectionState {
@@ -701,18 +702,18 @@ struct ProjectionWakeSignal {
 
 impl ProjectionWakeSignal {
     fn wake(&self) {
-        self.sequence.fetch_add(1, Ordering::SeqCst);
+        self.sequence.fetch_add(1, Ordering::Release);
         self.notify.notify_one();
     }
 
     async fn wait_for_activity(&self, observed_sequence: u64) {
         loop {
             let notified = self.notify.notified();
-            if self.sequence.load(Ordering::SeqCst) > observed_sequence {
+            if self.sequence.load(Ordering::Acquire) > observed_sequence {
                 return;
             }
             notified.await;
-            if self.sequence.load(Ordering::SeqCst) > observed_sequence {
+            if self.sequence.load(Ordering::Acquire) > observed_sequence {
                 return;
             }
         }
@@ -1978,15 +1979,26 @@ where
     controller.poll_active_prompt().await?;
     let snapshot = controller.snapshot().await;
     draw(&snapshot.projection)?;
-    let action = wait_for_projection_action(controller, input, &snapshot).await?;
-    apply_projection_action(controller, action).await
+    match wait_for_projection_action(controller, input, &snapshot).await? {
+        ProjectionWaitOutcome::Activity => {
+            drain_projection_activity_burst(controller, snapshot.activity_sequence).await?;
+            apply_projection_action(controller, ProjectionAction::None).await
+        }
+        ProjectionWaitOutcome::Action(action) => apply_projection_action(controller, action).await,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectionWaitOutcome {
+    Activity,
+    Action(ProjectionAction),
 }
 
 async fn wait_for_projection_action(
     controller: &ProjectionController,
     input: &mut ProjectionLoopInput,
     snapshot: &ProjectionSnapshot,
-) -> Result<ProjectionAction> {
+) -> Result<ProjectionWaitOutcome> {
     let activity_wait = controller.wait_for_activity(snapshot.activity_sequence);
     tokio::pin!(activity_wait);
 
@@ -1995,9 +2007,30 @@ async fn wait_for_projection_action(
 
     tokio::select! {
         biased;
-        () = &mut activity_wait => Ok(ProjectionAction::None),
-        event = &mut input_wait => Ok(projection_action_from_event(&snapshot.projection, event?)),
+        () = &mut activity_wait => Ok(ProjectionWaitOutcome::Activity),
+        event = &mut input_wait => Ok(ProjectionWaitOutcome::Action(
+            projection_action_from_event(&snapshot.projection, event?)
+        )),
     }
+}
+
+async fn drain_projection_activity_burst(
+    controller: &mut ProjectionController,
+    mut observed_sequence: u64,
+) -> Result<()> {
+    for _ in 0..PROJECTION_ACTIVITY_BURST_DRAIN_LIMIT {
+        tokio::task::yield_now().await;
+        controller.poll_active_prompt().await?;
+
+        let latest_sequence = controller.activity_sequence().await;
+        if latest_sequence == observed_sequence {
+            break;
+        }
+
+        observed_sequence = latest_sequence;
+    }
+
+    Ok(())
 }
 
 async fn apply_projection_action(
@@ -2501,6 +2534,10 @@ impl ProjectionController {
         self.projection.lock().await.snapshot()
     }
 
+    async fn activity_sequence(&self) -> u64 {
+        self.projection.lock().await.activity_sequence
+    }
+
     async fn wait_for_activity(&self, observed_sequence: u64) {
         let wake_signal = { self.projection.lock().await.wake_signal() };
         wake_signal.wait_for_activity(observed_sequence).await;
@@ -2924,6 +2961,160 @@ pub(crate) async fn assert_projection_state_flushes_terminal_stream_updates_imme
 }
 
 #[cfg(test)]
+fn regression_agent_message_chunk(text: &str) -> acp::SessionNotification {
+    acp::SessionNotification::new(
+        "session-1",
+        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
+            acp::TextContent::new(text),
+        ))),
+    )
+}
+
+#[cfg(test)]
+fn quit_key_event() -> Event {
+    Event::Key(crossterm::event::KeyEvent {
+        code: KeyCode::Char('q'),
+        modifiers: KeyModifiers::NONE,
+        kind: KeyEventKind::Press,
+        state: crossterm::event::KeyEventState::NONE,
+    })
+}
+
+#[cfg(test)]
+pub(crate) async fn assert_projection_loop_batches_notifications_without_starving_input()
+-> Result<()> {
+    let projection = Arc::new(Mutex::new(ProjectionSharedState::default()));
+    let mut controller =
+        ProjectionController::new(Arc::clone(&projection), None, PathBuf::default());
+    let (input_sender, input_receiver) = mpsc::unbounded_channel();
+    let mut input = ProjectionLoopInput::from_receiver(input_receiver);
+
+    {
+        let mut state = projection.lock().await;
+        state
+            .projection
+            .mark_session_created(acp::SessionId::new("session-1"));
+    }
+
+    let draw_count = AtomicU64::new(0);
+    let projection_for_burst = Arc::clone(&projection);
+    let input_sender_for_burst = input_sender.clone();
+    let should_quit = timeout(
+        Duration::from_millis(100),
+        run_projection_iteration(&mut controller, &mut input, |snapshot| {
+            assert_eq!(draw_count.fetch_add(1, Ordering::SeqCst), 0);
+            assert!(snapshot.transcript_rows.is_empty());
+
+            let projection_for_burst = Arc::clone(&projection_for_burst);
+            let input_sender_for_burst = input_sender_for_burst.clone();
+            tokio::spawn(async move {
+                let _ = input_sender_for_burst.send(Ok(quit_key_event()));
+                for chunk in ["burst ", "activity ", "done"] {
+                    projection_for_burst
+                        .lock()
+                        .await
+                        .apply_session_notification(regression_agent_message_chunk(chunk));
+                    tokio::task::yield_now().await;
+                }
+            });
+            Ok(())
+        }),
+    )
+    .await
+    .map_err(|_| {
+        FluentCodeError::Provider(
+            "timed out waiting for the projection loop to coalesce a burst notification wake"
+                .to_string(),
+        )
+    })??;
+
+    assert!(!should_quit);
+
+    let should_quit = timeout(
+        Duration::from_millis(100),
+        run_projection_iteration(&mut controller, &mut input, |snapshot| {
+            assert_eq!(draw_count.fetch_add(1, Ordering::SeqCst), 1);
+            assert_eq!(
+                snapshot.transcript_rows,
+                vec![TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: "burst activity done".to_string(),
+                }]
+            );
+            Ok(())
+        }),
+    )
+    .await
+    .map_err(|_| {
+        FluentCodeError::Provider(
+            "timed out waiting for the projection loop to redraw the coalesced burst snapshot"
+                .to_string(),
+        )
+    })??;
+
+    assert!(should_quit);
+    assert_eq!(draw_count.load(Ordering::SeqCst), 2);
+
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn assert_projection_wake_does_not_miss_activity_with_release_acquire_ordering()
+-> Result<()> {
+    let wake_signal = ProjectionWakeSignal::default();
+
+    wake_signal.wake();
+    wake_signal.notify.notified().await;
+
+    timeout(Duration::from_millis(100), wake_signal.wait_for_activity(0))
+        .await
+        .map_err(|_| {
+            FluentCodeError::Provider(
+                "timed out waiting for stale activity to be observed after its wake permit was consumed"
+                    .to_string(),
+            )
+        })?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn assert_projection_wait_for_activity_still_blocks_without_new_sequence()
+-> Result<()> {
+    let wake_signal = Arc::new(ProjectionWakeSignal::default());
+
+    wake_signal.wake();
+    wake_signal.notify.notified().await;
+
+    let observed_sequence = wake_signal.sequence.load(Ordering::Acquire);
+    let wait_signal = Arc::clone(&wake_signal);
+    let wait_task = tokio::spawn(async move {
+        wait_signal.wait_for_activity(observed_sequence).await;
+    });
+
+    tokio::task::yield_now().await;
+    if wait_task.is_finished() {
+        return Err(FluentCodeError::Provider(
+            "projection wait_for_activity should remain blocked until a newer activity sequence arrives"
+                .to_string(),
+        ));
+    }
+
+    wake_signal.wake();
+    timeout(Duration::from_millis(100), wait_task)
+        .await
+        .map_err(|_| {
+            FluentCodeError::Provider(
+                "timed out waiting for wait_for_activity to resume after a newer activity sequence"
+                    .to_string(),
+            )
+        })?
+        .expect("projection wait task should join cleanly");
+
+    Ok(())
+}
+
+#[cfg(test)]
 #[allow(dead_code)]
 pub(crate) async fn assert_projection_wait_path_stays_idle_until_activity_wake() -> Result<()> {
     let projection = Arc::new(Mutex::new(ProjectionSharedState::default()));
@@ -3072,6 +3263,110 @@ async fn assert_projection_state_flushes_terminal_stream_updates_immediately_for
         controller.active_prompt.is_none(),
         "expected polling the {outcome:?} prompt terminal outcome to clear the active prompt handle"
     );
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn assert_projection_loop_flushes_terminal_update_before_queued_quit_under_burst_activity()
+-> Result<()> {
+    let projection = Arc::new(Mutex::new(ProjectionSharedState::default()));
+    let mut controller =
+        ProjectionController::new(Arc::clone(&projection), None, PathBuf::default());
+    let (input_sender, input_receiver) = mpsc::unbounded_channel();
+    let mut input = ProjectionLoopInput::from_receiver(input_receiver);
+
+    {
+        let mut state = projection.lock().await;
+        state
+            .projection
+            .mark_session_created(acp::SessionId::new("session-1"));
+        state.projection.mark_prompt_started();
+        state.apply_session_notification(regression_agent_message_chunk("streamed "));
+    }
+
+    let projection_for_prompt = Arc::clone(&projection);
+    controller.active_prompt = Some(ActivePromptRequest {
+        session_id: acp::SessionId::new("session-1"),
+        task: tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            projection_for_prompt.lock().await.mark_external_activity();
+            Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+        }),
+    });
+
+    let draw_count = AtomicU64::new(0);
+    let projection_for_burst = Arc::clone(&projection);
+    let input_sender_for_burst = input_sender.clone();
+    let should_quit = timeout(
+        Duration::from_millis(100),
+        run_projection_iteration(&mut controller, &mut input, |snapshot| {
+            assert_eq!(draw_count.fetch_add(1, Ordering::SeqCst), 0);
+            assert!(snapshot.prompt_in_flight);
+            assert_eq!(
+                snapshot.transcript_rows,
+                vec![TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: "streamed ".to_string(),
+                }]
+            );
+
+            let projection_for_burst = Arc::clone(&projection_for_burst);
+            let input_sender_for_burst = input_sender_for_burst.clone();
+            tokio::spawn(async move {
+                let _ = input_sender_for_burst.send(Ok(quit_key_event()));
+                for chunk in ["final ", "response"] {
+                    projection_for_burst
+                        .lock()
+                        .await
+                        .apply_session_notification(regression_agent_message_chunk(chunk));
+                    tokio::task::yield_now().await;
+                }
+            });
+            Ok(())
+        }),
+    )
+    .await
+    .map_err(|_| {
+        FluentCodeError::Provider(
+            "timed out waiting for the burst activity wake before the queued quit input"
+                .to_string(),
+        )
+    })??;
+
+    assert!(!should_quit);
+
+    let should_quit = timeout(
+        Duration::from_millis(100),
+        run_projection_iteration(&mut controller, &mut input, |snapshot| {
+            assert_eq!(draw_count.fetch_add(1, Ordering::SeqCst), 1);
+            assert!(
+                !snapshot.prompt_in_flight,
+                "expected the prompt completion to flush before the queued quit was applied"
+            );
+            assert!(snapshot.prompt_error.is_none());
+            assert_eq!(
+                snapshot.transcript_rows,
+                vec![TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: "streamed final response".to_string(),
+                }]
+            );
+            Ok(())
+        }),
+    )
+    .await
+    .map_err(|_| {
+        FluentCodeError::Provider(
+            "timed out waiting for the prompt completion snapshot to flush under burst activity"
+                .to_string(),
+        )
+    })??;
+
+    assert!(should_quit);
+    assert_eq!(draw_count.load(Ordering::SeqCst), 2);
+    assert!(controller.active_prompt.is_none());
+
     Ok(())
 }
 
@@ -3357,6 +3652,36 @@ mod tests {
         assert_projection_state_flushes_terminal_stream_updates_immediately()
             .await
             .expect("projection iteration to flush the terminal-state snapshot");
+    }
+
+    #[tokio::test]
+    async fn projection_loop_batches_notifications_without_starving_input() {
+        assert_projection_loop_batches_notifications_without_starving_input()
+            .await
+            .expect("projection iteration to batch burst notifications without starving input");
+    }
+
+    #[tokio::test]
+    async fn projection_wake_does_not_miss_activity_with_release_acquire_ordering() {
+        assert_projection_wake_does_not_miss_activity_with_release_acquire_ordering()
+            .await
+            .expect(
+                "stale activity should still be observed after the stored wake permit is consumed",
+            );
+    }
+
+    #[tokio::test]
+    async fn projection_wait_for_activity_still_blocks_without_new_sequence() {
+        assert_projection_wait_for_activity_still_blocks_without_new_sequence()
+            .await
+            .expect("wait_for_activity should remain blocked until a newer sequence is published");
+    }
+
+    #[tokio::test]
+    async fn projection_loop_flushes_terminal_update_before_queued_quit_under_burst_activity() {
+        assert_projection_loop_flushes_terminal_update_before_queued_quit_under_burst_activity()
+            .await
+            .expect("projection iteration to flush the final prompt snapshot before queued quit under burst activity");
     }
 
     #[test]

@@ -606,10 +606,39 @@ async fn projection_state_flushes_terminal_stream_updates_immediately() {
 }
 
 #[tokio::test]
+async fn projection_loop_batches_notifications_without_starving_input() {
+    acp_projection_regression::assert_projection_loop_batches_notifications_without_starving_input(
+    )
+    .await
+    .expect("projection burst-coalescing regression helper to pass");
+}
+
+#[tokio::test]
 async fn projection_wait_path_stays_idle_until_activity_wake() {
     acp_projection_regression::assert_projection_wait_path_stays_idle_until_activity_wake()
         .await
         .expect("projection idle-wait regression helper to pass");
+}
+
+#[tokio::test]
+async fn projection_wake_does_not_miss_activity_with_release_acquire_ordering() {
+    acp_projection_regression::assert_projection_wake_does_not_miss_activity_with_release_acquire_ordering()
+        .await
+        .expect("projection wake ordering regression helper to pass");
+}
+
+#[tokio::test]
+async fn projection_wait_for_activity_still_blocks_without_new_sequence() {
+    acp_projection_regression::assert_projection_wait_for_activity_still_blocks_without_new_sequence()
+        .await
+        .expect("projection wait ordering regression helper to pass");
+}
+
+#[tokio::test]
+async fn projection_loop_flushes_terminal_update_before_queued_quit_under_burst_activity() {
+    acp_projection_regression::assert_projection_loop_flushes_terminal_update_before_queued_quit_under_burst_activity()
+        .await
+        .expect("projection burst flush regression helper to pass");
 }
 
 #[tokio::test]
@@ -1334,6 +1363,7 @@ fn interrupted_delegation_fixture() -> StartupRecoveryFixture {
         approved_at: Some(Utc::now()),
         completed_at: None,
     });
+    session.rebuild_run_indexes();
 
     StartupRecoveryFixture {
         session,
