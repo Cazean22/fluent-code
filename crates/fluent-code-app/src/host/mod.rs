@@ -755,6 +755,7 @@ mod tests {
             approved_at: Some(Utc::now()),
             completed_at: None,
         });
+        session.rebuild_run_indexes();
         session
     }
 

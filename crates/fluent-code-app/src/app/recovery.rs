@@ -312,6 +312,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
+        session.rebuild_run_indexes();
         let turn_sequence = session.allocate_replay_sequence();
         session.turns.push(Turn {
             id: Uuid::new_v4(),
@@ -346,6 +347,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
+        session.rebuild_run_indexes();
         let user_turn_sequence = session.allocate_replay_sequence();
         session.turns.push(Turn {
             id: Uuid::new_v4(),
@@ -480,6 +482,7 @@ mod tests {
             approved_at: Some(Utc::now()),
             completed_at: None,
         });
+        session.rebuild_run_indexes();
         if include_owner {
             session.foreground_owner = Some(ForegroundOwnerRecord {
                 run_id: child_run_id,

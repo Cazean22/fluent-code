@@ -559,6 +559,7 @@ mod tests {
             .session
             .runs
             .retain(|run| run.id != fixture.child_run_id);
+        fixture.state.session.rebuild_run_indexes();
 
         let effects = recover_interrupted_delegated_child(&mut fixture.state);
 
@@ -617,6 +618,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
+        fixture.state.session.rebuild_run_indexes();
 
         let effects = recover_interrupted_delegated_child(&mut fixture.state);
 
@@ -769,6 +771,7 @@ mod tests {
             approved_at: Some(Utc::now()),
             completed_at: None,
         });
+        session.rebuild_run_indexes();
 
         StartupRecoveryFixture {
             state: AppState::new(session),
