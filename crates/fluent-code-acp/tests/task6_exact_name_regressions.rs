@@ -3,6 +3,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+#[ignore = "slow (>10s)"]
 fn session_prompt_streams_text_updates_until_terminal_stop_reason() {
     run_exact_acp_libtest(
         "server::tests::session_prompt_streams_text_updates_until_terminal_stop_reason",
@@ -10,6 +11,7 @@ fn session_prompt_streams_text_updates_until_terminal_stop_reason() {
 }
 
 #[test]
+#[ignore = "slow (>10s)"]
 fn contract_session_prompt_streams_tool_lifecycle_over_jsonl_harness() {
     run_exact_acp_libtest(
         "server::contract_tests::contract_session_prompt_streams_tool_lifecycle_over_jsonl_harness",

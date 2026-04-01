@@ -3,6 +3,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+#[ignore = "slow (>10s)"]
 fn session_prompt_flushes_pending_agent_delta_before_terminal_stop_reason() {
     run_exact_acp_libtest(
         "server::tests::session_prompt_flushes_pending_agent_delta_before_terminal_stop_reason",
@@ -10,6 +11,7 @@ fn session_prompt_flushes_pending_agent_delta_before_terminal_stop_reason() {
 }
 
 #[test]
+#[ignore = "slow (>10s)"]
 fn task3_exact_name_regressions_cover_burst_continuity_and_cancel_paths() {
     session_prompt_flushes_pending_agent_delta_before_terminal_stop_reason();
     session_prompt_preserves_many_chunk_continuity_without_duplicate_text();
@@ -17,6 +19,7 @@ fn task3_exact_name_regressions_cover_burst_continuity_and_cancel_paths() {
 }
 
 #[test]
+#[ignore = "slow (>10s)"]
 fn session_prompt_preserves_many_chunk_continuity_without_duplicate_text() {
     run_exact_acp_libtest(
         "server::tests::session_prompt_preserves_many_chunk_continuity_without_duplicate_text",
@@ -24,6 +27,7 @@ fn session_prompt_preserves_many_chunk_continuity_without_duplicate_text() {
 }
 
 #[test]
+#[ignore = "slow (>10s)"]
 fn contract_live_same_connection_cancel_resolves_prompt_over_stdio_loop() {
     run_exact_acp_libtest(
         "server::contract_tests::contract_live_same_connection_cancel_resolves_prompt_over_stdio_loop",
