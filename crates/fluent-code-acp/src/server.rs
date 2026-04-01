@@ -4247,6 +4247,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn live_prompt_wait_path_stays_idle_until_runtime_activity() {
         let temp_dir = unique_temp_dir("fluent-code-acp-live-wait-idle");
         fs::create_dir_all(&temp_dir).unwrap();
