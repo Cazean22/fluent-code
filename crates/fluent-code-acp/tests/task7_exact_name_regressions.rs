@@ -3,6 +3,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+#[ignore = "slow (>10s)"]
 fn official_sdk_same_connection_cancel_unblocks_live_prompt_and_preserves_streaming() {
     run_exact_acp_libtest(
         "server::tests::official_sdk_same_connection_cancel_unblocks_live_prompt_and_preserves_streaming",
@@ -10,6 +11,7 @@ fn official_sdk_same_connection_cancel_unblocks_live_prompt_and_preserves_stream
 }
 
 #[test]
+#[ignore = "slow (>10s)"]
 fn live_stdio_session_cancel_interrupts_active_prompt_on_same_connection() {
     run_exact_acp_libtest(
         "server::tests::live_stdio_session_cancel_interrupts_active_prompt_on_same_connection",
@@ -17,6 +19,7 @@ fn live_stdio_session_cancel_interrupts_active_prompt_on_same_connection() {
 }
 
 #[test]
+#[ignore = "slow (>10s)"]
 fn contract_live_same_connection_cancel_resolves_prompt_over_stdio_loop() {
     run_exact_acp_libtest(
         "server::contract_tests::contract_live_same_connection_cancel_resolves_prompt_over_stdio_loop",

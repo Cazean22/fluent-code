@@ -3,6 +3,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+#[ignore = "slow (>10s)"]
 fn session_prompt_permission_request_stays_ordered_across_wake_driven_resume() {
     run_exact_acp_libtest(
         "server::tests::official_sdk_prompt_permission_request_stays_ordered_across_wake_driven_resume",
@@ -10,6 +11,7 @@ fn session_prompt_permission_request_stays_ordered_across_wake_driven_resume() {
 }
 
 #[test]
+#[ignore = "slow (>10s)"]
 fn session_prompt_delegated_child_completion_resumes_incrementally() {
     run_exact_acp_libtest(
         "server::tests::poll_live_prompt_turn_resumes_foreground_delegated_child_agent_chunks_without_duplicate_text",
