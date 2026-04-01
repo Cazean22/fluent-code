@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TryRecvError};
 use tracing::{debug, info};
 
 use crate::Result;
@@ -18,6 +18,7 @@ pub struct SharedAppHost {
     runtime: Runtime,
     runtime_sender: mpsc::UnboundedSender<Msg>,
     runtime_receiver: mpsc::UnboundedReceiver<Msg>,
+    queued_runtime_messages: VecDeque<Msg>,
 }
 
 impl SharedAppHost {
@@ -42,6 +43,7 @@ impl SharedAppHost {
             runtime,
             runtime_sender,
             runtime_receiver,
+            queued_runtime_messages: VecDeque::new(),
         }
     }
 
@@ -94,6 +96,10 @@ impl SharedAppHost {
         self.runtime_sender.clone()
     }
 
+    pub fn close_runtime_activity_channel(&mut self) {
+        self.runtime_receiver.close();
+    }
+
     pub async fn recover_startup(&mut self) -> Result<()> {
         let effects = recover_startup_foreground(&mut self.state);
         if effects.is_empty() {
@@ -136,7 +142,7 @@ impl SharedAppHost {
     }
 
     pub async fn drain_runtime_messages(&mut self) -> Result<()> {
-        while let Ok(message) = self.runtime_receiver.try_recv() {
+        while let Some(message) = self.next_runtime_message() {
             debug!(
                 session_id = %self.state.session.id,
                 message = ?message,
@@ -148,6 +154,31 @@ impl SharedAppHost {
         Ok(())
     }
 
+    pub async fn wait_for_runtime_activity(&mut self) -> bool {
+        if self.queue_runtime_message_if_available() {
+            return true;
+        }
+
+        match self.runtime_receiver.recv().await {
+            Some(message) => {
+                debug!(
+                    session_id = %self.state.session.id,
+                    message = ?message,
+                    "queued runtime message after runtime activity wake"
+                );
+                self.queued_runtime_messages.push_back(message);
+                true
+            }
+            None => {
+                debug!(
+                    session_id = %self.state.session.id,
+                    "runtime activity wait exited because the sender channel closed"
+                );
+                false
+            }
+        }
+    }
+
     pub fn persist_now(&mut self) -> Result<()> {
         self.persist_session()
     }
@@ -157,6 +188,33 @@ impl SharedAppHost {
         info!(session_id = %session.id, "swapped shared host to new session");
         self.state.replace_session(session);
         Ok(())
+    }
+
+    fn next_runtime_message(&mut self) -> Option<Msg> {
+        if let Some(message) = self.queued_runtime_messages.pop_front() {
+            return Some(message);
+        }
+
+        self.runtime_receiver.try_recv().ok()
+    }
+
+    fn queue_runtime_message_if_available(&mut self) -> bool {
+        if !self.queued_runtime_messages.is_empty() {
+            return true;
+        }
+
+        match self.runtime_receiver.try_recv() {
+            Ok(message) => {
+                debug!(
+                    session_id = %self.state.session.id,
+                    message = ?message,
+                    "queued already-available runtime message before waiting"
+                );
+                self.queued_runtime_messages.push_back(message);
+                true
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => false,
+        }
     }
 
     async fn apply_effects(
@@ -480,6 +538,124 @@ mod tests {
             .find(|turn| matches!(turn.role, Role::Assistant))
             .expect("assistant turn after recovery");
         assert_eq!(assistant_turn.content, "Mock assistant response: resume me");
+
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn shared_host_wait_for_runtime_activity_returns_immediately_for_queued_messages() {
+        let root = unique_test_dir("shared-host-wait-queued");
+        let store = FsSessionStore::new(root.clone());
+        let agent_registry = Arc::new(AgentRegistry::built_in().clone());
+        let tool_registry = Arc::new(ToolRegistry::with_agent_registry(&agent_registry));
+        let runtime = Runtime::new_with_tool_registry(
+            ProviderClient::Mock(MockProvider::new(None)),
+            Arc::clone(&tool_registry),
+        );
+        let mut host = SharedAppHost::new(
+            Session::new("shared host queued wait"),
+            store,
+            runtime,
+            agent_registry,
+            tool_registry,
+            PluginLoadSnapshot::default(),
+        );
+
+        host.runtime_sender()
+            .send(Msg::InputChanged("queued runtime message".to_string()))
+            .expect("queue runtime message");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), host.wait_for_runtime_activity())
+                .await
+                .expect("queued wait should complete immediately")
+        );
+        assert_eq!(host.state().draft_input, "");
+
+        host.drain_runtime_messages()
+            .await
+            .expect("drain queued runtime message");
+
+        assert_eq!(host.state().draft_input, "queued runtime message");
+
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn shared_host_wait_for_runtime_activity_wakes_when_runtime_message_arrives() {
+        let root = unique_test_dir("shared-host-wait-idle");
+        let store = FsSessionStore::new(root.clone());
+        let agent_registry = Arc::new(AgentRegistry::built_in().clone());
+        let tool_registry = Arc::new(ToolRegistry::with_agent_registry(&agent_registry));
+        let runtime = Runtime::new_with_tool_registry(
+            ProviderClient::Mock(MockProvider::new(None)),
+            Arc::clone(&tool_registry),
+        );
+        let mut host = SharedAppHost::new(
+            Session::new("shared host idle wait"),
+            store,
+            runtime,
+            agent_registry,
+            tool_registry,
+            PluginLoadSnapshot::default(),
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), host.wait_for_runtime_activity())
+                .await
+                .is_err()
+        );
+
+        let runtime_sender = host.runtime_sender();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            runtime_sender
+                .send(Msg::InputChanged("wake after idle wait".to_string()))
+                .expect("send wake message");
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), host.wait_for_runtime_activity())
+                .await
+                .expect("idle wait should wake after runtime message")
+        );
+        assert_eq!(host.state().draft_input, "");
+
+        host.drain_runtime_messages()
+            .await
+            .expect("drain wake message");
+
+        assert_eq!(host.state().draft_input, "wake after idle wait");
+
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn shared_host_wait_for_runtime_activity_exits_when_runtime_channel_closes() {
+        let root = unique_test_dir("shared-host-wait-close");
+        let store = FsSessionStore::new(root.clone());
+        let agent_registry = Arc::new(AgentRegistry::built_in().clone());
+        let tool_registry = Arc::new(ToolRegistry::with_agent_registry(&agent_registry));
+        let runtime = Runtime::new_with_tool_registry(
+            ProviderClient::Mock(MockProvider::new(None)),
+            Arc::clone(&tool_registry),
+        );
+        let mut host = SharedAppHost::new(
+            Session::new("shared host closed wait"),
+            store,
+            runtime,
+            agent_registry,
+            tool_registry,
+            PluginLoadSnapshot::default(),
+        );
+
+        host.close_runtime_activity_channel();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_millis(50), host.wait_for_runtime_activity())
+                .await
+                .expect("closed runtime channel should exit promptly")
+        );
 
         cleanup(root);
     }
