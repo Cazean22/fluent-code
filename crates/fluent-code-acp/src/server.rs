@@ -260,7 +260,7 @@ struct OfficialAgentTestProbeAdapter {
 
 enum OutboundClientCall {
     SessionNotification {
-        notification: acp::SessionNotification,
+        request: acp::SessionNotification,
         ack: oneshot::Sender<acp::Result<()>>,
     },
     RequestPermission {
@@ -291,6 +291,12 @@ enum OutboundClientCall {
         request: acp::ReleaseTerminalRequest,
         ack: oneshot::Sender<acp::Result<acp::ReleaseTerminalResponse>>,
     },
+}
+
+enum FrameRouteResult {
+    Dispatched,
+    PermissionFollowUp,
+    NotRouted,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,6 +340,22 @@ struct TerminalCommandProbeResponse {
     exit_code: Option<i32>,
 }
 
+macro_rules! send_outbound_call {
+    ($self:expr, $variant:ident, $request:expr) => {{
+        let (ack_sender, ack_receiver) = oneshot::channel();
+        $self
+            .outbound_sender
+            .send(OutboundClientCall::$variant {
+                request: $request,
+                ack: ack_sender,
+            })
+            .map_err(|_| acp::Error::internal_error())?;
+        ack_receiver
+            .await
+            .map_err(|_| acp::Error::internal_error())?
+    }};
+}
+
 impl OfficialAgentAdapter {
     fn for_probe_connection(
         server: AcpServer,
@@ -365,6 +387,44 @@ impl OfficialAgentAdapter {
         self.process_outbound_frames(outbound_frames).await
     }
 
+    async fn try_route_notification_frame(
+        &self,
+        frame: &Value,
+        outbound_frames: &mut VecDeque<Value>,
+    ) -> acp::Result<FrameRouteResult> {
+        if frame.get("method").and_then(Value::as_str) == Some(SESSION_UPDATE_METHOD) {
+            let notification = serde_json::from_value::<acp::SessionNotification>(
+                frame
+                    .get("params")
+                    .cloned()
+                    .ok_or_else(acp::Error::internal_error)?,
+            )
+            .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
+            self.send_session_notification(notification).await?;
+            return Ok(FrameRouteResult::Dispatched);
+        }
+
+        if frame.get("method").and_then(Value::as_str)
+            == Some(SESSION_REQUEST_PERMISSION_METHOD)
+        {
+            let request = serde_json::from_value::<acp::RequestPermissionRequest>(
+                frame
+                    .get("params")
+                    .cloned()
+                    .ok_or_else(acp::Error::internal_error)?,
+            )
+            .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
+            let client_response = self.request_permission(request.clone()).await?;
+            let follow_up_frames = self
+                .process_permission_response(&request, client_response)
+                .await?;
+            prepend_outbound_frames(outbound_frames, follow_up_frames);
+            return Ok(FrameRouteResult::PermissionFollowUp);
+        }
+
+        Ok(FrameRouteResult::NotRouted)
+    }
+
     async fn process_outbound_frames<TResponse>(
         &self,
         outbound_frames: Vec<Value>,
@@ -376,34 +436,12 @@ impl OfficialAgentAdapter {
         let mut outbound_frames = VecDeque::from(outbound_frames);
 
         while let Some(outbound_frame) = outbound_frames.pop_front() {
-            if outbound_frame.get("method").and_then(Value::as_str) == Some(SESSION_UPDATE_METHOD) {
-                let notification = serde_json::from_value::<acp::SessionNotification>(
-                    outbound_frame
-                        .get("params")
-                        .cloned()
-                        .ok_or_else(acp::Error::internal_error)?,
-                )
-                .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
-                self.send_session_notification(notification).await?;
-                continue;
-            }
-
-            if outbound_frame.get("method").and_then(Value::as_str)
-                == Some(SESSION_REQUEST_PERMISSION_METHOD)
+            match self
+                .try_route_notification_frame(&outbound_frame, &mut outbound_frames)
+                .await?
             {
-                let request = serde_json::from_value::<acp::RequestPermissionRequest>(
-                    outbound_frame
-                        .get("params")
-                        .cloned()
-                        .ok_or_else(acp::Error::internal_error)?,
-                )
-                .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
-                let client_response = self.request_permission(request.clone()).await?;
-                let follow_up_frames = self
-                    .process_permission_response(&request, client_response)
-                    .await?;
-                prepend_outbound_frames(&mut outbound_frames, follow_up_frames);
-                continue;
+                FrameRouteResult::Dispatched | FrameRouteResult::PermissionFollowUp => continue,
+                FrameRouteResult::NotRouted => {}
             }
 
             if let Some(error) = outbound_frame.get("error") {
@@ -439,128 +477,56 @@ impl OfficialAgentAdapter {
         &self,
         notification: acp::SessionNotification,
     ) -> acp::Result<()> {
-        let (ack_sender, ack_receiver) = oneshot::channel();
-        self.outbound_sender
-            .send(OutboundClientCall::SessionNotification {
-                notification,
-                ack: ack_sender,
-            })
-            .map_err(|_| acp::Error::internal_error())?;
-        ack_receiver
-            .await
-            .map_err(|_| acp::Error::internal_error())?
+        send_outbound_call!(self, SessionNotification, notification)
     }
 
     async fn request_permission(
         &self,
         request: acp::RequestPermissionRequest,
     ) -> acp::Result<acp::RequestPermissionResponse> {
-        let (ack_sender, ack_receiver) = oneshot::channel();
-        self.outbound_sender
-            .send(OutboundClientCall::RequestPermission {
-                request,
-                ack: ack_sender,
-            })
-            .map_err(|_| acp::Error::internal_error())?;
-        ack_receiver
-            .await
-            .map_err(|_| acp::Error::internal_error())?
+        send_outbound_call!(self, RequestPermission, request)
     }
 
     async fn read_text_file(
         &self,
         request: acp::ReadTextFileRequest,
     ) -> acp::Result<acp::ReadTextFileResponse> {
-        let (ack_sender, ack_receiver) = oneshot::channel();
-        self.outbound_sender
-            .send(OutboundClientCall::ReadTextFile {
-                request,
-                ack: ack_sender,
-            })
-            .map_err(|_| acp::Error::internal_error())?;
-        ack_receiver
-            .await
-            .map_err(|_| acp::Error::internal_error())?
+        send_outbound_call!(self, ReadTextFile, request)
     }
 
     async fn write_text_file(
         &self,
         request: acp::WriteTextFileRequest,
     ) -> acp::Result<acp::WriteTextFileResponse> {
-        let (ack_sender, ack_receiver) = oneshot::channel();
-        self.outbound_sender
-            .send(OutboundClientCall::WriteTextFile {
-                request,
-                ack: ack_sender,
-            })
-            .map_err(|_| acp::Error::internal_error())?;
-        ack_receiver
-            .await
-            .map_err(|_| acp::Error::internal_error())?
+        send_outbound_call!(self, WriteTextFile, request)
     }
 
     async fn create_terminal(
         &self,
         request: acp::CreateTerminalRequest,
     ) -> acp::Result<acp::CreateTerminalResponse> {
-        let (ack_sender, ack_receiver) = oneshot::channel();
-        self.outbound_sender
-            .send(OutboundClientCall::CreateTerminal {
-                request,
-                ack: ack_sender,
-            })
-            .map_err(|_| acp::Error::internal_error())?;
-        ack_receiver
-            .await
-            .map_err(|_| acp::Error::internal_error())?
+        send_outbound_call!(self, CreateTerminal, request)
     }
 
     async fn wait_for_terminal_exit(
         &self,
         request: acp::WaitForTerminalExitRequest,
     ) -> acp::Result<acp::WaitForTerminalExitResponse> {
-        let (ack_sender, ack_receiver) = oneshot::channel();
-        self.outbound_sender
-            .send(OutboundClientCall::WaitForTerminalExit {
-                request,
-                ack: ack_sender,
-            })
-            .map_err(|_| acp::Error::internal_error())?;
-        ack_receiver
-            .await
-            .map_err(|_| acp::Error::internal_error())?
+        send_outbound_call!(self, WaitForTerminalExit, request)
     }
 
     async fn terminal_output(
         &self,
         request: acp::TerminalOutputRequest,
     ) -> acp::Result<acp::TerminalOutputResponse> {
-        let (ack_sender, ack_receiver) = oneshot::channel();
-        self.outbound_sender
-            .send(OutboundClientCall::TerminalOutput {
-                request,
-                ack: ack_sender,
-            })
-            .map_err(|_| acp::Error::internal_error())?;
-        ack_receiver
-            .await
-            .map_err(|_| acp::Error::internal_error())?
+        send_outbound_call!(self, TerminalOutput, request)
     }
 
     async fn release_terminal(
         &self,
         request: acp::ReleaseTerminalRequest,
     ) -> acp::Result<acp::ReleaseTerminalResponse> {
-        let (ack_sender, ack_receiver) = oneshot::channel();
-        self.outbound_sender
-            .send(OutboundClientCall::ReleaseTerminal {
-                request,
-                ack: ack_sender,
-            })
-            .map_err(|_| acp::Error::internal_error())?;
-        ack_receiver
-            .await
-            .map_err(|_| acp::Error::internal_error())?
+        send_outbound_call!(self, ReleaseTerminal, request)
     }
 
     async fn handle_ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
@@ -766,34 +732,12 @@ impl OfficialAgentAdapter {
         let mut outbound_frames = VecDeque::from(outbound_frames);
 
         while let Some(outbound_frame) = outbound_frames.pop_front() {
-            if outbound_frame.get("method").and_then(Value::as_str) == Some(SESSION_UPDATE_METHOD) {
-                let notification = serde_json::from_value::<acp::SessionNotification>(
-                    outbound_frame
-                        .get("params")
-                        .cloned()
-                        .ok_or_else(acp::Error::internal_error)?,
-                )
-                .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
-                self.send_session_notification(notification).await?;
-                continue;
-            }
-
-            if outbound_frame.get("method").and_then(Value::as_str)
-                == Some(SESSION_REQUEST_PERMISSION_METHOD)
+            match self
+                .try_route_notification_frame(&outbound_frame, &mut outbound_frames)
+                .await?
             {
-                let request = serde_json::from_value::<acp::RequestPermissionRequest>(
-                    outbound_frame
-                        .get("params")
-                        .cloned()
-                        .ok_or_else(acp::Error::internal_error)?,
-                )
-                .map_err(|error| acp::Error::new(JSONRPC_INTERNAL_ERROR, error.to_string()))?;
-                let client_response = self.request_permission(request.clone()).await?;
-                let follow_up_frames = self
-                    .process_permission_response(&request, client_response)
-                    .await?;
-                prepend_outbound_frames(&mut outbound_frames, follow_up_frames);
-                continue;
+                FrameRouteResult::Dispatched | FrameRouteResult::PermissionFollowUp => continue,
+                FrameRouteResult::NotRouted => {}
             }
 
             if let Some(error) = outbound_frame.get("error") {
@@ -920,6 +864,27 @@ impl OfficialAgentAdapter {
 
         Ok(())
     }
+}
+
+async fn cancel_via_adapter(
+    adapter: &OfficialAgentAdapter,
+    args: acp::CancelNotification,
+) -> acp::Result<()> {
+    let (session_id, cancel_request_id, outbound_frames) =
+        adapter.connection.prepare_cancel_request(&args).await?;
+
+    if let Some(buffered_prompt_completion) =
+        buffered_prompt_completion_from_outbound_frames(cancel_request_id, &outbound_frames)?
+    {
+        adapter
+            .connection
+            .store_buffered_prompt_completion(&session_id, buffered_prompt_completion)
+            .await?;
+    }
+
+    adapter
+        .process_cancel_outbound_frames(&session_id, cancel_request_id, outbound_frames)
+        .await
 }
 
 fn prepend_outbound_frames(queue: &mut VecDeque<Value>, frames: Vec<Value>) {
@@ -1173,22 +1138,7 @@ impl acp::Agent for AcpServer {
     }
 
     async fn cancel(&self, args: acp::CancelNotification) -> acp::Result<()> {
-        let adapter = self.official_agent_adapter()?;
-        let (session_id, cancel_request_id, outbound_frames) =
-            adapter.connection.prepare_cancel_request(&args).await?;
-
-        if let Some(buffered_prompt_completion) =
-            buffered_prompt_completion_from_outbound_frames(cancel_request_id, &outbound_frames)?
-        {
-            adapter
-                .connection
-                .store_buffered_prompt_completion(&session_id, buffered_prompt_completion)
-                .await?;
-        }
-
-        adapter
-            .process_cancel_outbound_frames(&session_id, cancel_request_id, outbound_frames)
-            .await
+        cancel_via_adapter(&self.official_agent_adapter()?, args).await
     }
 
     async fn ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
@@ -1250,24 +1200,7 @@ impl acp::Agent for OfficialAgentTestProbeAdapter {
     }
 
     async fn cancel(&self, args: acp::CancelNotification) -> acp::Result<()> {
-        let (session_id, cancel_request_id, outbound_frames) = self
-            .adapter
-            .connection
-            .prepare_cancel_request(&args)
-            .await?;
-
-        if let Some(buffered_prompt_completion) =
-            buffered_prompt_completion_from_outbound_frames(cancel_request_id, &outbound_frames)?
-        {
-            self.adapter
-                .connection
-                .store_buffered_prompt_completion(&session_id, buffered_prompt_completion)
-                .await?;
-        }
-
-        self.adapter
-            .process_cancel_outbound_frames(&session_id, cancel_request_id, outbound_frames)
-            .await
+        cancel_via_adapter(&self.adapter, args).await
     }
 
     async fn ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
@@ -2613,27 +2546,44 @@ fn active_session_not_found_error(session_id: &str) -> acp::Error {
 fn official_prompt_text_from_blocks(
     prompt: &[acp::ContentBlock],
 ) -> std::result::Result<String, RpcResponseError> {
-    let prompt = prompt
-        .iter()
-        .map(|block| match block {
-            acp::ContentBlock::Text(text) => Ok(text.text.trim().to_string()),
-            _ => Err(RpcResponseError::invalid_params(
-                "session prompt only supports text ACP content blocks",
-            )),
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|block| !block.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    join_prompt_text(prompt.iter().map(|block| match block {
+        acp::ContentBlock::Text(text) => Ok(text.text.trim().to_string()),
+        _ => Err(RpcResponseError::invalid_params(
+            "session prompt only supports text ACP content blocks",
+        )),
+    }))
+}
 
-    if prompt.is_empty() {
-        return Err(RpcResponseError::invalid_params(
-            "session prompt must include at least one non-empty text block",
-        ));
+async fn dispatch_outbound_call(
+    connection: &acp::AgentSideConnection,
+    call: OutboundClientCall,
+) {
+    match call {
+        OutboundClientCall::SessionNotification { request, ack } => {
+            let _ = ack.send(connection.session_notification(request).await);
+        }
+        OutboundClientCall::RequestPermission { request, ack } => {
+            let _ = ack.send(connection.request_permission(request).await);
+        }
+        OutboundClientCall::ReadTextFile { request, ack } => {
+            let _ = ack.send(connection.read_text_file(request).await);
+        }
+        OutboundClientCall::WriteTextFile { request, ack } => {
+            let _ = ack.send(connection.write_text_file(request).await);
+        }
+        OutboundClientCall::CreateTerminal { request, ack } => {
+            let _ = ack.send(connection.create_terminal(request).await);
+        }
+        OutboundClientCall::WaitForTerminalExit { request, ack } => {
+            let _ = ack.send(connection.wait_for_terminal_exit(request).await);
+        }
+        OutboundClientCall::TerminalOutput { request, ack } => {
+            let _ = ack.send(connection.terminal_output(request).await);
+        }
+        OutboundClientCall::ReleaseTerminal { request, ack } => {
+            let _ = ack.send(connection.release_terminal(request).await);
+        }
     }
-
-    Ok(prompt)
 }
 
 async fn run_probe_official_agent_connection<R, W, A>(
@@ -2653,33 +2603,8 @@ where
         });
 
     tokio::task::spawn_local(async move {
-        while let Some(outbound_call) = outbound_receiver.recv().await {
-            match outbound_call {
-                OutboundClientCall::SessionNotification { notification, ack } => {
-                    let _ = ack.send(connection.session_notification(notification).await);
-                }
-                OutboundClientCall::RequestPermission { request, ack } => {
-                    let _ = ack.send(connection.request_permission(request).await);
-                }
-                OutboundClientCall::ReadTextFile { request, ack } => {
-                    let _ = ack.send(connection.read_text_file(request).await);
-                }
-                OutboundClientCall::WriteTextFile { request, ack } => {
-                    let _ = ack.send(connection.write_text_file(request).await);
-                }
-                OutboundClientCall::CreateTerminal { request, ack } => {
-                    let _ = ack.send(connection.create_terminal(request).await);
-                }
-                OutboundClientCall::WaitForTerminalExit { request, ack } => {
-                    let _ = ack.send(connection.wait_for_terminal_exit(request).await);
-                }
-                OutboundClientCall::TerminalOutput { request, ack } => {
-                    let _ = ack.send(connection.terminal_output(request).await);
-                }
-                OutboundClientCall::ReleaseTerminal { request, ack } => {
-                    let _ = ack.send(connection.release_terminal(request).await);
-                }
-            }
+        while let Some(call) = outbound_receiver.recv().await {
+            dispatch_outbound_call(&connection, call).await;
         }
     });
 
@@ -2712,33 +2637,8 @@ where
         .await;
 
     tokio::task::spawn_local(async move {
-        while let Some(outbound_call) = outbound_receiver.recv().await {
-            match outbound_call {
-                OutboundClientCall::SessionNotification { notification, ack } => {
-                    let _ = ack.send(connection.session_notification(notification).await);
-                }
-                OutboundClientCall::RequestPermission { request, ack } => {
-                    let _ = ack.send(connection.request_permission(request).await);
-                }
-                OutboundClientCall::ReadTextFile { request, ack } => {
-                    let _ = ack.send(connection.read_text_file(request).await);
-                }
-                OutboundClientCall::WriteTextFile { request, ack } => {
-                    let _ = ack.send(connection.write_text_file(request).await);
-                }
-                OutboundClientCall::CreateTerminal { request, ack } => {
-                    let _ = ack.send(connection.create_terminal(request).await);
-                }
-                OutboundClientCall::WaitForTerminalExit { request, ack } => {
-                    let _ = ack.send(connection.wait_for_terminal_exit(request).await);
-                }
-                OutboundClientCall::TerminalOutput { request, ack } => {
-                    let _ = ack.send(connection.terminal_output(request).await);
-                }
-                OutboundClientCall::ReleaseTerminal { request, ack } => {
-                    let _ = ack.send(connection.release_terminal(request).await);
-                }
-            }
+        while let Some(call) = outbound_receiver.recv().await {
+            dispatch_outbound_call(&connection, call).await;
         }
     });
 
@@ -3024,14 +2924,12 @@ fn projection_phase_key(phase: ProjectionEventPhase) -> u8 {
     }
 }
 
-fn prompt_text_from_blocks(
-    prompt: &[ContentBlock],
+fn join_prompt_text(
+    blocks: impl Iterator<Item = std::result::Result<String, RpcResponseError>>,
 ) -> std::result::Result<String, RpcResponseError> {
-    let prompt = prompt
-        .iter()
-        .map(|block| match block {
-            ContentBlock::Text(text) => text.text.trim().to_string(),
-        })
+    let prompt = blocks
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
         .filter(|block| !block.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
@@ -3043,6 +2941,14 @@ fn prompt_text_from_blocks(
     }
 
     Ok(prompt)
+}
+
+fn prompt_text_from_blocks(
+    prompt: &[ContentBlock],
+) -> std::result::Result<String, RpcResponseError> {
+    join_prompt_text(prompt.iter().map(|block| match block {
+        ContentBlock::Text(text) => Ok(text.text.trim().to_string()),
+    }))
 }
 
 fn prompt_turn_response(
