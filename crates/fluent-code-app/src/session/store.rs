@@ -24,6 +24,13 @@ pub trait SessionStore {
 }
 
 #[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct FsSessionStore {
     root: PathBuf,
 }
@@ -80,6 +87,57 @@ impl FsSessionStore {
             "created new session"
         );
         Ok(session)
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
+        self.ensure_root()?;
+
+        let sessions_root = self.sessions_root();
+        if !sessions_root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut summaries = Vec::new();
+        let entries = fs::read_dir(&sessions_root)?;
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let dir_name = match path.file_name().and_then(|name| name.to_str()) {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+
+            let session_id: SessionId = match dir_name.parse() {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            let meta_path = self.session_meta_path(&session_id);
+            if !meta_path.exists() {
+                continue;
+            }
+
+            match fs::read_to_string(&meta_path) {
+                Ok(content) => {
+                    if let Ok(metadata) = serde_json::from_str::<SessionMetadata>(&content) {
+                        summaries.push(SessionSummary {
+                            session_id: metadata.id.to_string(),
+                            title: Some(metadata.title),
+                            updated_at: Some(metadata.updated_at.to_rfc3339()),
+                        });
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+
+        summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(summaries)
     }
 
     fn ensure_root(&self) -> Result<()> {

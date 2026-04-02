@@ -39,12 +39,14 @@ use crate::mapping::{
     TerminalStopProjection,
 };
 use crate::protocol::{
-    AgentMessageChunk, AgentThoughtChunk, AuthenticateRequest, AuthenticateResponse, ContentBlock,
-    InitializeRequest, InitializeResponse, JsonRpcErrorResponse, JsonRpcNotification,
-    JsonRpcProtocol, JsonRpcResponse, LoadSessionRequest, LoadSessionResponse, Method,
+    AgentMessageChunk, AgentThoughtChunk, AuthenticateRequest, AuthenticateResponse,
+    CloseSessionRequest, CloseSessionResponse, ContentBlock, InitializeRequest, InitializeResponse,
+    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcProtocol, JsonRpcResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, Method,
     NewSessionRequest, NewSessionResponse, ParsedRequest, PromptTurnState, ProtocolError,
-    ProtocolState, ReplayFidelity, ServerInfo, SessionCancelRequest, SessionNotification,
-    SessionPromptRequest, SessionPromptResponse, SessionUpdate, ToolCallUpdate, UserMessageChunk,
+    ProtocolState, ReplayFidelity, ResumeSessionRequest, ResumeSessionResponse, ServerInfo,
+    SessionCancelRequest, SessionInfoEntry, SessionNotification, SessionPromptRequest,
+    SessionPromptResponse, SessionUpdate, ToolCallUpdate, UserMessageChunk,
 };
 use crate::transport::StdioTransport;
 
@@ -63,6 +65,41 @@ const SESSION_UPDATE_METHOD: &str = "session/update";
 const SESSION_REQUEST_PERMISSION_METHOD: &str = "session/request_permission";
 const CANCELLED_TOOL_MESSAGE: &str =
     "Tool execution was cancelled because the prompt turn was cancelled.";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerConfig {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<McpTransportConfig>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum McpTransportConfig {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+    },
+    Http {
+        url: String,
+    },
+    Sse {
+        url: String,
+    },
+}
+
+fn parse_mcp_servers(raw_servers: &[Value]) -> Vec<McpServerConfig> {
+    raw_servers
+        .iter()
+        .filter_map(|value| serde_json::from_value::<McpServerConfig>(value.clone()).ok())
+        .collect()
+}
 
 pub async fn run() -> Result<()> {
     let (bootstrap, _logging) = AppBootstrap::load()?.into_parts();
@@ -138,9 +175,10 @@ struct AcpConnectionState {
     next_request_id: u64,
 }
 
+#[allow(dead_code)]
 struct ManagedSession {
-    _cwd: PathBuf,
-    _mcp_servers: Vec<Value>,
+    cwd: PathBuf,
+    mcp_servers: Vec<McpServerConfig>,
     host: ManagedAppHost,
     live_prompt_turn: Option<LivePromptTurnState>,
     pending_prompt_request_id: Option<u64>,
@@ -1178,6 +1216,33 @@ impl acp::Agent for AcpServer {
             .await
     }
 
+    async fn resume_session(
+        &self,
+        args: acp::ResumeSessionRequest,
+    ) -> acp::Result<acp::ResumeSessionResponse> {
+        self.official_agent_adapter()?
+            .delegate_request(Method::SessionResume, args)
+            .await
+    }
+
+    async fn close_session(
+        &self,
+        args: acp::CloseSessionRequest,
+    ) -> acp::Result<acp::CloseSessionResponse> {
+        self.official_agent_adapter()?
+            .delegate_request(Method::SessionClose, args)
+            .await
+    }
+
+    async fn list_sessions(
+        &self,
+        args: acp::ListSessionsRequest,
+    ) -> acp::Result<acp::ListSessionsResponse> {
+        self.official_agent_adapter()?
+            .delegate_request(Method::SessionList, args)
+            .await
+    }
+
     async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
         self.official_agent_adapter()?
             .handle_live_prompt_request(args)
@@ -1239,6 +1304,33 @@ impl acp::Agent for OfficialAgentTestProbeAdapter {
     ) -> acp::Result<acp::LoadSessionResponse> {
         self.adapter
             .delegate_request(Method::SessionLoad, args)
+            .await
+    }
+
+    async fn resume_session(
+        &self,
+        args: acp::ResumeSessionRequest,
+    ) -> acp::Result<acp::ResumeSessionResponse> {
+        self.adapter
+            .delegate_request(Method::SessionResume, args)
+            .await
+    }
+
+    async fn close_session(
+        &self,
+        args: acp::CloseSessionRequest,
+    ) -> acp::Result<acp::CloseSessionResponse> {
+        self.adapter
+            .delegate_request(Method::SessionClose, args)
+            .await
+    }
+
+    async fn list_sessions(
+        &self,
+        args: acp::ListSessionsRequest,
+    ) -> acp::Result<acp::ListSessionsResponse> {
+        self.adapter
+            .delegate_request(Method::SessionList, args)
             .await
     }
 
@@ -1740,6 +1832,9 @@ impl AcpServer {
             Method::Authenticate => self.handle_authenticate(connection, request),
             Method::SessionNew => self.handle_session_new(connection, request),
             Method::SessionLoad => self.handle_session_load(connection, request).await,
+            Method::SessionResume => self.handle_session_resume(connection, request).await,
+            Method::SessionClose => self.handle_session_close(connection, request),
+            Method::SessionList => self.handle_session_list(connection, request),
             Method::SessionPrompt => self.handle_session_prompt(connection, request).await,
             Method::SessionCancel => self.handle_session_cancel(connection, request).await,
         }
@@ -1804,6 +1899,14 @@ impl AcpServer {
 
         let new_session_request = decode_params::<NewSessionRequest>(request.params)?;
         let cwd = validate_absolute_cwd(&new_session_request.cwd)?;
+        let mcp_servers = parse_mcp_servers(&new_session_request.mcp_servers);
+        if !mcp_servers.is_empty() {
+            info!(
+                mcp_server_count = mcp_servers.len(),
+                mcp_server_names = %mcp_servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "),
+                "session created with MCP server configurations"
+            );
+        }
         let session = self
             .dependencies
             .store
@@ -1815,8 +1918,8 @@ impl AcpServer {
         connection.sessions.insert(
             session_id,
             Arc::new(Mutex::new(ManagedSession {
-                _cwd: cwd,
-                _mcp_servers: new_session_request.mcp_servers,
+                cwd,
+                mcp_servers,
                 host,
                 live_prompt_turn: None,
                 pending_prompt_request_id: None,
@@ -1872,8 +1975,8 @@ impl AcpServer {
         connection.sessions.insert(
             host.state().session.id,
             Arc::new(Mutex::new(ManagedSession {
-                _cwd: cwd,
-                _mcp_servers: load_session_request.mcp_servers,
+                cwd: cwd,
+                mcp_servers: parse_mcp_servers(&load_session_request.mcp_servers),
                 host,
                 live_prompt_turn,
                 pending_prompt_request_id: None,
@@ -1882,6 +1985,103 @@ impl AcpServer {
         );
 
         Ok(outbound_frames)
+    }
+
+    async fn handle_session_resume(
+        &self,
+        connection: &mut AcpConnectionState,
+        request: ParsedRequest,
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
+        self.ensure_authenticated(connection)?;
+
+        let resume_request = decode_params::<ResumeSessionRequest>(request.params)?;
+        let session_id = parse_session_id(&resume_request.session_id)?;
+        let cwd = validate_absolute_cwd(&resume_request.cwd)?;
+        let mut host = self
+            .load_host(&session_id)
+            .map_err(map_load_session_error)?;
+        host.recover_startup()
+            .await
+            .map_err(|error| RpcResponseError::internal(error.to_string()))?;
+
+        let live_prompt_turn = self
+            .seed_live_prompt_turn_state(&resume_request.session_id, &host)
+            .map_err(|error| RpcResponseError::internal(error.to_string()))?;
+
+        connection.sessions.insert(
+            host.state().session.id,
+            Arc::new(Mutex::new(ManagedSession {
+                cwd: cwd,
+                mcp_servers: parse_mcp_servers(&resume_request.mcp_servers),
+                host,
+                live_prompt_turn,
+                pending_prompt_request_id: None,
+                buffered_prompt_completion: None,
+            })),
+        );
+
+        Ok(vec![serialize_value(JsonRpcResponse::new(
+            request.id,
+            ResumeSessionResponse {
+                config_options: self.mapper.session_config_options(),
+                meta: None,
+            },
+        ))?])
+    }
+
+    fn handle_session_close(
+        &self,
+        connection: &mut AcpConnectionState,
+        request: ParsedRequest,
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
+        self.ensure_authenticated(connection)?;
+
+        let close_request = decode_params::<CloseSessionRequest>(request.params)?;
+        let session_id = parse_session_id(&close_request.session_id)?;
+
+        connection.sessions.remove(&session_id).ok_or_else(|| {
+            RpcResponseError::resource_not_found(format!(
+                "session `{session_id}` is not active on this connection"
+            ))
+        })?;
+
+        Ok(vec![serialize_value(JsonRpcResponse::new(
+            request.id,
+            CloseSessionResponse { meta: None },
+        ))?])
+    }
+
+    fn handle_session_list(
+        &self,
+        connection: &mut AcpConnectionState,
+        request: ParsedRequest,
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
+        self.ensure_authenticated(connection)?;
+
+        let _list_request = decode_params::<ListSessionsRequest>(request.params)?;
+
+        let summaries = self
+            .dependencies
+            .store
+            .list_sessions()
+            .map_err(|error| RpcResponseError::internal(error.to_string()))?;
+
+        let session_entries = summaries
+            .into_iter()
+            .map(|summary| SessionInfoEntry {
+                session_id: summary.session_id,
+                title: summary.title,
+                updated_at: summary.updated_at,
+            })
+            .collect();
+
+        Ok(vec![serialize_value(JsonRpcResponse::new(
+            request.id,
+            ListSessionsResponse {
+                sessions: session_entries,
+                next_cursor: None,
+            },
+        ))?])
     }
 
     async fn handle_session_prompt(
@@ -4691,8 +4891,8 @@ mod tests {
             .expect("active generating session should retain a foreground owner")
             .run_id;
         let managed_session = Arc::new(Mutex::new(ManagedSession {
-            _cwd: temp_dir.clone(),
-            _mcp_servers: Vec::new(),
+            cwd: temp_dir.clone(),
+            mcp_servers: Vec::new(),
             host: server.build_host_for_session(session),
             live_prompt_turn: Some(LivePromptTurnState {
                 root_run_id,
@@ -6085,8 +6285,8 @@ mod tests {
             .seed_live_prompt_turn_state(&session_id, &host)
             .unwrap();
         ManagedSession {
-            _cwd: PathBuf::from("/tmp"),
-            _mcp_servers: Vec::new(),
+            cwd: PathBuf::from("/tmp"),
+            mcp_servers: Vec::new(),
             host,
             live_prompt_turn,
             pending_prompt_request_id: None,

@@ -14,6 +14,9 @@ pub enum Method {
     Authenticate,
     SessionNew,
     SessionLoad,
+    SessionResume,
+    SessionClose,
+    SessionList,
     SessionPrompt,
     SessionCancel,
 }
@@ -25,6 +28,9 @@ impl Method {
             Self::Authenticate => "authenticate",
             Self::SessionNew => "session/new",
             Self::SessionLoad => "session/load",
+            Self::SessionResume => "session/resume",
+            Self::SessionClose => "session/close",
+            Self::SessionList => "session/list",
             Self::SessionPrompt => "session/prompt",
             Self::SessionCancel => "session/cancel",
         }
@@ -40,6 +46,9 @@ impl TryFrom<&str> for Method {
             "authenticate" => Ok(Self::Authenticate),
             "session/new" => Ok(Self::SessionNew),
             "session/load" => Ok(Self::SessionLoad),
+            "session/resume" => Ok(Self::SessionResume),
+            "session/close" => Ok(Self::SessionClose),
+            "session/list" => Ok(Self::SessionList),
             "session/prompt" => Ok(Self::SessionPrompt),
             "session/cancel" => Ok(Self::SessionCancel),
             _ => Err(ProtocolError::UnsupportedMethod(value.to_string())),
@@ -296,6 +305,10 @@ pub struct AgentCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_session: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_session: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_session: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_capabilities: Option<McpCapabilities>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_capabilities: Option<PromptCapabilities>,
@@ -371,6 +384,63 @@ pub struct LoadSessionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SessionCancelRequest {
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeSessionRequest {
+    pub session_id: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub mcp_servers: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeSessionResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_options: Option<Vec<SessionConfigOption>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseSessionRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseSessionResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSessionsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSessionsResponse {
+    pub sessions: Vec<SessionInfoEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfoEntry {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

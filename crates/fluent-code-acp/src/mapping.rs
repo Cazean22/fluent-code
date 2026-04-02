@@ -14,11 +14,12 @@ use serde_json::json;
 
 use crate::protocol::{
     ACP_PROTOCOL_VERSION, AgentCapabilities, AgentMessageChunk, AgentThoughtChunk, AuthMethod,
-    ContentBlock, InitializeResponse, Meta, PermissionOption, PermissionOptionKind,
-    RequestPermissionRequest, ServerInfo, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption, SessionInfoUpdate,
-    SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolKind, UserMessageChunk,
+    ContentBlock, InitializeResponse, McpCapabilities, Meta, PermissionOption,
+    PermissionOptionKind, RequestPermissionRequest, ServerInfo, SessionCapabilities,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
+    SessionConfigSelectOption, SessionInfoUpdate, SessionListCapabilities, SessionUpdate,
+    StopReason, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolKind, UserMessageChunk,
 };
 
 const SESSION_INFO_UPDATE_PHASE: ProjectionEventPhase = ProjectionEventPhase::SessionInfoUpdate;
@@ -26,6 +27,11 @@ const TOOL_CALL_CREATE_PHASE: ProjectionEventPhase = ProjectionEventPhase::ToolC
 const TOOL_CALL_PATCH_PHASE: ProjectionEventPhase = ProjectionEventPhase::ToolCallPatch;
 const ACP_META_TOOL_INVOCATION_KEY: &str = "fluentCodeToolInvocation";
 const ACP_META_TRANSCRIPT_ITEM_KEY: &str = "fluentCodeTranscriptItem";
+const ACP_META_TOOL_NAME_KEY: &str = "tool_name";
+const ACP_META_SUBAGENT_SESSION_INFO_KEY: &str = "subagent_session_info";
+const ACP_META_TERMINAL_INFO_KEY: &str = "terminal_info";
+const ACP_META_TERMINAL_OUTPUT_KEY: &str = "terminal_output";
+const ACP_META_TERMINAL_EXIT_KEY: &str = "terminal_exit";
 const SYSTEM_PROMPT_CONFIG_ID: &str = "system_prompt";
 const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 const NO_REASONING_EFFORT_VALUE: &str = "none";
@@ -75,6 +81,15 @@ impl SessionUpdateMapper {
     pub fn negotiated_capabilities(&self) -> AgentCapabilities {
         AgentCapabilities {
             load_session: Some(true),
+            resume_session: Some(true),
+            close_session: Some(true),
+            mcp_capabilities: Some(McpCapabilities {
+                http: Some(true),
+                sse: Some(true),
+            }),
+            session_capabilities: Some(SessionCapabilities {
+                list: Some(SessionListCapabilities {}),
+            }),
             ..AgentCapabilities::default()
         }
     }
@@ -525,7 +540,11 @@ impl SessionUpdateMapper {
             update.raw_output = Some(json!({ "error": error }));
         }
 
-        update.meta = tool_invocation_meta(Some(invocation));
+        let mut meta = tool_invocation_meta(Some(invocation)).unwrap_or_default();
+        if let Some(terminal_meta) = tool_invocation_terminal_meta(invocation) {
+            meta.extend(terminal_meta);
+        }
+        update.meta = if meta.is_empty() { None } else { Some(meta) };
 
         (!update.is_empty()).then_some(update)
     }
@@ -687,7 +706,81 @@ fn tool_invocation_meta(invocation: Option<&ToolInvocationRecord>) -> Option<Met
         ACP_META_TOOL_INVOCATION_KEY.to_string(),
         serde_json::to_value(invocation).ok()?,
     );
+
+    meta.insert(
+        ACP_META_TOOL_NAME_KEY.to_string(),
+        serde_json::Value::String(invocation.tool_name.clone()),
+    );
+
+    if let Some(delegation) = &invocation.delegation {
+        if let Some(child_run_id) = delegation.child_run_id {
+            let subagent_info = json!({
+                "session_id": child_run_id.to_string(),
+                "message_start_index": 0,
+            });
+            meta.insert(
+                ACP_META_SUBAGENT_SESSION_INFO_KEY.to_string(),
+                subagent_info,
+            );
+        }
+    }
+
+    if is_terminal_tool(&invocation.tool_name) {
+        meta.insert(
+            ACP_META_TERMINAL_INFO_KEY.to_string(),
+            json!({
+                "terminal_id": invocation.tool_call_id,
+            }),
+        );
+    }
+
     Some(meta)
+}
+
+fn tool_invocation_terminal_meta(invocation: &ToolInvocationRecord) -> Option<Meta> {
+    if !is_terminal_tool(&invocation.tool_name) {
+        return None;
+    }
+
+    let is_completed = matches!(
+        invocation.execution_state,
+        ToolExecutionState::Completed | ToolExecutionState::Failed
+    );
+
+    if !is_completed {
+        return None;
+    }
+
+    let mut meta = Meta::new();
+
+    let output_data = invocation
+        .result
+        .as_deref()
+        .or(invocation.error.as_deref())
+        .unwrap_or("");
+
+    meta.insert(
+        ACP_META_TERMINAL_OUTPUT_KEY.to_string(),
+        json!({
+            "terminal_id": invocation.tool_call_id,
+            "data": output_data,
+        }),
+    );
+
+    let exit_code = if invocation.error.is_some() { 1 } else { 0 };
+    meta.insert(
+        ACP_META_TERMINAL_EXIT_KEY.to_string(),
+        json!({
+            "terminal_id": invocation.tool_call_id,
+            "exit_code": exit_code,
+        }),
+    );
+
+    Some(meta)
+}
+
+fn is_terminal_tool(tool_name: &str) -> bool {
+    matches!(tool_kind(tool_name), ToolKind::Execute)
 }
 
 fn transcript_item_session_info_update(item: &TranscriptItemRecord) -> SessionInfoUpdate {
@@ -1084,15 +1177,17 @@ mod tests {
 
         assert_eq!(json["protocolVersion"], 1);
         assert_eq!(json["agentCapabilities"]["loadSession"], true);
-        assert!(json["agentCapabilities"].get("mcpCapabilities").is_none());
+        assert_eq!(json["agentCapabilities"]["resumeSession"], true);
+        assert_eq!(json["agentCapabilities"]["closeSession"], true);
+        assert_eq!(json["agentCapabilities"]["mcpCapabilities"]["http"], true);
+        assert_eq!(json["agentCapabilities"]["mcpCapabilities"]["sse"], true);
         assert!(
-            json["agentCapabilities"]
-                .get("promptCapabilities")
-                .is_none()
+            json["agentCapabilities"]["sessionCapabilities"]["list"]
+                .is_object()
         );
         assert!(
             json["agentCapabilities"]
-                .get("sessionCapabilities")
+                .get("promptCapabilities")
                 .is_none()
         );
         assert!(json.get("authMethods").is_none());
