@@ -843,12 +843,30 @@ mod tests {
                 ),
             },
         ];
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: tool_invocation_id,
+            run_id,
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
+            arguments: serde_json::json!({ "path": "src/main.rs" }),
+            preceding_turn_id: Some(user_turn_id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Running,
+            result: None,
+            error: None,
+            delegation: None,
+            sequence_number: 3,
+            requested_at: Utc::now(),
+            approved_at: Some(Utc::now()),
+            completed_at: None,
+        });
         session.next_replay_sequence = 4;
 
         store
             .create(&session)
             .expect("create exact transcript session");
-        let loaded = store
+        let mut loaded = store
             .load(&session.id)
             .expect("load exact transcript session");
         let transcript_items_path = root
@@ -868,6 +886,54 @@ mod tests {
         assert_eq!(loaded.transcript_fidelity, TranscriptFidelity::Exact);
         assert_eq!(loaded.transcript_items, session.transcript_items);
         assert_eq!(loaded.next_replay_sequence, 4);
+
+        let loaded_turn_item = loaded
+            .find_transcript_item(user_turn_id)
+            .expect("loaded transcript item remains reachable by id");
+        assert_eq!(
+            characterize_transcript_items(std::slice::from_ref(loaded_turn_item)),
+            vec![(2, "turn:user:hello".to_string())]
+        );
+
+        let loaded_tool_item = loaded
+            .find_transcript_item(tool_invocation_id)
+            .expect("loaded tool transcript item remains reachable by id");
+        assert_eq!(
+            loaded_tool_item.tool_invocation_id,
+            Some(tool_invocation_id)
+        );
+
+        let loaded_tool_invocation = loaded
+            .find_tool_invocation_mut(tool_invocation_id)
+            .expect("loaded tool invocation remains reachable by id");
+        loaded_tool_invocation.execution_state = ToolExecutionState::Completed;
+        loaded_tool_invocation.result = Some("loaded result".to_string());
+
+        let loaded_turn_item = loaded
+            .find_transcript_item_mut(user_turn_id)
+            .expect("loaded transcript item remains mutable after load");
+        if let TranscriptItemContent::Turn(content) = &mut loaded_turn_item.content {
+            content.content = "hello after load".to_string();
+        } else {
+            panic!("expected turn transcript item for loaded lookup");
+        }
+
+        assert_eq!(
+            characterize_transcript_items(&loaded.transcript_items),
+            vec![
+                (1, "run:created".to_string()),
+                (2, "turn:user:hello after load".to_string()),
+                (3, "tool:read:running".to_string()),
+            ]
+        );
+        assert_eq!(
+            loaded.tool_invocations[0].execution_state,
+            ToolExecutionState::Completed
+        );
+        assert_eq!(
+            loaded.tool_invocations[0].result.as_deref(),
+            Some("loaded result")
+        );
 
         cleanup(root);
     }

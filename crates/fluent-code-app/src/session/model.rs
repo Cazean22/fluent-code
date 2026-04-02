@@ -15,7 +15,7 @@ pub type ReplaySequence = u64;
 
 const FIRST_REPLAY_SEQUENCE: ReplaySequence = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Session {
     pub id: SessionId,
     pub title: String,
@@ -41,6 +41,10 @@ pub struct Session {
     run_index: HashMap<RunId, usize>,
     #[serde(skip)]
     root_run_map: HashMap<RunId, RunId>,
+    #[serde(skip)]
+    transcript_item_index: HashMap<TranscriptItemId, usize>,
+    #[serde(skip)]
+    tool_invocation_index: HashMap<ToolInvocationId, usize>,
 }
 
 impl Session {
@@ -62,8 +66,10 @@ impl Session {
             foreground_owner: None,
             run_index: HashMap::new(),
             root_run_map: HashMap::new(),
+            transcript_item_index: HashMap::new(),
+            tool_invocation_index: HashMap::new(),
         };
-        session.rebuild_run_indexes();
+        session.rebuild_ephemeral_indexes();
         session
     }
 
@@ -210,7 +216,7 @@ impl Session {
             .max_replay_sequence()
             .map(|sequence| sequence.saturating_add(1))
             .unwrap_or(FIRST_REPLAY_SEQUENCE);
-        self.rebuild_run_indexes();
+        self.rebuild_ephemeral_indexes();
     }
 
     pub fn has_replay_visible_legacy_items(&self) -> bool {
@@ -247,6 +253,30 @@ impl Session {
             if let Some(root_run_id) = self.resolve_root_run_id(run_id) {
                 self.root_run_map.entry(run_id).or_insert(root_run_id);
             }
+        }
+    }
+
+    fn rebuild_ephemeral_indexes(&mut self) {
+        self.rebuild_run_indexes();
+        self.rebuild_transcript_item_index();
+        self.rebuild_tool_invocation_index();
+    }
+
+    fn rebuild_transcript_item_index(&mut self) {
+        self.transcript_item_index.clear();
+        for (item_index, item) in self.transcript_items.iter().enumerate() {
+            self.transcript_item_index
+                .entry(item.item_id)
+                .or_insert(item_index);
+        }
+    }
+
+    fn rebuild_tool_invocation_index(&mut self) {
+        self.tool_invocation_index.clear();
+        for (invocation_index, invocation) in self.tool_invocations.iter().enumerate() {
+            self.tool_invocation_index
+                .entry(invocation.id)
+                .or_insert(invocation_index);
         }
     }
 
@@ -297,16 +327,32 @@ impl Session {
         self.foreground_owner = None;
     }
 
+    pub fn find_tool_invocation(
+        &self,
+        invocation_id: ToolInvocationId,
+    ) -> Option<&ToolInvocationRecord> {
+        if let Some(invocation_index) = self.tool_invocation_index_position(invocation_id) {
+            return self.tool_invocations.get(invocation_index);
+        }
+
+        self.tool_invocations
+            .iter()
+            .find(|invocation| invocation.id == invocation_id)
+    }
+
     pub fn find_tool_invocation_mut(
         &mut self,
         invocation_id: ToolInvocationId,
     ) -> Option<&mut ToolInvocationRecord> {
-        self.tool_invocations
-            .iter_mut()
-            .find(|invocation| invocation.id == invocation_id)
+        let invocation_index = self.find_tool_invocation_index(invocation_id)?;
+        self.tool_invocations.get_mut(invocation_index)
     }
 
     pub fn find_transcript_item(&self, item_id: TranscriptItemId) -> Option<&TranscriptItemRecord> {
+        if let Some(item_index) = self.transcript_item_index_position(item_id) {
+            return self.transcript_items.get(item_index);
+        }
+
         self.transcript_items
             .iter()
             .find(|item| item.item_id == item_id)
@@ -316,20 +362,24 @@ impl Session {
         &mut self,
         item_id: TranscriptItemId,
     ) -> Option<&mut TranscriptItemRecord> {
-        self.transcript_items
-            .iter_mut()
-            .find(|item| item.item_id == item_id)
+        let item_index = self.find_transcript_item_index(item_id)?;
+        self.transcript_items.get_mut(item_index)
     }
 
     pub fn upsert_transcript_item(&mut self, item: TranscriptItemRecord) {
-        if let Some(existing) = self.find_transcript_item_mut(item.item_id) {
-            *existing = item;
+        if let Some(existing_item_index) = self.find_transcript_item_index(item.item_id) {
+            if self.transcript_items[existing_item_index].sequence_number == item.sequence_number {
+                self.transcript_items[existing_item_index] = item;
+                return;
+            }
+
+            self.transcript_items.remove(existing_item_index);
+            self.insert_transcript_item_in_order(item);
+            self.rebuild_transcript_item_index();
             return;
         }
 
-        self.transcript_items.push(item);
-        self.transcript_items
-            .sort_by_key(|item| item.sequence_number);
+        self.insert_transcript_item_in_order(item);
     }
 
     fn has_legacy_replay_metadata(&self) -> bool {
@@ -386,6 +436,58 @@ impl Session {
 
         self.transcript_fidelity = TranscriptFidelity::Approximate;
         self.transcript_items = transcript_items;
+        self.rebuild_transcript_item_index();
+    }
+
+    fn tool_invocation_index_position(&self, invocation_id: ToolInvocationId) -> Option<usize> {
+        let invocation_index = self.tool_invocation_index.get(&invocation_id).copied()?;
+        self.tool_invocations
+            .get(invocation_index)
+            .filter(|invocation| invocation.id == invocation_id)
+            .map(|_| invocation_index)
+    }
+
+    fn find_tool_invocation_index(&mut self, invocation_id: ToolInvocationId) -> Option<usize> {
+        if let Some(invocation_index) = self.tool_invocation_index_position(invocation_id) {
+            return Some(invocation_index);
+        }
+
+        self.rebuild_tool_invocation_index();
+        self.tool_invocation_index_position(invocation_id)
+    }
+
+    fn transcript_item_index_position(&self, item_id: TranscriptItemId) -> Option<usize> {
+        let item_index = self.transcript_item_index.get(&item_id).copied()?;
+        self.transcript_items
+            .get(item_index)
+            .filter(|item| item.item_id == item_id)
+            .map(|_| item_index)
+    }
+
+    fn find_transcript_item_index(&mut self, item_id: TranscriptItemId) -> Option<usize> {
+        if let Some(item_index) = self.transcript_item_index_position(item_id) {
+            return Some(item_index);
+        }
+
+        self.rebuild_transcript_item_index();
+        self.transcript_item_index_position(item_id)
+    }
+
+    fn insert_transcript_item_in_order(&mut self, item: TranscriptItemRecord) {
+        let insertion_index = self
+            .transcript_items
+            .partition_point(|existing| existing.sequence_number <= item.sequence_number);
+
+        if insertion_index == self.transcript_items.len() {
+            self.transcript_items.push(item);
+            let item_index = self.transcript_items.len() - 1;
+            let item_id = self.transcript_items[item_index].item_id;
+            self.transcript_item_index.insert(item_id, item_index);
+            return;
+        }
+
+        self.transcript_items.insert(insertion_index, item);
+        self.rebuild_transcript_item_index();
     }
 
     fn resolve_root_run_id(&mut self, run_id: RunId) -> Option<RunId> {
@@ -479,6 +581,60 @@ impl Session {
             next_sequence = next_sequence.saturating_add(1);
         }
     }
+}
+
+impl<'de> Deserialize<'de> for Session {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let compat = SessionCompat::deserialize(deserializer)?;
+
+        let mut session = Self {
+            id: compat.id,
+            title: compat.title,
+            created_at: compat.created_at,
+            updated_at: compat.updated_at,
+            next_replay_sequence: compat.next_replay_sequence,
+            permissions: compat.permissions,
+            transcript_fidelity: compat.transcript_fidelity,
+            transcript_items: compat.transcript_items,
+            runs: compat.runs,
+            turns: compat.turns,
+            tool_invocations: compat.tool_invocations,
+            foreground_owner: compat.foreground_owner,
+            run_index: HashMap::new(),
+            root_run_map: HashMap::new(),
+            transcript_item_index: HashMap::new(),
+            tool_invocation_index: HashMap::new(),
+        };
+        session.rebuild_ephemeral_indexes();
+        Ok(session)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionCompat {
+    id: SessionId,
+    title: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    #[serde(default = "default_next_replay_sequence")]
+    next_replay_sequence: ReplaySequence,
+    #[serde(default)]
+    permissions: SessionPermissionState,
+    #[serde(default)]
+    transcript_fidelity: TranscriptFidelity,
+    #[serde(default)]
+    transcript_items: Vec<TranscriptItemRecord>,
+    #[serde(default)]
+    runs: Vec<RunRecord>,
+    #[serde(default)]
+    turns: Vec<Turn>,
+    #[serde(default)]
+    tool_invocations: Vec<ToolInvocationRecord>,
+    #[serde(default)]
+    foreground_owner: Option<ForegroundOwnerRecord>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1314,7 +1470,11 @@ pub enum Role {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunRecord, RunStatus, Session};
+    use super::{
+        ReplaySequence, Role, RunRecord, RunStatus, Session, ToolApprovalState, ToolExecutionState,
+        ToolInvocationRecord, ToolSource, TranscriptItemContent, TranscriptItemRecord,
+        TranscriptStreamState,
+    };
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -1463,6 +1623,346 @@ mod tests {
             session.root_run_id(grandchild_run_id),
             Some(second_root_run_id)
         );
+    }
+
+    #[test]
+    fn transcript_item_index_rebuilds_after_serde_round_trip() {
+        let mut session = Session::new("serde transcript round trip");
+        let run_id = Uuid::new_v4();
+        let first_turn_id = Uuid::new_v4();
+        let second_turn_id = Uuid::new_v4();
+
+        let first_item = TranscriptItemRecord::assistant_text(
+            run_id,
+            first_turn_id,
+            1,
+            "first answer",
+            TranscriptStreamState::Committed,
+        );
+        let second_item = TranscriptItemRecord::assistant_text(
+            run_id,
+            second_turn_id,
+            3,
+            "second answer",
+            TranscriptStreamState::Committed,
+        );
+        let invocation = tool_invocation_record(run_id, 2, Some(first_turn_id));
+        let tool_item = TranscriptItemRecord::from_tool_invocation(&invocation);
+
+        session.upsert_transcript_item(second_item.clone());
+        session.upsert_transcript_item(tool_item.clone());
+        session.upsert_transcript_item(first_item.clone());
+        session.tool_invocations.push(invocation.clone());
+
+        let serialized = serde_json::to_string(&session).expect("serialize session");
+        let mut round_tripped: Session =
+            serde_json::from_str(&serialized).expect("deserialize session");
+
+        assert_eq!(
+            round_tripped
+                .transcript_items
+                .iter()
+                .map(|item| item.sequence_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            transcript_turn_text(
+                round_tripped
+                    .find_transcript_item(first_item.item_id)
+                    .expect("transcript lookup survives serde round trip"),
+            ),
+            "first answer"
+        );
+        assert_eq!(
+            round_tripped
+                .find_transcript_item(tool_item.item_id)
+                .expect("tool transcript lookup survives serde round trip")
+                .tool_invocation_id,
+            Some(invocation.id)
+        );
+
+        let first_round_tripped_item = round_tripped
+            .find_transcript_item_mut(first_item.item_id)
+            .expect("mutable transcript lookup survives serde round trip");
+        match &mut first_round_tripped_item.content {
+            TranscriptItemContent::Turn(content) => {
+                content.content = "first answer updated after serde".to_string();
+            }
+            other => panic!("expected turn transcript item, found {other:?}"),
+        }
+
+        round_tripped.upsert_transcript_item(TranscriptItemRecord::assistant_text(
+            run_id,
+            second_turn_id,
+            3,
+            "second answer updated after serde",
+            TranscriptStreamState::Committed,
+        ));
+
+        assert_eq!(
+            round_tripped
+                .transcript_items
+                .iter()
+                .map(|item| item.sequence_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            transcript_turn_text(
+                round_tripped
+                    .find_transcript_item(first_item.item_id)
+                    .expect("updated first transcript item remains reachable"),
+            ),
+            "first answer updated after serde"
+        );
+        assert_eq!(
+            transcript_turn_text(
+                round_tripped
+                    .find_transcript_item(second_item.item_id)
+                    .expect("replacement transcript item remains reachable after serde"),
+            ),
+            "second answer updated after serde"
+        );
+
+        let round_tripped_invocation = round_tripped
+            .find_tool_invocation_mut(invocation.id)
+            .expect("tool lookup survives serde round trip");
+        round_tripped_invocation.execution_state = ToolExecutionState::Completed;
+        round_tripped_invocation.result = Some("ok".to_string());
+
+        assert_eq!(
+            round_tripped.tool_invocations[0].execution_state,
+            ToolExecutionState::Completed
+        );
+        assert_eq!(
+            round_tripped.tool_invocations[0].result.as_deref(),
+            Some("ok")
+        );
+        assert_eq!(
+            round_tripped
+                .find_tool_invocation(invocation.id)
+                .expect("immutable tool lookup survives serde round trip")
+                .result
+                .as_deref(),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn upsert_transcript_item_preserves_canonical_order_without_global_resort() {
+        let mut session = Session::new("ordered transcript upsert");
+        let run_id = Uuid::new_v4();
+        let first_turn_id = Uuid::new_v4();
+        let inserted_turn_id = Uuid::new_v4();
+        let second_turn_id = Uuid::new_v4();
+        let third_turn_id = Uuid::new_v4();
+
+        let third_item = TranscriptItemRecord::assistant_text(
+            run_id,
+            third_turn_id,
+            30,
+            "third",
+            TranscriptStreamState::Committed,
+        );
+        let first_item = TranscriptItemRecord::assistant_text(
+            run_id,
+            first_turn_id,
+            10,
+            "first",
+            TranscriptStreamState::Committed,
+        );
+        let inserted_item = TranscriptItemRecord::assistant_text(
+            run_id,
+            inserted_turn_id,
+            15,
+            "between",
+            TranscriptStreamState::Committed,
+        );
+        let second_item = TranscriptItemRecord::assistant_text(
+            run_id,
+            second_turn_id,
+            20,
+            "second",
+            TranscriptStreamState::Committed,
+        );
+
+        session.upsert_transcript_item(third_item.clone());
+        session.upsert_transcript_item(first_item.clone());
+        session.upsert_transcript_item(second_item.clone());
+
+        assert_eq!(
+            transcript_turn_snapshot(&session),
+            vec![
+                (10, "first".to_string()),
+                (20, "second".to_string()),
+                (30, "third".to_string()),
+            ]
+        );
+
+        session.upsert_transcript_item(TranscriptItemRecord::assistant_text(
+            run_id,
+            second_turn_id,
+            20,
+            "second updated",
+            TranscriptStreamState::Committed,
+        ));
+
+        assert_eq!(
+            transcript_turn_snapshot(&session),
+            vec![
+                (10, "first".to_string()),
+                (20, "second updated".to_string()),
+                (30, "third".to_string()),
+            ]
+        );
+        assert_eq!(
+            transcript_turn_text(
+                session
+                    .find_transcript_item(second_item.item_id)
+                    .expect("replacement keeps transcript lookup stable"),
+            ),
+            "second updated"
+        );
+
+        session.upsert_transcript_item(inserted_item.clone());
+
+        assert_eq!(
+            transcript_turn_snapshot(&session),
+            vec![
+                (10, "first".to_string()),
+                (15, "between".to_string()),
+                (20, "second updated".to_string()),
+                (30, "third".to_string()),
+            ]
+        );
+        assert_eq!(
+            transcript_turn_text(
+                session
+                    .find_transcript_item(inserted_item.item_id)
+                    .expect("inserted transcript item remains reachable after reordering"),
+            ),
+            "between"
+        );
+    }
+
+    #[test]
+    fn tool_invocation_index_tracks_insert_and_replace_paths() {
+        let mut session = Session::new("tool invocation lookups");
+        let run_id = Uuid::new_v4();
+        let inserted_invocation = tool_invocation_record(run_id, 0, None);
+        let first_invocation = tool_invocation_record(run_id, 1, None);
+        let second_invocation = tool_invocation_record(run_id, 2, Some(Uuid::new_v4()));
+
+        session.tool_invocations.push(first_invocation.clone());
+        {
+            let first = session
+                .find_tool_invocation_mut(first_invocation.id)
+                .expect("first inserted invocation remains reachable");
+            first.approval_state = ToolApprovalState::Approved;
+            first.execution_state = ToolExecutionState::Running;
+        }
+
+        session
+            .tool_invocations
+            .insert(0, inserted_invocation.clone());
+        {
+            let first = session
+                .find_tool_invocation_mut(first_invocation.id)
+                .expect("first invocation remains reachable after front insert");
+            first.execution_state = ToolExecutionState::Failed;
+            first.error = Some("first failed".to_string());
+        }
+
+        session.tool_invocations.push(second_invocation.clone());
+        session.tool_invocations[2] = ToolInvocationRecord {
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Running,
+            result: Some("replacement result".to_string()),
+            ..session.tool_invocations[2].clone()
+        };
+        {
+            let second = session
+                .find_tool_invocation_mut(second_invocation.id)
+                .expect("second replaced invocation remains reachable");
+            second.execution_state = ToolExecutionState::Completed;
+            second.result = Some("second result".to_string());
+            second.error = None;
+        }
+
+        assert_eq!(
+            session.tool_invocations[0].execution_state,
+            ToolExecutionState::NotStarted
+        );
+        assert_eq!(
+            session.tool_invocations[1].execution_state,
+            ToolExecutionState::Failed
+        );
+        assert_eq!(
+            session.tool_invocations[1].error.as_deref(),
+            Some("first failed")
+        );
+        assert_eq!(
+            session.tool_invocations[2].execution_state,
+            ToolExecutionState::Completed
+        );
+        assert_eq!(
+            session.tool_invocations[2].result.as_deref(),
+            Some("second result")
+        );
+        assert_eq!(
+            session
+                .find_tool_invocation(second_invocation.id)
+                .expect("immutable tool lookup tracks latest replacement")
+                .result
+                .as_deref(),
+            Some("second result")
+        );
+    }
+
+    fn transcript_turn_snapshot(session: &Session) -> Vec<(ReplaySequence, String)> {
+        session
+            .transcript_items
+            .iter()
+            .map(|item| (item.sequence_number, transcript_turn_text(item).to_string()))
+            .collect()
+    }
+
+    fn transcript_turn_text(item: &TranscriptItemRecord) -> &str {
+        match &item.content {
+            TranscriptItemContent::Turn(content) => match content.role {
+                Role::Assistant => content.content.as_str(),
+                other => panic!("expected assistant turn transcript item, found {other:?}"),
+            },
+            other => panic!("expected turn transcript item, found {other:?}"),
+        }
+    }
+
+    fn tool_invocation_record(
+        run_id: Uuid,
+        sequence_number: ReplaySequence,
+        preceding_turn_id: Option<Uuid>,
+    ) -> ToolInvocationRecord {
+        ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: format!("call-{sequence_number}"),
+            tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
+            arguments: serde_json::json!({
+                "path": format!("file-{sequence_number}.txt"),
+            }),
+            preceding_turn_id,
+            approval_state: ToolApprovalState::Pending,
+            execution_state: ToolExecutionState::NotStarted,
+            result: None,
+            error: None,
+            delegation: None,
+            sequence_number,
+            requested_at: Utc::now(),
+            approved_at: None,
+            completed_at: None,
+        }
     }
 
     fn run_record(

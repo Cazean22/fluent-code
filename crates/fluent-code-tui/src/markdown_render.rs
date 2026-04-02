@@ -12,20 +12,20 @@ const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
 const MAX_HIGHLIGHT_LINES: usize = 10_000;
 
 pub(crate) fn render_markdown_lines(content: &str, base_style: Style) -> Vec<Line<'static>> {
-    let markdown = if content.trim().is_empty() {
-        "(empty)"
-    } else {
-        content
-    };
-    let parser = Parser::new_ext(markdown, Options::ENABLE_STRIKETHROUGH);
-    let mut renderer = MarkdownRenderer::new(base_style);
-    renderer.run(parser);
-    renderer.finish(true).lines
+    render_markdown_lines_with_mode(content, base_style, false)
 }
 
 pub(crate) fn render_streaming_markdown_lines(
     content: &str,
     base_style: Style,
+) -> Vec<Line<'static>> {
+    render_markdown_lines_with_mode(content, base_style, true)
+}
+
+fn render_markdown_lines_with_mode(
+    content: &str,
+    base_style: Style,
+    streaming: bool,
 ) -> Vec<Line<'static>> {
     let markdown = if content.trim().is_empty() {
         "(empty)"
@@ -33,15 +33,17 @@ pub(crate) fn render_streaming_markdown_lines(
         content
     };
 
-    let plain_fenced_code_block_index = infer_unclosed_code_block(markdown)
-        .then(|| count_fenced_code_block_markers(markdown).div_ceil(2));
     let parser = Parser::new_ext(markdown, Options::ENABLE_STRIKETHROUGH);
-    let mut renderer = MarkdownRenderer::new(base_style)
-        .with_plain_fenced_code_block_index(plain_fenced_code_block_index);
+    let mut renderer = MarkdownRenderer::new(base_style);
+    if streaming {
+        let plain_fenced_code_block_index = infer_unclosed_code_block(markdown)
+            .then(|| count_fenced_code_block_markers(markdown).div_ceil(2));
+        renderer = renderer.with_plain_fenced_code_block_index(plain_fenced_code_block_index);
+    }
     renderer.run(parser);
-    let lines = renderer.finish(false).lines;
+    let lines = renderer.finish(!streaming).lines;
 
-    if lines.is_empty() {
+    if streaming && lines.is_empty() {
         vec![Line::from(vec![Span::styled(
             "(empty)".to_string(),
             base_style,

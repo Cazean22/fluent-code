@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use fluent_code_app::app::AppState;
@@ -5,8 +6,9 @@ use fluent_code_app::config::{AcpConfig, AcpSessionDefaultsConfig};
 use fluent_code_app::session::model::{
     ReplaySequence, Role, RunId, RunRecord, RunTerminalStopReason, Session, ToolApprovalState,
     ToolExecutionState, ToolInvocationRecord, ToolSource, TranscriptFidelity,
-    TranscriptItemContent, TranscriptItemRecord, TranscriptPermissionState,
-    transcript_assistant_reasoning_item_id, transcript_assistant_text_item_id,
+    TranscriptItemContent, TranscriptItemId, TranscriptItemRecord, TranscriptPermissionState,
+    TranscriptStreamState, transcript_assistant_reasoning_item_id,
+    transcript_assistant_text_item_id,
 };
 use serde_json::json;
 
@@ -127,8 +129,41 @@ impl SessionUpdateMapper {
         Some(self.project_legacy_prompt_turn(state, run))
     }
 
+    pub fn project_live_prompt_turn(
+        &self,
+        state: &AppState,
+        run_id: RunId,
+        watermark: Option<ReplaySequence>,
+        previously_open_item_ids: &HashSet<TranscriptItemId>,
+    ) -> Option<PromptTurnProjection> {
+        let session = &state.session;
+        let run = session.find_run(run_id)?;
+        if session.root_run_id(run_id) != Some(run_id) {
+            return None;
+        }
+
+        if uses_canonical_transcript_projection(session) {
+            return Some(self.project_canonical_prompt_turn_incremental(
+                state,
+                run,
+                watermark,
+                previously_open_item_ids,
+            ));
+        }
+
+        Some(self.project_legacy_prompt_turn(state, run))
+    }
+
     fn project_canonical_prompt_turns(&self, state: &AppState) -> Vec<PromptTurnProjection> {
+        self.canonical_root_run_ids_in_projection_order(state)
+            .into_iter()
+            .filter_map(|run_id| self.project_prompt_turn(state, run_id))
+            .collect()
+    }
+
+    fn canonical_root_run_ids_in_projection_order(&self, state: &AppState) -> Vec<RunId> {
         let mut root_run_ids = Vec::new();
+        let mut seen_root_run_ids = HashSet::new();
 
         for item in state
             .session
@@ -142,15 +177,12 @@ impl SessionUpdateMapper {
             if state.session.root_run_id(root_run_id) != Some(root_run_id) {
                 continue;
             }
-            if !root_run_ids.contains(&root_run_id) {
+            if seen_root_run_ids.insert(root_run_id) {
                 root_run_ids.push(root_run_id);
             }
         }
 
         root_run_ids
-            .into_iter()
-            .filter_map(|run_id| self.project_prompt_turn(state, run_id))
-            .collect()
     }
 
     fn project_canonical_prompt_turn(
@@ -158,7 +190,19 @@ impl SessionUpdateMapper {
         state: &AppState,
         run: &RunRecord,
     ) -> PromptTurnProjection {
+        self.project_canonical_prompt_turn_incremental(state, run, None, &HashSet::new())
+    }
+
+    fn project_canonical_prompt_turn_incremental(
+        &self,
+        state: &AppState,
+        run: &RunRecord,
+        watermark: Option<ReplaySequence>,
+        previously_open_item_ids: &HashSet<TranscriptItemId>,
+    ) -> PromptTurnProjection {
         let mut events = Vec::new();
+        let mut open_transcript_item_ids = Vec::new();
+        let mut max_sequence: Option<ReplaySequence> = None;
 
         for item in state
             .session
@@ -167,6 +211,20 @@ impl SessionUpdateMapper {
             .filter(|item| state.session.root_run_id(item.run_id) == Some(run.id))
             .filter(|item| is_valid_sequence(&state.session, item.sequence_number))
         {
+            if let Some(watermark) = watermark
+                && item.sequence_number <= watermark
+                && item.stream_state != TranscriptStreamState::Open
+                && !previously_open_item_ids.contains(&item.item_id)
+            {
+                continue;
+            }
+
+            max_sequence = Some(max_sequence.map_or(item.sequence_number, |current| {
+                current.max(item.sequence_number)
+            }));
+            if item.stream_state == TranscriptStreamState::Open {
+                open_transcript_item_ids.push(item.item_id);
+            }
             self.project_transcript_item(state, item, &mut events);
         }
 
@@ -176,6 +234,8 @@ impl SessionUpdateMapper {
             run_id: run.id,
             events,
             terminal_stop: self.terminal_stop(run),
+            max_sequence,
+            open_transcript_item_ids,
         }
     }
 
@@ -273,6 +333,8 @@ impl SessionUpdateMapper {
             run_id: run.id,
             events,
             terminal_stop: self.terminal_stop(run),
+            max_sequence: None,
+            open_transcript_item_ids: Vec::new(),
         }
     }
 
@@ -576,10 +638,7 @@ impl SessionUpdateMapper {
         item: &TranscriptItemRecord,
     ) -> Option<&'a ToolInvocationRecord> {
         let invocation_id = item.tool_invocation_id?;
-        session
-            .tool_invocations
-            .iter()
-            .find(|invocation| invocation.id == invocation_id)
+        session.find_tool_invocation(invocation_id)
     }
 
     pub fn terminal_stop(&self, run: &RunRecord) -> Option<TerminalStopProjection> {
@@ -633,6 +692,8 @@ pub struct PromptTurnProjection {
     pub run_id: RunId,
     pub events: Vec<OrderedPromptTurnEvent>,
     pub terminal_stop: Option<TerminalStopProjection>,
+    pub max_sequence: Option<ReplaySequence>,
+    pub open_transcript_item_ids: Vec<TranscriptItemId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -967,12 +1028,15 @@ fn reasoning_effort_options() -> Vec<SessionConfigSelectOption> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use chrono::Utc;
     use fluent_code_app::app::AppState;
     use fluent_code_app::session::model::{
         Role, RunRecord, RunStatus, RunTerminalStopReason, Session, TaskDelegationRecord,
         TaskDelegationStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
-        ToolSource, TranscriptItemRecord, TranscriptPermissionState, Turn,
+        ToolSource, TranscriptItemContent, TranscriptItemRecord, TranscriptPermissionState,
+        TranscriptStreamState, Turn, transcript_assistant_text_item_id,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -2223,6 +2287,76 @@ mod tests {
                 );
             }
             other => panic!("expected delegated child metadata update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_live_prompt_turn_reprojects_open_stream_items_without_sequence_advance() {
+        let mapper = SessionUpdateMapper::new();
+        let root_run_id = Uuid::new_v4();
+        let assistant_turn_id = Uuid::new_v4();
+        let now = Utc::now();
+        let assistant_item_id = transcript_assistant_text_item_id(assistant_turn_id);
+        let mut session = Session::new("live incremental open stream");
+        session.runs = vec![RunRecord {
+            id: root_run_id,
+            status: RunStatus::InProgress,
+            parent_run_id: None,
+            parent_tool_invocation_id: None,
+            created_sequence: 1,
+            terminal_sequence: None,
+            terminal_stop_reason: None,
+            created_at: now,
+            updated_at: now,
+        }];
+        session.transcript_items = vec![
+            TranscriptItemRecord::from_turn(&user_turn(root_run_id, 2, "resume me")),
+            TranscriptItemRecord {
+                item_id: assistant_item_id,
+                sequence_number: 3,
+                run_id: root_run_id,
+                kind: fluent_code_app::session::model::TranscriptItemKind::Turn,
+                stream_state: TranscriptStreamState::Open,
+                turn_id: Some(assistant_turn_id),
+                tool_invocation_id: None,
+                parent_item_id: None,
+                parent_tool_invocation_id: None,
+                child_run_id: None,
+                content: TranscriptItemContent::Turn(
+                    fluent_code_app::session::model::TranscriptTurnContent {
+                        role: Role::Assistant,
+                        content: "partial answer".to_string(),
+                        reasoning: String::new(),
+                    },
+                ),
+            },
+        ];
+        session.next_replay_sequence = 4;
+        session.normalize_persistence();
+
+        let projection = mapper
+            .project_live_prompt_turn(
+                &AppState::new(session),
+                root_run_id,
+                Some(3),
+                &HashSet::from([assistant_item_id]),
+            )
+            .expect("live prompt turn projection");
+
+        assert_eq!(projection.max_sequence, Some(3));
+        assert_eq!(projection.open_transcript_item_ids, vec![assistant_item_id]);
+        assert_eq!(projection.events.len(), 1);
+        assert_eq!(event_signature(&projection.events[0]).0, 3);
+        assert_eq!(
+            event_signature(&projection.events[0]).1,
+            ProjectionEventPhase::AgentMessage
+        );
+
+        match &projection.events[0].event {
+            PromptTurnEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(chunk)) => {
+                assert_eq!(chunk.content, ContentBlock::text("partial answer"));
+            }
+            other => panic!("expected assistant message reprojection, got {other:?}"),
         }
     }
 

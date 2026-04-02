@@ -228,9 +228,16 @@ pub(crate) fn conversation_lines_from_cells(
     history_cells: &DerivedHistoryCells,
     show_tool_details: bool,
 ) -> Vec<Line<'static>> {
-    let rows = history_cells.iter_rows().collect::<Vec<_>>();
+    conversation_lines_from_rows(history_cells.iter_rows(), show_tool_details)
+}
 
-    if rows.is_empty() {
+pub(crate) fn conversation_lines_from_rows<'a>(
+    rows: impl IntoIterator<Item = &'a ConversationRow>,
+    show_tool_details: bool,
+) -> Vec<Line<'static>> {
+    let mut rows = rows.into_iter().peekable();
+
+    if rows.peek().is_none() {
         return vec![
             Line::default(),
             Line::styled(
@@ -241,12 +248,13 @@ pub(crate) fn conversation_lines_from_cells(
     }
 
     let mut lines = Vec::new();
-    for (i, row) in rows.into_iter().enumerate() {
+    for (i, row) in rows.enumerate() {
         if i > 0 {
             lines.push(Line::default());
         }
         lines.extend(render_row(row, show_tool_details));
     }
+
     lines
 }
 

@@ -46,7 +46,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::conversation::{ConversationRow, derive_history_cells_for_session};
+use crate::conversation::{ConversationRow, DerivedHistoryCells, derive_history_cells_for_session};
 use crate::terminal;
 use crate::theme::TUI_THEME;
 use crate::view::{conversation_lines_from_cells, resolve_transcript_scroll};
@@ -55,7 +55,6 @@ const ACP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const ACP_TEST_PROBES_ENV_VAR: &str = "FLUENT_CODE_ACP_ENABLE_TEST_PROBES";
 const PROJECTION_ACTIVITY_BURST_DRAIN_LIMIT: usize = 8;
-const PROJECTION_QUEUED_INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(10);
 const PROJECTION_PAGE_SCROLL_LINES: u16 = 8;
 const ACP_META_LATEST_PROMPT_STATE_KEY: &str = "fluentCodeLatestPromptState";
 const ACP_META_REPLAY_FIDELITY_KEY: &str = "fluentCodeReplayFidelity";
@@ -81,12 +80,35 @@ pub struct TuiProjectionState {
     current_user_turn_id: Option<Uuid>,
     current_assistant_turn_id: Option<Uuid>,
     current_reasoning_turn_id: Option<Uuid>,
+    conversation_cache: Arc<ProjectionConversationCache>,
+}
+
+#[derive(Debug, Default)]
+struct ProjectionConversationCache {
+    #[cfg(test)]
+    history_cells: DerivedHistoryCells,
+    transcript_rows: Vec<TranscriptRowProjection>,
+    tool_statuses: Vec<ToolStatusProjection>,
+    transcript_lines: Vec<Line<'static>>,
+}
+
+impl ProjectionConversationCache {
+    fn build(session: &Session, status: &AppStatus, active_run_id: Option<Uuid>) -> Self {
+        let history_cells = derive_history_cells_for_session(session, status, active_run_id);
+        Self {
+            #[cfg(test)]
+            history_cells: history_cells.clone(),
+            transcript_rows: transcript_rows_from_history_cells(&history_cells),
+            tool_statuses: tool_statuses_from_history_cells(&history_cells),
+            transcript_lines: conversation_lines_from_cells(&history_cells, false),
+        }
+    }
 }
 
 impl Default for TuiProjectionState {
     fn default() -> Self {
         let transcript_run_id = Uuid::new_v4();
-        Self {
+        let mut projection = Self {
             session: SessionProjection::default(),
             pending_permission: None,
             subprocess: SubprocessProjection::default(),
@@ -104,15 +126,18 @@ impl Default for TuiProjectionState {
             current_user_turn_id: None,
             current_assistant_turn_id: None,
             current_reasoning_turn_id: None,
-        }
+            conversation_cache: Arc::new(ProjectionConversationCache::default()),
+        };
+        projection.refresh_conversation_cache();
+        projection
     }
 }
 
 impl PartialEq for TuiProjectionState {
     fn eq(&self, other: &Self) -> bool {
         self.session == other.session
-            && self.transcript_rows() == other.transcript_rows()
-            && self.tool_statuses() == other.tool_statuses()
+            && self.transcript_rows_ref() == other.transcript_rows_ref()
+            && self.tool_statuses_ref() == other.tool_statuses_ref()
             && self.pending_permission == other.pending_permission
             && self.subprocess == other.subprocess
             && self.draft_input == other.draft_input
@@ -178,6 +203,13 @@ pub struct PendingPermissionProjection {
     pub tool_call_id: String,
     pub title: String,
     pub options: Vec<PermissionOptionProjection>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolCallPayload {
+    raw_input: Option<Value>,
+    raw_output: Option<Value>,
+    content: Option<Vec<acp::ToolCallContent>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +281,14 @@ pub struct ProjectionActivitySnapshot {
 }
 
 impl TuiProjectionState {
+    fn refresh_conversation_cache(&mut self) {
+        self.conversation_cache = Arc::new(ProjectionConversationCache::build(
+            &self.transcript_session,
+            &self.app_status(),
+            self.active_run_id,
+        ));
+    }
+
     fn reset_session_projection(&mut self, session_id: Option<String>) {
         self.session = SessionProjection {
             session_id,
@@ -271,6 +311,7 @@ impl TuiProjectionState {
         self.transcript_run_id = Uuid::new_v4();
         self.active_run_id = None;
         self.break_transcript_merge();
+        self.refresh_conversation_cache();
     }
 
     fn mark_spawned(&mut self, binary_path: PathBuf, pid: u32) {
@@ -297,6 +338,7 @@ impl TuiProjectionState {
         self.set_prompt_status(None);
         self.break_transcript_merge();
         self.subprocess.status = SubprocessStatus::Failed { message };
+        self.refresh_conversation_cache();
     }
 
     fn mark_session_created(&mut self, session_id: acp::SessionId) {
@@ -320,6 +362,7 @@ impl TuiProjectionState {
         self.active_run_id = Some(self.transcript_run_id);
         self.set_prompt_status(Some(PromptStatusProjection::Running));
         self.break_transcript_merge();
+        self.refresh_conversation_cache();
     }
 
     fn mark_prompt_finished(&mut self, stop_reason: acp::StopReason) {
@@ -330,6 +373,7 @@ impl TuiProjectionState {
         }));
         self.commit_open_transcript_items();
         self.break_transcript_merge();
+        self.refresh_conversation_cache();
     }
 
     fn mark_prompt_error(&mut self, message: String) {
@@ -338,6 +382,7 @@ impl TuiProjectionState {
         self.prompt_error = Some(message);
         self.commit_open_transcript_items();
         self.break_transcript_merge();
+        self.refresh_conversation_cache();
     }
 
     fn apply_loaded_session_projection(&mut self, metadata: LoadedSessionMetadataProjection) {
@@ -352,6 +397,7 @@ impl TuiProjectionState {
             self.set_prompt_status(prompt_status);
         }
         self.active_run_id = self.prompt_in_flight.then_some(self.transcript_run_id);
+        self.refresh_conversation_cache();
     }
 
     #[cfg(test)]
@@ -406,6 +452,7 @@ impl TuiProjectionState {
                 }
                 if let Some(item) = transcript_item_from_meta(update.meta.as_ref()) {
                     self.apply_transcript_metadata_item(item);
+                    self.refresh_conversation_cache();
                 }
             }
             acp::SessionUpdate::Plan(_)
@@ -458,6 +505,7 @@ impl TuiProjectionState {
         }
         self.set_prompt_status(Some(PromptStatusProjection::AwaitingToolApproval));
         self.active_run_id = Some(self.transcript_run_id);
+        self.refresh_conversation_cache();
     }
 
     fn apply_permission_selection(&mut self, option_id: &str) {
@@ -489,6 +537,7 @@ impl TuiProjectionState {
         } else {
             PromptStatusProjection::Running
         }));
+        self.refresh_conversation_cache();
     }
 
     fn append_user_chunk(&mut self, content: acp::ContentBlock) {
@@ -510,6 +559,7 @@ impl TuiProjectionState {
             let transcript_item = TranscriptItemRecord::from_turn(turn);
             self.transcript_session
                 .upsert_transcript_item(transcript_item);
+            self.refresh_conversation_cache();
             return;
         }
 
@@ -526,6 +576,7 @@ impl TuiProjectionState {
         self.transcript_session.turns.push(turn.clone());
         self.transcript_session
             .upsert_transcript_item(TranscriptItemRecord::from_turn(&turn));
+        self.refresh_conversation_cache();
     }
 
     fn break_transcript_merge(&mut self) {
@@ -576,6 +627,7 @@ impl TuiProjectionState {
 
         if let Some(existing_turn_id) = *turn_id {
             self.update_assistant_transcript_item(existing_turn_id, source, &content);
+            self.refresh_conversation_cache();
             return;
         }
 
@@ -601,6 +653,7 @@ impl TuiProjectionState {
         *turn_id = Some(new_turn_id);
         self.transcript_session
             .upsert_transcript_item(transcript_item);
+        self.refresh_conversation_cache();
     }
 
     fn apply_tool_call_update(&mut self, update: acp::ToolCallUpdate) {
@@ -620,9 +673,11 @@ impl TuiProjectionState {
         self.upsert_tool_invocation(
             &tool_call_id,
             &tool_name,
-            raw_input,
-            raw_output,
-            content,
+            ToolCallPayload {
+                raw_input,
+                raw_output,
+                content,
+            },
             status,
             tool_invocation,
         );
@@ -631,6 +686,7 @@ impl TuiProjectionState {
             self.set_prompt_status(Some(PromptStatusProjection::RunningTool));
             self.active_run_id = Some(self.transcript_run_id);
         }
+        self.refresh_conversation_cache();
     }
 
     fn apply_tool_call_snapshot(&mut self, tool_call: acp::ToolCall) {
@@ -639,21 +695,22 @@ impl TuiProjectionState {
         self.upsert_tool_invocation(
             &tool_call_id,
             &tool_name,
-            tool_call.raw_input,
-            tool_call.raw_output,
-            Some(tool_call.content),
+            ToolCallPayload {
+                raw_input: tool_call.raw_input,
+                raw_output: tool_call.raw_output,
+                content: Some(tool_call.content),
+            },
             Some(tool_call.status),
             tool_invocation_from_meta(tool_call.meta.as_ref()),
         );
+        self.refresh_conversation_cache();
     }
 
     fn upsert_tool_invocation(
         &mut self,
         tool_call_id: &str,
         tool_name: &str,
-        raw_input: Option<Value>,
-        raw_output: Option<Value>,
-        content: Option<Vec<acp::ToolCallContent>>,
+        payload: ToolCallPayload,
         status: Option<acp::ToolCallStatus>,
         tool_invocation: Option<ToolInvocationRecord>,
     ) {
@@ -663,7 +720,7 @@ impl TuiProjectionState {
         let meta_error = tool_invocation
             .as_ref()
             .and_then(|invocation| invocation.error.clone());
-        let (result, error) = tool_output_previews(raw_output, content.as_deref());
+        let (result, error) = tool_output_previews(payload.raw_output, payload.content.as_deref());
         let now = Utc::now();
         let invocation_index = self
             .transcript_session
@@ -703,7 +760,7 @@ impl TuiProjectionState {
                 .as_ref()
                 .map(|invocation| invocation.tool_source.clone())
                 .unwrap_or(fluent_code_app::session::model::ToolSource::BuiltIn),
-            arguments: raw_input.unwrap_or_else(|| {
+            arguments: payload.raw_input.unwrap_or_else(|| {
                 tool_invocation
                     .as_ref()
                     .map(|invocation| invocation.arguments.clone())
@@ -880,72 +937,29 @@ impl TuiProjectionState {
         }
     }
 
-    fn history_cells(&self) -> crate::conversation::DerivedHistoryCells {
-        derive_history_cells_for_session(
-            &self.transcript_session,
-            &self.app_status(),
-            self.active_run_id,
-        )
+    #[cfg(test)]
+    fn history_cells(&self) -> &DerivedHistoryCells {
+        &self.conversation_cache.history_cells
+    }
+
+    fn transcript_rows_ref(&self) -> &[TranscriptRowProjection] {
+        &self.conversation_cache.transcript_rows
     }
 
     pub fn transcript_rows(&self) -> Vec<TranscriptRowProjection> {
-        let mut transcript_rows = Vec::new();
+        self.transcript_rows_ref().to_vec()
+    }
 
-        for row in self.history_cells().iter_rows() {
-            match row {
-                ConversationRow::Turn(turn)
-                    if turn.role == Role::User && !turn.content.is_empty() =>
-                {
-                    transcript_rows.push(TranscriptRowProjection {
-                        source: TranscriptSource::User,
-                        content: turn.content.clone(),
-                    });
-                }
-                ConversationRow::Reasoning(reasoning) if !reasoning.content.is_empty() => {
-                    transcript_rows.push(TranscriptRowProjection {
-                        source: TranscriptSource::Thought,
-                        content: reasoning.content.clone(),
-                    });
-                }
-                ConversationRow::Turn(turn)
-                    if turn.role == Role::Assistant && !turn.content.is_empty() =>
-                {
-                    transcript_rows.push(TranscriptRowProjection {
-                        source: TranscriptSource::Agent,
-                        content: turn.content.clone(),
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        transcript_rows
+    fn tool_statuses_ref(&self) -> &[ToolStatusProjection] {
+        &self.conversation_cache.tool_statuses
     }
 
     pub fn tool_statuses(&self) -> Vec<ToolStatusProjection> {
-        let mut tool_statuses = Vec::new();
+        self.tool_statuses_ref().to_vec()
+    }
 
-        for row in self.history_cells().iter_rows() {
-            match row {
-                ConversationRow::Tool(tool) => {
-                    tool_statuses.push(ToolStatusProjection {
-                        tool_call_id: tool.tool_call_id.clone(),
-                        title: tool.display_name.clone(),
-                        status: tool_execution_label(tool.execution_state, tool.approval_state),
-                    });
-                }
-                ConversationRow::ToolGroup(group) => {
-                    tool_statuses.extend(group.items.iter().map(|tool| ToolStatusProjection {
-                        tool_call_id: tool.tool_call_id.clone(),
-                        title: tool.display_name.clone(),
-                        status: tool_execution_label(tool.execution_state, tool.approval_state),
-                    }));
-                }
-                _ => {}
-            }
-        }
-
-        tool_statuses
+    fn transcript_lines(&self) -> &[Line<'static>] {
+        &self.conversation_cache.transcript_lines
     }
 
     fn scroll_transcript_up(&mut self, lines: u16) {
@@ -2660,24 +2674,28 @@ async fn wait_for_projection_action(
     input: &mut ProjectionLoopInput,
     snapshot: &ProjectionSnapshot,
 ) -> Result<ProjectionWaitOutcome> {
-    loop {
-        if let Some(event) = input.try_next_event()? {
-            return Ok(ProjectionWaitOutcome::Action(projection_action_from_event(
+    if let Some(event) = input.try_next_event()? {
+        return Ok(ProjectionWaitOutcome::Action(projection_action_from_event(
+            &snapshot.projection,
+            event,
+        )));
+    }
+
+    let activity_wait = controller.wait_for_activity(snapshot.activity_sequence);
+    tokio::pin!(activity_wait);
+
+    let input_wait = input.next_event();
+    tokio::pin!(input_wait);
+
+    tokio::select! {
+        biased;
+        () = &mut activity_wait => Ok(ProjectionWaitOutcome::Activity),
+        result = &mut input_wait => {
+            let event = result?;
+            Ok(ProjectionWaitOutcome::Action(projection_action_from_event(
                 &snapshot.projection,
                 event,
-            )));
-        }
-
-        let activity_wait = controller.wait_for_activity(snapshot.activity_sequence);
-        tokio::pin!(activity_wait);
-
-        let poll_delay = tokio::time::sleep(PROJECTION_QUEUED_INPUT_POLL_TIMEOUT);
-        tokio::pin!(poll_delay);
-
-        tokio::select! {
-            biased;
-            () = &mut activity_wait => return Ok(ProjectionWaitOutcome::Activity),
-            () = &mut poll_delay => {}
+            )))
         }
     }
 }
@@ -2891,23 +2909,12 @@ fn projection_lines(projection: &TuiProjectionState) -> Vec<Line<'static>> {
         lines.push(Line::from(format!("  {error}")));
     }
 
-    let transcript_lines = projection_transcript_lines(projection);
-    if !transcript_lines.is_empty() {
+    if !projection.transcript_lines().is_empty() {
         lines.push(Line::default());
-        lines.extend(transcript_lines);
+        lines.extend(projection.transcript_lines().iter().cloned());
     }
 
     lines
-}
-
-fn projection_history_cells(
-    projection: &TuiProjectionState,
-) -> crate::conversation::DerivedHistoryCells {
-    projection.history_cells()
-}
-
-fn projection_transcript_lines(projection: &TuiProjectionState) -> Vec<Line<'static>> {
-    conversation_lines_from_cells(&projection_history_cells(projection), false)
 }
 
 fn projection_body_scroll(projection: &TuiProjectionState, lines: &[Line<'_>], area: Rect) -> u16 {
@@ -2939,6 +2946,163 @@ fn line_from_status(status: &SubprocessStatus) -> Line<'static> {
             Line::from(format!("ACP subprocess: failed ({message})"))
         }
     }
+}
+
+fn transcript_rows_from_history_cells(
+    history_cells: &DerivedHistoryCells,
+) -> Vec<TranscriptRowProjection> {
+    let mut transcript_rows = Vec::new();
+
+    for row in history_cells.iter_rows() {
+        match row {
+            ConversationRow::Turn(turn) if turn.role == Role::User && !turn.content.is_empty() => {
+                transcript_rows.push(TranscriptRowProjection {
+                    source: TranscriptSource::User,
+                    content: turn.content.clone(),
+                });
+            }
+            ConversationRow::Reasoning(reasoning) if !reasoning.content.is_empty() => {
+                transcript_rows.push(TranscriptRowProjection {
+                    source: TranscriptSource::Thought,
+                    content: reasoning.content.clone(),
+                });
+            }
+            ConversationRow::Turn(turn)
+                if turn.role == Role::Assistant && !turn.content.is_empty() =>
+            {
+                transcript_rows.push(TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: turn.content.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    transcript_rows
+}
+
+fn tool_statuses_from_history_cells(
+    history_cells: &DerivedHistoryCells,
+) -> Vec<ToolStatusProjection> {
+    let mut tool_statuses = Vec::new();
+
+    for row in history_cells.iter_rows() {
+        match row {
+            ConversationRow::Tool(tool) => {
+                tool_statuses.push(ToolStatusProjection {
+                    tool_call_id: tool.tool_call_id.clone(),
+                    title: tool.display_name.clone(),
+                    status: tool_execution_label(tool.execution_state, tool.approval_state),
+                });
+            }
+            ConversationRow::ToolGroup(group) => {
+                tool_statuses.extend(group.items.iter().map(|tool| ToolStatusProjection {
+                    tool_call_id: tool.tool_call_id.clone(),
+                    title: tool.display_name.clone(),
+                    status: tool_execution_label(tool.execution_state, tool.approval_state),
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    tool_statuses
+}
+
+#[cfg(test)]
+fn uncached_history_cells(projection: &TuiProjectionState) -> DerivedHistoryCells {
+    derive_history_cells_for_session(
+        &projection.transcript_session,
+        &projection.app_status(),
+        projection.active_run_id,
+    )
+}
+
+#[cfg(test)]
+fn uncached_transcript_rows(projection: &TuiProjectionState) -> Vec<TranscriptRowProjection> {
+    transcript_rows_from_history_cells(&uncached_history_cells(projection))
+}
+
+#[cfg(test)]
+fn uncached_tool_statuses(projection: &TuiProjectionState) -> Vec<ToolStatusProjection> {
+    tool_statuses_from_history_cells(&uncached_history_cells(projection))
+}
+
+#[cfg(test)]
+fn uncached_projection_lines(projection: &TuiProjectionState) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(line_from_status(&projection.subprocess.status));
+
+    if let Some(session_id) = &projection.session.session_id {
+        lines.push(Line::from(format!("Session: {session_id}")));
+    } else {
+        lines.push(Line::from("Session: not created yet"));
+    }
+
+    if let Some(title) = &projection.session.title {
+        lines.push(Line::from(format!("Title: {title}")));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("Replay fidelity: ", TUI_THEME.text_muted),
+        Span::styled(
+            match projection.replay_fidelity {
+                ReplayFidelityProjection::Exact => "exact",
+                ReplayFidelityProjection::Approximate => "approximate",
+            },
+            match projection.replay_fidelity {
+                ReplayFidelityProjection::Exact => TUI_THEME.success,
+                ReplayFidelityProjection::Approximate => TUI_THEME.warning,
+            },
+        ),
+    ]));
+
+    if let Some(prompt_status) = projection.prompt_status {
+        lines.push(Line::from(vec![
+            Span::styled("Prompt status: ", TUI_THEME.text_muted),
+            Span::styled(
+                prompt_status_label(prompt_status),
+                prompt_status_style(prompt_status),
+            ),
+        ]));
+    }
+
+    if let Some(permission) = &projection.pending_permission {
+        lines.push(Line::default());
+        lines.push(Line::styled("Pending permission", TUI_THEME.warning));
+        lines.push(Line::from(format!(
+            "  {} ({})",
+            permission.title, permission.tool_call_id
+        )));
+        for option in &permission.options {
+            lines.push(Line::from(format!(
+                "  - {} [{}]",
+                option.name, option.option_id
+            )));
+        }
+    }
+
+    if let Some(error) = &projection.startup_error {
+        lines.push(Line::default());
+        lines.push(Line::styled("Startup error", TUI_THEME.error));
+        lines.push(Line::from(format!("  {error}")));
+    }
+
+    if let Some(error) = &projection.prompt_error {
+        lines.push(Line::default());
+        lines.push(Line::styled("Prompt error", TUI_THEME.error));
+        lines.push(Line::from(format!("  {error}")));
+    }
+
+    let transcript_lines =
+        conversation_lines_from_cells(&uncached_history_cells(projection), false);
+    if !transcript_lines.is_empty() {
+        lines.push(Line::default());
+        lines.extend(transcript_lines);
+    }
+
+    lines
 }
 
 fn status_label(projection: &TuiProjectionState) -> &'static str {
@@ -3483,6 +3647,26 @@ impl ProjectionLoopInput {
                         "ACP projection input pump stopped unexpectedly".to_string(),
                     ))
                 }
+            },
+        }
+    }
+
+    async fn next_event(&mut self) -> Result<Event> {
+        match &mut self.source {
+            ProjectionLoopInputSource::Stream(stream) => match stream.next().await {
+                Some(Ok(event)) => Ok(event),
+                Some(Err(error)) => Err(error.into()),
+                None => Err(FluentCodeError::Provider(
+                    "ACP projection input pump stopped unexpectedly".to_string(),
+                )),
+            },
+            #[cfg(test)]
+            ProjectionLoopInputSource::Receiver(receiver) => match receiver.recv().await {
+                Some(Ok(event)) => Ok(event),
+                Some(Err(error)) => Err(error.into()),
+                None => Err(FluentCodeError::Provider(
+                    "ACP projection input pump stopped unexpectedly".to_string(),
+                )),
             },
         }
     }
@@ -4445,6 +4629,7 @@ fn projection_with_session(
     projection.pending_permission = pending_permission;
     projection.active_run_id = active_run_id;
     projection.set_prompt_status(prompt_status);
+    projection.refresh_conversation_cache();
     projection
 }
 
@@ -4878,6 +5063,164 @@ pub(crate) fn assert_render_contract_distinguishes_committed_history_from_active
 }
 
 #[cfg(test)]
+pub(crate) fn assert_conversation_projection_cache_preserves_history_output() {
+    let run_id = Uuid::new_v4();
+    let mut session = Session::new("projection cache parity");
+    let user_turn = make_turn(run_id, Role::User, "summarize the latest update", 1);
+    let assistant_turn = make_turn(run_id, Role::Assistant, "Committed line\n\n# Heading", 2);
+    let mut invocation = make_tool_invocation(
+        run_id,
+        Some(user_turn.id),
+        "read",
+        json!({"path": "src/lib.rs"}),
+        3,
+    );
+    invocation.result = Some("ok".to_string());
+
+    session
+        .turns
+        .extend([user_turn.clone(), assistant_turn.clone()]);
+    session.tool_invocations.push(invocation.clone());
+    session.transcript_items = vec![
+        TranscriptItemRecord::from_turn(&user_turn),
+        TranscriptItemRecord::from_turn(&assistant_turn),
+        TranscriptItemRecord::from_tool_invocation(&invocation),
+        TranscriptItemRecord::assistant_text(
+            run_id,
+            Uuid::new_v4(),
+            4,
+            "streaming tail",
+            TranscriptStreamState::Open,
+        ),
+    ];
+    session.upsert_run(
+        run_id,
+        fluent_code_app::session::model::RunStatus::InProgress,
+    );
+
+    let projection = projection_with_session(
+        "session-cache-preserve",
+        session,
+        Some(PromptStatusProjection::Running),
+        Some(run_id),
+        None,
+    );
+
+    assert_eq!(
+        projection.transcript_rows(),
+        uncached_transcript_rows(&projection)
+    );
+    assert_eq!(
+        projection.tool_statuses(),
+        uncached_tool_statuses(&projection)
+    );
+    assert_eq!(
+        projection_lines(&projection)
+            .into_iter()
+            .map(tests::line_to_string)
+            .collect::<Vec<_>>(),
+        uncached_projection_lines(&projection)
+            .into_iter()
+            .map(tests::line_to_string)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn assert_conversation_projection_cache_invalidates_on_transcript_change() {
+    let mut projection = TuiProjectionState::default();
+    let initial_cache = Arc::clone(&projection.conversation_cache);
+
+    projection.apply_session_notification(tests::agent_message_chunk("first chunk"));
+    let after_first_chunk_cache = Arc::clone(&projection.conversation_cache);
+
+    assert!(!Arc::ptr_eq(&initial_cache, &after_first_chunk_cache));
+    assert_eq!(
+        projection.transcript_rows(),
+        uncached_transcript_rows(&projection)
+    );
+    assert_eq!(
+        projection_lines(&projection)
+            .into_iter()
+            .map(tests::line_to_string)
+            .collect::<Vec<_>>(),
+        uncached_projection_lines(&projection)
+            .into_iter()
+            .map(tests::line_to_string)
+            .collect::<Vec<_>>(),
+    );
+
+    projection.apply_session_notification(tests::agent_message_chunk(" plus more"));
+
+    assert!(!Arc::ptr_eq(
+        &after_first_chunk_cache,
+        &projection.conversation_cache
+    ));
+    assert_eq!(
+        projection.transcript_rows(),
+        vec![TranscriptRowProjection {
+            source: TranscriptSource::Agent,
+            content: "first chunk plus more".to_string(),
+        }]
+    );
+    assert_eq!(
+        projection.transcript_rows(),
+        uncached_transcript_rows(&projection)
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn assert_startup_restore_with_projection_cache_matches_uncached_output() {
+    let run_id = Uuid::new_v4();
+    let mut session = Session::new("restored session");
+    let user_turn = make_turn(run_id, Role::User, "restore this", 1);
+    session.turns.push(user_turn.clone());
+    session.transcript_fidelity = TranscriptFidelity::Approximate;
+    session.foreground_owner = Some(fluent_code_app::session::model::ForegroundOwnerRecord {
+        run_id,
+        phase: ForegroundPhase::Generating,
+        batch_anchor_turn_id: None,
+    });
+    session.transcript_items = vec![
+        TranscriptItemRecord::from_turn(&user_turn),
+        TranscriptItemRecord::assistant_text(
+            run_id,
+            Uuid::new_v4(),
+            2,
+            "restored answer",
+            TranscriptStreamState::Open,
+        ),
+    ];
+    session.upsert_run(
+        run_id,
+        fluent_code_app::session::model::RunStatus::InProgress,
+    );
+
+    let mut projection =
+        projection_with_session("session-restored", session.clone(), None, None, None);
+    projection.apply_loaded_session_metadata(&session);
+
+    assert_eq!(
+        projection.replay_fidelity,
+        ReplayFidelityProjection::Approximate
+    );
+    assert_eq!(
+        projection_lines(&projection)
+            .into_iter()
+            .map(tests::line_to_string)
+            .collect::<Vec<_>>(),
+        uncached_projection_lines(&projection)
+            .into_iter()
+            .map(tests::line_to_string)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        projection.transcript_rows(),
+        uncached_transcript_rows(&projection)
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -5179,7 +5522,7 @@ mod tests {
             "session-1",
             TranscriptItemRecord::run_terminal(&fluent_code_app::session::model::RunRecord {
                 id: root_run_id,
-                status: fluent_code_app::session::model::RunStatus::Interrupted,
+                status: fluent_code_app::session::model::RunStatus::Failed,
                 parent_run_id: None,
                 parent_tool_invocation_id: None,
                 created_sequence: 1,
@@ -5197,7 +5540,7 @@ mod tests {
             vec![ToolStatusProjection {
                 tool_call_id: "task-call-1".to_string(),
                 title: "task explore".to_string(),
-                status: "pending".to_string(),
+                status: "queued".to_string(),
             }]
         );
         assert_eq!(
@@ -5308,6 +5651,21 @@ mod tests {
     #[test]
     fn render_contract_distinguishes_committed_history_from_active_cell() {
         super::assert_render_contract_distinguishes_committed_history_from_active_cell();
+    }
+
+    #[test]
+    fn conversation_projection_cache_preserves_history_output() {
+        super::assert_conversation_projection_cache_preserves_history_output();
+    }
+
+    #[test]
+    fn conversation_projection_cache_invalidates_on_transcript_change() {
+        super::assert_conversation_projection_cache_invalidates_on_transcript_change();
+    }
+
+    #[test]
+    fn startup_restore_with_projection_cache_matches_uncached_output() {
+        super::assert_startup_restore_with_projection_cache_matches_uncached_output();
     }
 
     pub(super) fn agent_message_chunk(text: &str) -> acp::SessionNotification {

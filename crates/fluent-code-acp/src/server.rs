@@ -15,8 +15,8 @@ use fluent_code_app::logging::{config_source_for_log, path_for_log};
 use fluent_code_app::plugin::{PluginLoadSnapshot, ToolRegistry};
 use fluent_code_app::runtime::Runtime;
 use fluent_code_app::session::model::{
-    ForegroundPhase, RunId, RunTerminalStopReason, Session, SessionId, TaskDelegationStatus,
-    ToolApprovalState, ToolExecutionState,
+    ForegroundPhase, ReplaySequence, RunId, RunTerminalStopReason, Session, SessionId,
+    TaskDelegationStatus, ToolApprovalState, ToolExecutionState, TranscriptItemId,
 };
 use fluent_code_app::session::store::FsSessionStore;
 use fluent_code_app::{FluentCodeError, Result};
@@ -216,6 +216,8 @@ impl RpcResponseError {
 
 #[derive(Debug, Default)]
 struct PromptTurnEmissionState {
+    watermark: Option<ReplaySequence>,
+    open_transcript_item_ids: HashSet<TranscriptItemId>,
     emitted_text_lengths: HashMap<(u64, u8), usize>,
     emitted_tool_calls: HashSet<String>,
     emitted_permission_requests: HashSet<String>,
@@ -223,13 +225,42 @@ struct PromptTurnEmissionState {
 }
 
 struct PromptTurnResult {
-    frames: Vec<Value>,
+    frames: Vec<OutboundFrame>,
     stop_reason: SessionPromptResponse,
 }
 
 struct LivePromptPollResult {
-    frames: Vec<Value>,
+    frames: Vec<OutboundFrame>,
     prompt_turn_complete: bool,
+}
+
+#[derive(Clone, Debug)]
+struct OutboundFrame {
+    json: Box<str>,
+}
+
+impl OutboundFrame {
+    fn new(json: String) -> std::result::Result<Self, RpcResponseError> {
+        if json.contains(['\n', '\r']) {
+            return Err(RpcResponseError::internal(
+                "serialized JSON-RPC frame must remain single-line",
+            ));
+        }
+
+        Ok(Self {
+            json: json.into_boxed_str(),
+        })
+    }
+
+    fn into_value(self) -> std::result::Result<Value, RpcResponseError> {
+        serde_json::from_str(&self.json)
+            .map_err(|error| RpcResponseError::internal(error.to_string()))
+    }
+
+    fn to_value(&self) -> std::result::Result<Value, RpcResponseError> {
+        serde_json::from_str(&self.json)
+            .map_err(|error| RpcResponseError::internal(error.to_string()))
+    }
 }
 
 type ManagedSessionHandle = Arc<Mutex<ManagedSession>>;
@@ -391,9 +422,10 @@ impl OfficialAgentAdapter {
 
     async fn try_route_notification_frame(
         &self,
-        frame: Value,
-        outbound_frames: &mut VecDeque<Value>,
+        frame: OutboundFrame,
+        outbound_frames: &mut VecDeque<OutboundFrame>,
     ) -> acp::Result<(FrameRouteResult, Option<Value>)> {
+        let frame = frame.into_value().map_err(map_rpc_response_error)?;
         let mut frame_object = match frame {
             Value::Object(frame_object) => frame_object,
             frame => return Ok((FrameRouteResult::NotRouted, Some(frame))),
@@ -435,7 +467,7 @@ impl OfficialAgentAdapter {
 
     async fn process_outbound_frames<TResponse>(
         &self,
-        outbound_frames: Vec<Value>,
+        outbound_frames: Vec<OutboundFrame>,
     ) -> acp::Result<TResponse>
     where
         TResponse: serde::de::DeserializeOwned,
@@ -635,7 +667,7 @@ impl OfficialAgentAdapter {
         &self,
         request: &acp::RequestPermissionRequest,
         response: acp::RequestPermissionResponse,
-    ) -> acp::Result<Vec<Value>> {
+    ) -> acp::Result<Vec<OutboundFrame>> {
         self.connection
             .process_permission_response(request, response)
             .await
@@ -736,7 +768,7 @@ impl OfficialAgentAdapter {
     async fn process_prompt_outbound_frames(
         &self,
         prompt_request_id: u64,
-        outbound_frames: Vec<Value>,
+        outbound_frames: Vec<OutboundFrame>,
     ) -> acp::Result<Option<acp::PromptResponse>> {
         let mut prompt_response = None;
         let mut outbound_frames = VecDeque::from(outbound_frames);
@@ -797,11 +829,14 @@ impl OfficialAgentAdapter {
         &self,
         session_id: &SessionId,
         cancel_request_id: u64,
-        outbound_frames: Vec<Value>,
+        outbound_frames: Vec<OutboundFrame>,
     ) -> acp::Result<()> {
         let mut buffered_prompt_completion = None;
 
         for outbound_frame in outbound_frames {
+            let outbound_frame = outbound_frame
+                .into_value()
+                .map_err(map_rpc_response_error)?;
             match outbound_frame.get("method").and_then(Value::as_str) {
                 Some(SESSION_UPDATE_METHOD) => {
                     let notification = serde_json::from_value::<acp::SessionNotification>(
@@ -899,7 +934,7 @@ async fn cancel_via_adapter(
         .await
 }
 
-fn prepend_outbound_frames(queue: &mut VecDeque<Value>, frames: Vec<Value>) {
+fn prepend_outbound_frames(queue: &mut VecDeque<OutboundFrame>, frames: Vec<OutboundFrame>) {
     for frame in frames.into_iter().rev() {
         queue.push_front(frame);
     }
@@ -917,7 +952,7 @@ impl OfficialAgentConnection {
         &self,
         method: Method,
         params: TParams,
-    ) -> acp::Result<Vec<Value>>
+    ) -> acp::Result<Vec<OutboundFrame>>
     where
         TParams: Serialize,
     {
@@ -979,7 +1014,7 @@ impl OfficialAgentConnection {
         &self,
         request: &acp::RequestPermissionRequest,
         response: acp::RequestPermissionResponse,
-    ) -> acp::Result<Vec<Value>> {
+    ) -> acp::Result<Vec<OutboundFrame>> {
         let session_id =
             parse_session_id(&request.session_id.to_string()).map_err(map_rpc_response_error)?;
         let managed_session = self
@@ -1001,7 +1036,7 @@ impl OfficialAgentConnection {
     async fn start_live_prompt_request(
         &self,
         args: acp::PromptRequest,
-    ) -> acp::Result<(String, u64, ManagedSessionHandle, Vec<Value>)> {
+    ) -> acp::Result<(String, u64, ManagedSessionHandle, Vec<OutboundFrame>)> {
         let session_id = args.session_id.to_string();
         let managed_session_id = parse_session_id(&session_id).map_err(map_rpc_response_error)?;
         let prompt =
@@ -1061,7 +1096,7 @@ impl OfficialAgentConnection {
     async fn prepare_cancel_request(
         &self,
         args: &acp::CancelNotification,
-    ) -> acp::Result<(SessionId, u64, Vec<Value>)> {
+    ) -> acp::Result<(SessionId, u64, Vec<OutboundFrame>)> {
         let session_id =
             parse_session_id(&args.session_id.to_string()).map_err(map_rpc_response_error)?;
         let (cancel_request_id, managed_session) = self
@@ -1225,7 +1260,7 @@ impl PromptTurnEmissionState {
         &mut self,
         session_id: &str,
         projection: &PromptTurnProjection,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         let mut outbound_frames = Vec::new();
 
         for event in &projection.events {
@@ -1247,6 +1282,18 @@ impl PromptTurnEmissionState {
                 }
             }
         }
+
+        if let Some(max_sequence) = projection.max_sequence {
+            self.watermark = Some(
+                self.watermark
+                    .map_or(max_sequence, |current| current.max(max_sequence)),
+            );
+        }
+        self.open_transcript_item_ids = projection
+            .open_transcript_item_ids
+            .iter()
+            .copied()
+            .collect();
 
         Ok(outbound_frames)
     }
@@ -1529,7 +1576,8 @@ impl AcpServer {
 
                             let outbound_frames = match self.handle_live_frame(&mut connection, &frame).await {
                                 Ok(outbound_frames) => outbound_frames,
-                                Err(error_response) => vec![serde_json::to_value(error_response)?],
+                                Err(error_response) => vec![serialize_value(error_response)
+                                    .map_err(|error| FluentCodeError::Provider(error.message))?],
                             };
                             self.write_outbound_frames(writer, outbound_frames.clone())?;
                             clear_written_prompt_responses(
@@ -1580,7 +1628,10 @@ impl AcpServer {
 
             let outbound_frames = match self.handle_frame(&mut connection, &frame).await {
                 Ok(outbound_frames) => outbound_frames,
-                Err(error_response) => vec![serde_json::to_value(error_response)?],
+                Err(error_response) => vec![
+                    serialize_value(error_response)
+                        .map_err(|error| FluentCodeError::Provider(error.message))?,
+                ],
             };
             self.write_outbound_frames(writer, outbound_frames)?;
         }
@@ -1605,7 +1656,10 @@ impl AcpServer {
 
             let outbound_frames = match self.handle_frame(&mut connection, &frame).await {
                 Ok(outbound_frames) => outbound_frames,
-                Err(error_response) => vec![serde_json::to_value(error_response)?],
+                Err(error_response) => vec![
+                    serialize_value(error_response)
+                        .map_err(|error| FluentCodeError::Provider(error.message))?,
+                ],
             };
             self.write_outbound_frames(writer, outbound_frames)?;
         }
@@ -1617,11 +1671,13 @@ impl AcpServer {
     fn write_outbound_frames<W: Write>(
         &self,
         writer: &mut W,
-        outbound_frames: Vec<Value>,
+        outbound_frames: Vec<OutboundFrame>,
     ) -> Result<()> {
         for outbound_frame in outbound_frames {
-            self.transport
-                .write_frame(writer, &outbound_frame)
+            writer
+                .write_all(outbound_frame.json.as_bytes())
+                .and_then(|()| writer.write_all(b"\n"))
+                .and_then(|()| writer.flush())
                 .map_err(|error| {
                     FluentCodeError::Provider(format!("ACP stdio transport error: {error}"))
                 })?;
@@ -1635,7 +1691,7 @@ impl AcpServer {
         &self,
         connection: &mut AcpConnectionState,
         frame: &str,
-    ) -> std::result::Result<Vec<Value>, JsonRpcErrorResponse> {
+    ) -> std::result::Result<Vec<OutboundFrame>, JsonRpcErrorResponse> {
         let request_id = request_id_from_frame(frame);
         let request = self
             .parse_request(connection, frame)
@@ -1651,7 +1707,7 @@ impl AcpServer {
         &self,
         connection: &mut AcpConnectionState,
         frame: &str,
-    ) -> std::result::Result<Vec<Value>, JsonRpcErrorResponse> {
+    ) -> std::result::Result<Vec<OutboundFrame>, JsonRpcErrorResponse> {
         let request_id = request_id_from_frame(frame);
         let request = self
             .parse_request(connection, frame)
@@ -1678,7 +1734,7 @@ impl AcpServer {
         &self,
         connection: &mut AcpConnectionState,
         request: ParsedRequest,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         match request.method {
             Method::Initialize => self.handle_initialize(connection, request),
             Method::Authenticate => self.handle_authenticate(connection, request),
@@ -1693,7 +1749,7 @@ impl AcpServer {
         &self,
         connection: &mut AcpConnectionState,
         request: ParsedRequest,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         let initialize_request = decode_params::<InitializeRequest>(request.params)?;
         self.ensure_supported_protocol_version(initialize_request.protocol_version)?;
         let response = self.initialize_response(initialize_request.protocol_version);
@@ -1711,7 +1767,7 @@ impl AcpServer {
         &self,
         connection: &mut AcpConnectionState,
         request: ParsedRequest,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         let authenticate_request = decode_params::<AuthenticateRequest>(request.params)?;
         let configured_auth_methods = &self.dependencies.config.acp.auth_methods;
 
@@ -1743,7 +1799,7 @@ impl AcpServer {
         &self,
         connection: &mut AcpConnectionState,
         request: ParsedRequest,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         self.ensure_authenticated(connection)?;
 
         let new_session_request = decode_params::<NewSessionRequest>(request.params)?;
@@ -1781,7 +1837,7 @@ impl AcpServer {
         &self,
         connection: &mut AcpConnectionState,
         request: ParsedRequest,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         self.ensure_authenticated(connection)?;
 
         let load_session_request = decode_params::<LoadSessionRequest>(request.params)?;
@@ -1832,7 +1888,7 @@ impl AcpServer {
         &self,
         connection: &mut AcpConnectionState,
         request: ParsedRequest,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         self.ensure_authenticated(connection)?;
 
         let session_prompt_request = decode_params::<SessionPromptRequest>(request.params)?;
@@ -1876,7 +1932,7 @@ impl AcpServer {
         &self,
         connection: &mut AcpConnectionState,
         request: ParsedRequest,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         self.ensure_authenticated(connection)?;
 
         let request_id = request.id;
@@ -1913,7 +1969,7 @@ impl AcpServer {
         &self,
         connection: &mut AcpConnectionState,
         request: ParsedRequest,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         self.ensure_authenticated(connection)?;
 
         let session_cancel_request = decode_params::<SessionCancelRequest>(request.params)?;
@@ -1975,7 +2031,7 @@ impl AcpServer {
         managed_session: &mut ManagedSession,
         prompt: String,
         request_id: u64,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         managed_session
             .host
             .submit_prompt(prompt)
@@ -1997,7 +2053,7 @@ impl AcpServer {
         managed_session: &mut ManagedSession,
         prompt: String,
         request_id: u64,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         if managed_session.host.state().active_run_id.is_some() {
             return Err(RpcResponseError::active_prompt(format!(
                 "session `{session_id}` already has an active prompt turn"
@@ -2036,7 +2092,7 @@ impl AcpServer {
         &self,
         session_id: &str,
         managed_session: &mut ManagedSession,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         self.poll_live_prompt_turn(session_id, managed_session)
             .await
             .map(|result| result.frames)
@@ -2047,7 +2103,7 @@ impl AcpServer {
         session_id: &str,
         managed_session: &mut ManagedSession,
         cancel_target: CancelTarget,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         managed_session
             .host
             .handle_message(Msg::CancelActiveRun)
@@ -2087,7 +2143,7 @@ impl AcpServer {
         session_id: &str,
         managed_session: &mut ManagedSession,
         request_id: u64,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         self.ensure_live_prompt_turn_seeded(session_id, managed_session)?;
         let prompt_request_id = managed_session.pending_prompt_request_id;
         let (mut outbound_frames, mut prompt_completion_frames) = split_prompt_completion_frames(
@@ -2139,7 +2195,7 @@ impl AcpServer {
         managed_session: &mut ManagedSession,
         request: &acp::RequestPermissionRequest,
         response: acp::RequestPermissionResponse,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         match response.outcome {
             acp::RequestPermissionOutcome::Cancelled => {
                 let cancel_target =
@@ -2191,7 +2247,7 @@ impl AcpServer {
     async fn poll_live_prompt_turns(
         &self,
         connection: &mut AcpConnectionState,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         let mut outbound_frames = Vec::new();
 
         for managed_session in connection.sessions.values() {
@@ -2239,7 +2295,7 @@ impl AcpServer {
     fn flush_pending_prompt_response(
         &self,
         managed_session: &mut ManagedSession,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         let Some(request_id) = managed_session.pending_prompt_request_id else {
             return Ok(Vec::new());
         };
@@ -2302,7 +2358,12 @@ impl AcpServer {
         };
         let projection = self
             .mapper
-            .project_prompt_turn(managed_session.host.state(), live_prompt_turn.root_run_id)
+            .project_live_prompt_turn(
+                managed_session.host.state(),
+                live_prompt_turn.root_run_id,
+                live_prompt_turn.emission_state.watermark,
+                &live_prompt_turn.emission_state.open_transcript_item_ids,
+            )
             .ok_or_else(|| {
                 RpcResponseError::internal(format!(
                     "session `{session_id}` lost active prompt turn projection for run `{}`",
@@ -2365,7 +2426,7 @@ impl AcpServer {
         &self,
         session_id: &str,
         host: &ManagedAppHost,
-    ) -> std::result::Result<Vec<Value>, RpcResponseError> {
+    ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         let mut outbound_frames = Vec::new();
 
         for projection in self.mapper.project_prompt_turns(host.state()) {
@@ -2405,7 +2466,7 @@ impl AcpServer {
         let emit_prompt_turn_projection =
             |host: &ManagedAppHost,
              emission_state: &mut PromptTurnEmissionState,
-             outbound_frames: &mut Vec<Value>|
+             outbound_frames: &mut Vec<OutboundFrame>|
              -> std::result::Result<Option<SessionPromptResponse>, RpcResponseError> {
                 let projection = self
                     .mapper
@@ -2518,9 +2579,10 @@ fn load_session_meta(
 }
 
 #[cfg(test)]
-fn frame_ids_from_responses(frames: &[Value]) -> Vec<u64> {
+fn frame_ids_from_responses(frames: &[OutboundFrame]) -> Vec<u64> {
     frames
         .iter()
+        .filter_map(|frame| frame.to_value().ok())
         .filter_map(|frame| frame.get("id").and_then(Value::as_u64))
         .collect()
 }
@@ -2753,11 +2815,12 @@ fn official_test_probes_enabled() -> bool {
 
 fn buffered_prompt_completion_from_outbound_frames(
     cancel_request_id: u64,
-    outbound_frames: &[Value],
+    outbound_frames: &[OutboundFrame],
 ) -> acp::Result<Option<BufferedPromptCompletion>> {
     let mut buffered_prompt_completion = None;
 
     for outbound_frame in outbound_frames {
+        let outbound_frame = outbound_frame.to_value().map_err(map_rpc_response_error)?;
         if outbound_frame.get("method").is_some() {
             continue;
         }
@@ -2806,8 +2869,8 @@ fn buffered_prompt_completion_from_outbound_frames(
 
 fn split_prompt_completion_frames(
     prompt_request_id: Option<u64>,
-    outbound_frames: Vec<Value>,
-) -> (Vec<Value>, Vec<Value>) {
+    outbound_frames: Vec<OutboundFrame>,
+) -> (Vec<OutboundFrame>, Vec<OutboundFrame>) {
     let Some(prompt_request_id) = prompt_request_id else {
         return (outbound_frames, Vec::new());
     };
@@ -2816,7 +2879,10 @@ fn split_prompt_completion_frames(
     let mut prompt_completion_frames = Vec::new();
 
     for frame in outbound_frames {
-        let frame_id = frame.get("id").and_then(Value::as_u64);
+        let frame_id = frame
+            .to_value()
+            .ok()
+            .and_then(|frame| frame.get("id").and_then(Value::as_u64));
         if frame_id == Some(prompt_request_id) {
             prompt_completion_frames.push(frame);
         } else {
@@ -2986,14 +3052,17 @@ fn decode_params<T: serde::de::DeserializeOwned>(
         .map_err(|error| RpcResponseError::invalid_params(error.to_string()))
 }
 
-fn serialize_value<T: Serialize>(value: T) -> std::result::Result<Value, RpcResponseError> {
-    serde_json::to_value(value).map_err(|error| RpcResponseError::internal(error.to_string()))
+fn serialize_value<T: Serialize>(value: T) -> std::result::Result<OutboundFrame, RpcResponseError> {
+    OutboundFrame::new(
+        serde_json::to_string(&value)
+            .map_err(|error| RpcResponseError::internal(error.to_string()))?,
+    )
 }
 
 fn session_update_frame(
     session_id: &str,
     update: SessionUpdate,
-) -> std::result::Result<Value, RpcResponseError> {
+) -> std::result::Result<OutboundFrame, RpcResponseError> {
     serialize_value(JsonRpcNotification::new(
         SESSION_UPDATE_METHOD,
         SessionNotification {
@@ -3005,7 +3074,7 @@ fn session_update_frame(
 
 fn permission_request_frame(
     request: &crate::protocol::RequestPermissionRequest,
-) -> std::result::Result<Value, RpcResponseError> {
+) -> std::result::Result<OutboundFrame, RpcResponseError> {
     serialize_value(JsonRpcNotification::new(
         SESSION_REQUEST_PERMISSION_METHOD,
         request.clone(),
@@ -3220,8 +3289,8 @@ mod tests {
     use super::{
         ACP_META_LATEST_PROMPT_STATE_KEY, ACP_META_REPLAY_FIDELITY_KEY, AcpConnectionState,
         AcpServer, AcpServerDependencies, CANCELLED_TOOL_MESSAGE, JSONRPC_INTERNAL_ERROR,
-        LivePromptTurnState, ManagedAppHost, ManagedSession, PromptTurnEmissionState, ReaderEvent,
-        wait_for_live_prompt_turn_activity,
+        LivePromptTurnState, ManagedAppHost, ManagedSession, OutboundFrame,
+        PromptTurnEmissionState, ReaderEvent, wait_for_live_prompt_turn_activity,
     };
     use crate::dev_harness::ScriptedJsonlHarness;
     use crate::protocol::{Method, ParsedRequest};
@@ -4009,21 +4078,24 @@ mod tests {
             .await
             .unwrap();
         let session_updates = session_update_frames(&poll_result.frames);
+        let poll_frames = response_values(poll_result.frames.clone());
         let tool_call_frame_index = poll_result
             .frames
             .iter()
-            .position(|frame| session_update_kind(frame) == Some("tool_call"))
+            .zip(poll_frames.iter())
+            .position(|(_, frame)| session_update_kind(frame) == Some("tool_call"))
             .expect("delegated child tool call frame");
         let permission_request_frame_index = poll_result
             .frames
             .iter()
-            .position(|frame| frame["method"] == "session/request_permission")
+            .zip(poll_frames.iter())
+            .position(|(_, frame)| frame["method"] == "session/request_permission")
             .expect("delegated child permission request frame");
 
         assert!(!poll_result.prompt_turn_complete);
         assert_eq!(session_updates.len(), 3);
         assert_eq!(
-            session_update_kind(session_updates[0]),
+            session_update_kind(&session_updates[0]),
             Some("agent_thought_chunk")
         );
         assert_eq!(
@@ -4031,14 +4103,14 @@ mod tests {
             "child reasoning"
         );
         assert_eq!(
-            session_update_kind(session_updates[1]),
+            session_update_kind(&session_updates[1]),
             Some("agent_message_chunk")
         );
         assert_eq!(
             session_updates[1]["params"]["update"]["content"]["text"],
             "child answer"
         );
-        assert_eq!(session_update_kind(session_updates[2]), Some("tool_call"));
+        assert_eq!(session_update_kind(&session_updates[2]), Some("tool_call"));
         assert_eq!(
             session_updates[2]["params"]["update"]["toolCallId"],
             "read-call-2"
@@ -4121,6 +4193,285 @@ mod tests {
                 .expect("delegated child assistant turn")
                 .content,
             "delegated partial resumed output"
+        );
+
+        cleanup(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn live_projection_watermark_matches_full_projection_for_monotonic_updates() {
+        let _guard = test_lock().lock().await;
+        let temp_dir = unique_temp_dir("fluent-code-acp-live-watermark-parity");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let server = AcpServer::build(test_config(temp_dir.clone())).unwrap();
+        let mut managed_session = managed_session_for(
+            server.build_host_for_session(active_generating_session()),
+            &server,
+        );
+        let session_id = managed_session.host.state().session.id.to_string();
+        let run_id = managed_session
+            .host
+            .state()
+            .session
+            .foreground_owner
+            .as_ref()
+            .expect("active generating session owns the foreground")
+            .run_id;
+
+        let baseline_replay = server
+            .session_load_replay_frames(&session_id, &managed_session.host)
+            .unwrap();
+
+        managed_session
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantReasoningChunk {
+                run_id,
+                delta: "thinking ".to_string(),
+            })
+            .unwrap();
+        managed_session
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantChunk {
+                run_id,
+                delta: "hello ".to_string(),
+            })
+            .unwrap();
+
+        let first_poll = server
+            .poll_live_prompt_turn(&session_id, &mut managed_session)
+            .await
+            .unwrap();
+
+        managed_session
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantReasoningChunk {
+                run_id,
+                delta: "more".to_string(),
+            })
+            .unwrap();
+        managed_session
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantChunk {
+                run_id,
+                delta: "world".to_string(),
+            })
+            .unwrap();
+
+        let second_poll = server
+            .poll_live_prompt_turn(&session_id, &mut managed_session)
+            .await
+            .unwrap();
+        let final_replay = server
+            .session_load_replay_frames(&session_id, &managed_session.host)
+            .unwrap();
+        let mut cumulative_live = baseline_replay.clone();
+        cumulative_live.extend(first_poll.frames.clone());
+        cumulative_live.extend(second_poll.frames.clone());
+
+        assert!(!first_poll.prompt_turn_complete);
+        assert!(!second_poll.prompt_turn_complete);
+        assert_eq!(
+            collect_chunk_texts_by_kind(&first_poll.frames, "agent_thought_chunk"),
+            vec!["thinking ".to_string()]
+        );
+        assert_eq!(
+            collect_chunk_texts_by_kind(&first_poll.frames, "agent_message_chunk"),
+            vec!["hello ".to_string()]
+        );
+        assert_eq!(
+            collect_chunk_texts_by_kind(&second_poll.frames, "agent_thought_chunk"),
+            vec!["more".to_string()]
+        );
+        assert_eq!(
+            collect_chunk_texts_by_kind(&second_poll.frames, "agent_message_chunk"),
+            vec!["world".to_string()]
+        );
+        assert_eq!(
+            collect_chunk_texts_by_kind(&cumulative_live, "user_message_chunk").concat(),
+            collect_chunk_texts_by_kind(&final_replay, "user_message_chunk").concat()
+        );
+        assert_eq!(
+            collect_chunk_texts_by_kind(&cumulative_live, "agent_thought_chunk").concat(),
+            collect_chunk_texts_by_kind(&final_replay, "agent_thought_chunk").concat()
+        );
+        assert_eq!(
+            collect_chunk_texts_by_kind(&cumulative_live, "agent_message_chunk").concat(),
+            collect_chunk_texts_by_kind(&final_replay, "agent_message_chunk").concat()
+        );
+
+        cleanup(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn live_projection_falls_back_to_full_projection_on_stream_reopen() {
+        let _guard = test_lock().lock().await;
+        let temp_dir = unique_temp_dir("fluent-code-acp-live-stream-reopen");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let server = AcpServer::build(test_config(temp_dir.clone())).unwrap();
+        let mut managed_session = managed_session_for(
+            server.build_host_for_session(active_generating_session()),
+            &server,
+        );
+        let session_id = managed_session.host.state().session.id.to_string();
+        let run_id = managed_session
+            .host
+            .state()
+            .session
+            .foreground_owner
+            .as_ref()
+            .expect("active generating session owns the foreground")
+            .run_id;
+
+        managed_session
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantChunk {
+                run_id,
+                delta: "partial ".to_string(),
+            })
+            .unwrap();
+        let initial_poll = server
+            .poll_live_prompt_turn(&session_id, &mut managed_session)
+            .await
+            .unwrap();
+
+        managed_session
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantChunk {
+                run_id,
+                delta: "answer".to_string(),
+            })
+            .unwrap();
+        let continued_frames = server
+            .poll_live_prompt_turn(&session_id, &mut managed_session)
+            .await
+            .unwrap();
+        let reopened_frames = server
+            .session_load_replay_frames(&session_id, &managed_session.host)
+            .unwrap();
+
+        assert_eq!(
+            collect_chunk_texts_by_kind(&initial_poll.frames, "agent_message_chunk"),
+            vec!["partial ".to_string()]
+        );
+        assert_eq!(
+            collect_chunk_texts_by_kind(&continued_frames.frames, "agent_message_chunk"),
+            vec!["answer".to_string()]
+        );
+        assert_eq!(
+            collect_chunk_texts_by_kind(&reopened_frames, "user_message_chunk"),
+            vec!["resume me".to_string()]
+        );
+        assert_eq!(
+            collect_chunk_texts_by_kind(&reopened_frames, "agent_message_chunk"),
+            vec!["partial answer".to_string()]
+        );
+
+        cleanup(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn live_projection_empty_poll_does_not_emit_duplicate_text() {
+        let _guard = test_lock().lock().await;
+        let temp_dir = unique_temp_dir("fluent-code-acp-live-empty-poll");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let server = AcpServer::build(test_config(temp_dir.clone())).unwrap();
+        let mut managed_session = managed_session_for(
+            server.build_host_for_session(active_generating_session()),
+            &server,
+        );
+        let session_id = managed_session.host.state().session.id.to_string();
+        let run_id = managed_session
+            .host
+            .state()
+            .session
+            .foreground_owner
+            .as_ref()
+            .expect("active generating session owns the foreground")
+            .run_id;
+
+        managed_session
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantChunk {
+                run_id,
+                delta: "partial ".to_string(),
+            })
+            .unwrap();
+
+        let first_poll = server
+            .poll_live_prompt_turn(&session_id, &mut managed_session)
+            .await
+            .unwrap();
+        let empty_poll = server
+            .poll_live_prompt_turn(&session_id, &mut managed_session)
+            .await
+            .unwrap();
+
+        assert!(!first_poll.prompt_turn_complete);
+        assert!(!empty_poll.prompt_turn_complete);
+        assert_eq!(
+            collect_chunk_texts_by_kind(&first_poll.frames, "agent_message_chunk"),
+            vec!["partial ".to_string()]
+        );
+        assert!(empty_poll.frames.is_empty());
+
+        cleanup(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn replay_projection_ignores_live_watermark_state() {
+        let _guard = test_lock().lock().await;
+        let temp_dir = unique_temp_dir("fluent-code-acp-replay-watermark-fallback");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let server = AcpServer::build(test_config(temp_dir.clone())).unwrap();
+        let mut managed_session = managed_session_for(
+            server.build_host_for_session(active_generating_session()),
+            &server,
+        );
+        let session_id = managed_session.host.state().session.id.to_string();
+        let run_id = managed_session
+            .host
+            .state()
+            .session
+            .foreground_owner
+            .as_ref()
+            .expect("active generating session owns the foreground")
+            .run_id;
+
+        managed_session
+            .host
+            .runtime_sender()
+            .send(Msg::AssistantChunk {
+                run_id,
+                delta: "live partial ".to_string(),
+            })
+            .unwrap();
+
+        let live_poll = server
+            .poll_live_prompt_turn(&session_id, &mut managed_session)
+            .await
+            .unwrap();
+        let replay_frames = server
+            .session_load_replay_frames(&session_id, &managed_session.host)
+            .unwrap();
+
+        assert_eq!(
+            collect_chunk_texts_by_kind(&live_poll.frames, "agent_message_chunk"),
+            vec!["live partial ".to_string()]
+        );
+        assert_eq!(
+            collect_chunk_texts_by_kind(&replay_frames, "user_message_chunk"),
+            vec!["resume me".to_string()]
+        );
+        assert_eq!(
+            collect_chunk_texts_by_kind(&replay_frames, "agent_message_chunk"),
+            vec!["live partial ".to_string()]
         );
 
         cleanup(temp_dir);
@@ -4277,6 +4628,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let new_session_frames = response_values(new_session_frames);
         let session_id = new_session_frames[0]["result"]["sessionId"]
             .as_str()
             .unwrap()
@@ -4303,6 +4655,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let cancel_frames = response_values(cancel_frames);
 
         let cancel_ids = cancel_frames
             .iter()
@@ -4698,7 +5051,7 @@ mod tests {
         );
         assert!(!session_updates.is_empty());
         assert_eq!(
-            session_update_kind(session_updates[0]),
+            session_update_kind(&session_updates[0]),
             Some("user_message_chunk")
         );
         assert!(
@@ -5693,8 +6046,32 @@ mod tests {
             .collect()
     }
 
-    fn response_values(frames: Vec<Value>) -> Vec<Value> {
+    fn response_values(frames: Vec<OutboundFrame>) -> Vec<Value> {
         frames
+            .into_iter()
+            .map(|frame| {
+                frame
+                    .into_value()
+                    .expect("outbound frame should parse as JSON")
+            })
+            .collect()
+    }
+
+    trait FrameValueExt {
+        fn to_frame_value(&self) -> Value;
+    }
+
+    impl FrameValueExt for Value {
+        fn to_frame_value(&self) -> Value {
+            self.clone()
+        }
+    }
+
+    impl FrameValueExt for OutboundFrame {
+        fn to_frame_value(&self) -> Value {
+            self.to_value()
+                .expect("outbound frame should parse as JSON")
+        }
     }
 
     fn managed_session_for(host: ManagedAppHost, server: &AcpServer) -> ManagedSession {
@@ -5717,9 +6094,10 @@ mod tests {
         }
     }
 
-    fn session_update_frames(frames: &[Value]) -> Vec<&Value> {
+    fn session_update_frames<F: FrameValueExt>(frames: &[F]) -> Vec<Value> {
         frames
             .iter()
+            .map(FrameValueExt::to_frame_value)
             .filter(|frame| frame.get("method").and_then(Value::as_str) == Some("session/update"))
             .collect()
     }
@@ -5728,7 +6106,7 @@ mod tests {
         frame["params"]["update"]["sessionUpdate"].as_str()
     }
 
-    fn collect_agent_message_chunks(frames: &[&Value]) -> String {
+    fn collect_agent_message_chunks(frames: &[Value]) -> String {
         frames
             .iter()
             .filter(|frame| session_update_kind(frame) == Some("agent_message_chunk"))
@@ -5737,12 +6115,25 @@ mod tests {
             .join("")
     }
 
-    fn collect_agent_message_chunk_texts(frames: &[&Value]) -> Vec<String> {
+    fn collect_agent_message_chunk_texts(frames: &[Value]) -> Vec<String> {
         frames
             .iter()
             .filter(|frame| session_update_kind(frame) == Some("agent_message_chunk"))
             .filter_map(|frame| frame["params"]["update"]["content"]["text"].as_str())
             .map(str::to_owned)
+            .collect()
+    }
+
+    fn collect_chunk_texts_by_kind<F: FrameValueExt>(frames: &[F], kind: &str) -> Vec<String> {
+        frames
+            .iter()
+            .map(FrameValueExt::to_frame_value)
+            .filter(|frame| session_update_kind(frame) == Some(kind))
+            .filter_map(|frame| {
+                frame["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
             .collect()
     }
 

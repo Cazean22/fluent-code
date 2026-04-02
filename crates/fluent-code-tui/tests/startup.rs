@@ -659,6 +659,22 @@ fn render_contract_distinguishes_committed_history_from_active_cell() {
 }
 
 #[test]
+fn conversation_projection_cache_preserves_history_output() {
+    acp_projection_regression::assert_conversation_projection_cache_preserves_history_output();
+}
+
+#[test]
+fn conversation_projection_cache_invalidates_on_transcript_change() {
+    acp_projection_regression::assert_conversation_projection_cache_invalidates_on_transcript_change();
+}
+
+#[test]
+fn startup_restore_with_projection_cache_matches_uncached_output() {
+    acp_projection_regression::assert_startup_restore_with_projection_cache_matches_uncached_output(
+    );
+}
+
+#[test]
 fn session_render_regression_completed_streaming_and_recovery() {
     acp_projection_regression::assert_session_render_regression_completed_and_streaming();
 

@@ -3,17 +3,27 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
-fn replay_projects_canonical_transcript_items_in_exact_order() {
+fn live_projection_watermark_matches_full_projection_for_monotonic_updates() {
     run_exact_acp_libtest(
-        "mapping::tests::replay_projects_canonical_transcript_items_in_exact_order",
+        "server::tests::live_projection_watermark_matches_full_projection_for_monotonic_updates",
     );
 }
 
 #[test]
-fn replay_preserves_permission_and_tool_boundaries_from_canonical_items() {
+fn live_projection_falls_back_to_full_projection_on_stream_reopen() {
     run_exact_acp_libtest(
-        "server::tests::replay_preserves_permission_and_tool_boundaries_from_canonical_items",
+        "server::tests::live_projection_falls_back_to_full_projection_on_stream_reopen",
     );
+}
+
+#[test]
+fn live_projection_empty_poll_does_not_emit_duplicate_text() {
+    run_exact_acp_libtest("server::tests::live_projection_empty_poll_does_not_emit_duplicate_text");
+}
+
+#[test]
+fn replay_projection_ignores_live_watermark_state() {
+    run_exact_acp_libtest("server::tests::replay_projection_ignores_live_watermark_state");
 }
 
 fn run_exact_acp_libtest(module_qualified_test_name: &str) {

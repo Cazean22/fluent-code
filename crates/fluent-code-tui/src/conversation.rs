@@ -160,19 +160,12 @@ fn derive_history_cells_from_parts(
     let session = synthesized_session.as_ref().unwrap_or(session);
     let synthesized_from_legacy = synthesized_session.is_some();
 
-    let mut items = session
-        .transcript_items
-        .iter()
-        .enumerate()
-        .collect::<Vec<_>>();
-    items.sort_by_key(|(index, item)| (item.sequence_number, *index));
-
     let mut history = Vec::new();
     let mut pending_history_tools = Vec::new();
     let mut active_rows = Vec::new();
     let mut pending_active_tools = Vec::new();
 
-    for (_, item) in items {
+    let mut push_item = |item: &TranscriptItemRecord| {
         let item_is_open =
             !synthesized_from_legacy && item.stream_state == TranscriptStreamState::Open;
         let target = if item_is_open {
@@ -226,6 +219,23 @@ fn derive_history_cells_from_parts(
             }
             TranscriptItemContent::RunLifecycle(_) | TranscriptItemContent::Marker(_) => {}
         }
+    };
+
+    if transcript_items_are_in_canonical_order(&session.transcript_items) {
+        for item in &session.transcript_items {
+            push_item(item);
+        }
+    } else {
+        let mut items = session
+            .transcript_items
+            .iter()
+            .enumerate()
+            .collect::<Vec<_>>();
+        items.sort_by_key(|(index, item)| (item.sequence_number, *index));
+
+        for (_, item) in items {
+            push_item(item);
+        }
     }
 
     flush_pending_tool_cells(
@@ -255,6 +265,12 @@ fn derive_history_cells_from_parts(
         history,
         active: (!active_rows.is_empty()).then_some(SessionCell { rows: active_rows }),
     }
+}
+
+fn transcript_items_are_in_canonical_order(items: &[TranscriptItemRecord]) -> bool {
+    items
+        .windows(2)
+        .all(|pair| pair[0].sequence_number <= pair[1].sequence_number)
 }
 
 #[derive(Debug, Clone, Copy)]
