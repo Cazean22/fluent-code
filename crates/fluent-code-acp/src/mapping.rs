@@ -204,10 +204,27 @@ impl SessionUpdateMapper {
         let mut open_transcript_item_ids = Vec::new();
         let mut max_sequence: Option<ReplaySequence> = None;
 
+        // When we have a watermark and no previously-open items to revisit,
+        // skip committed items below the watermark using binary search.
+        // Items are sorted by sequence_number (maintained by insert_transcript_item_in_order).
+        let skip_count = if let Some(watermark) = watermark {
+            if previously_open_item_ids.is_empty() {
+                state
+                    .session
+                    .transcript_items
+                    .partition_point(|item| item.sequence_number <= watermark)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
         for item in state
             .session
             .transcript_items
             .iter()
+            .skip(skip_count)
             .filter(|item| state.session.root_run_id(item.run_id) == Some(run.id))
             .filter(|item| is_valid_sequence(&state.session, item.sequence_number))
         {
