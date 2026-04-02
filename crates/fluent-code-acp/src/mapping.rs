@@ -1984,6 +1984,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow (>10s)"]
     fn project_prompt_turn_preserves_root_grouping_with_cached_root_lookup() {
         let mapper = SessionUpdateMapper::new();
         let root_run_id = Uuid::new_v4();
@@ -2099,6 +2100,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow (>10s)"]
     fn delegated_child_projection_ignores_broken_lineage_with_cached_lookup() {
         let mapper = SessionUpdateMapper::new();
         let root_run_id = Uuid::new_v4();

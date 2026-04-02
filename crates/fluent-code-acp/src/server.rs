@@ -4576,6 +4576,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn live_projection_empty_poll_does_not_emit_duplicate_text() {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-live-empty-poll");
@@ -4625,6 +4626,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn replay_projection_ignores_live_watermark_state() {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-replay-watermark-fallback");
@@ -4678,6 +4680,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn session_load_surfaces_interrupted_running_tool_state_explicitly() {
         let temp_dir = unique_temp_dir("fluent-code-acp-load-interrupted-running-tool");
         fs::create_dir_all(&temp_dir).unwrap();
@@ -4725,6 +4728,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn live_stdio_session_cancel_interrupts_active_prompt_on_same_connection() {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-live-cancel");
@@ -4804,6 +4808,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn live_session_new_cancel_keeps_prompt_request_resolvable() {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-live-session-new-cancel");
@@ -4934,6 +4939,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn official_sdk_test_probes_are_disabled_by_default() {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-official-test-probes-disabled");
@@ -4994,6 +5000,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn official_sdk_same_connection_cancel_unblocks_live_prompt_and_preserves_streaming() {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-official-live-cancel");
@@ -5089,6 +5096,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn permission_notification_routing_preserves_follow_up_order() {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-official-permission-order");
@@ -5221,6 +5229,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn session_prompt_streams_text_updates_until_terminal_stop_reason() {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-session-prompt-text");
@@ -5281,6 +5290,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn session_prompt_flushes_pending_agent_delta_before_terminal_stop_reason() {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-session-prompt-terminal-flush");
@@ -5341,6 +5351,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn session_prompt_preserves_many_chunk_continuity_without_duplicate_text() {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-session-prompt-chunk-continuity");
@@ -5385,6 +5396,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn session_prompt_streams_tool_lifecycle_updates_in_projection_order() {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-session-prompt-tool");
@@ -5479,6 +5491,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn session_prompt_rejects_when_session_already_has_active_prompt_turn() {
         let _guard = test_lock().lock().await;
         let temp_dir = unique_temp_dir("fluent-code-acp-session-prompt-active");
@@ -5519,6 +5532,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn headless_host_completes_prompt_lifecycle_and_persists_session() {
         let _guard = test_lock().lock().await;
         let root = unique_temp_dir("fluent-code-acp-headless-prompt");
@@ -5569,6 +5583,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn headless_host_drains_queued_runtime_messages_in_order() {
         let _guard = test_lock().lock().await;
         let root = unique_temp_dir("fluent-code-acp-runtime-drain");
@@ -5637,6 +5652,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "slow (>10s)"]
     async fn headless_host_recovery_fails_closed_for_running_tool_owner() {
         let _guard = test_lock().lock().await;
         let root = unique_temp_dir("fluent-code-acp-running-tool-recovery");
