@@ -55,6 +55,7 @@ const ACP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const ACP_TEST_PROBES_ENV_VAR: &str = "FLUENT_CODE_ACP_ENABLE_TEST_PROBES";
 const PROJECTION_ACTIVITY_BURST_DRAIN_LIMIT: usize = 8;
+const PROJECTION_QUEUED_INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(10);
 const PROJECTION_PAGE_SCROLL_LINES: u16 = 8;
 const ACP_META_LATEST_PROMPT_STATE_KEY: &str = "fluentCodeLatestPromptState";
 const ACP_META_REPLAY_FIDELITY_KEY: &str = "fluentCodeReplayFidelity";
@@ -2674,28 +2675,24 @@ async fn wait_for_projection_action(
     input: &mut ProjectionLoopInput,
     snapshot: &ProjectionSnapshot,
 ) -> Result<ProjectionWaitOutcome> {
-    if let Some(event) = input.try_next_event()? {
-        return Ok(ProjectionWaitOutcome::Action(projection_action_from_event(
-            &snapshot.projection,
-            event,
-        )));
-    }
-
-    let activity_wait = controller.wait_for_activity(snapshot.activity_sequence);
-    tokio::pin!(activity_wait);
-
-    let input_wait = input.next_event();
-    tokio::pin!(input_wait);
-
-    tokio::select! {
-        biased;
-        () = &mut activity_wait => Ok(ProjectionWaitOutcome::Activity),
-        result = &mut input_wait => {
-            let event = result?;
-            Ok(ProjectionWaitOutcome::Action(projection_action_from_event(
+    loop {
+        if let Some(event) = input.try_next_event()? {
+            return Ok(ProjectionWaitOutcome::Action(projection_action_from_event(
                 &snapshot.projection,
                 event,
-            )))
+            )));
+        }
+
+        let activity_wait = controller.wait_for_activity(snapshot.activity_sequence);
+        tokio::pin!(activity_wait);
+
+        let poll_delay = tokio::time::sleep(PROJECTION_QUEUED_INPUT_POLL_TIMEOUT);
+        tokio::pin!(poll_delay);
+
+        tokio::select! {
+            biased;
+            () = &mut activity_wait => return Ok(ProjectionWaitOutcome::Activity),
+            () = &mut poll_delay => {}
         }
     }
 }
@@ -3647,26 +3644,6 @@ impl ProjectionLoopInput {
                         "ACP projection input pump stopped unexpectedly".to_string(),
                     ))
                 }
-            },
-        }
-    }
-
-    async fn next_event(&mut self) -> Result<Event> {
-        match &mut self.source {
-            ProjectionLoopInputSource::Stream(stream) => match stream.next().await {
-                Some(Ok(event)) => Ok(event),
-                Some(Err(error)) => Err(error.into()),
-                None => Err(FluentCodeError::Provider(
-                    "ACP projection input pump stopped unexpectedly".to_string(),
-                )),
-            },
-            #[cfg(test)]
-            ProjectionLoopInputSource::Receiver(receiver) => match receiver.recv().await {
-                Some(Ok(event)) => Ok(event),
-                Some(Err(error)) => Err(error.into()),
-                None => Err(FluentCodeError::Provider(
-                    "ACP projection input pump stopped unexpectedly".to_string(),
-                )),
             },
         }
     }
