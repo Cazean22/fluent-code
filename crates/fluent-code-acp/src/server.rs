@@ -43,8 +43,8 @@ use crate::protocol::{
     InitializeRequest, InitializeResponse, JsonRpcErrorResponse, JsonRpcNotification,
     JsonRpcProtocol, JsonRpcResponse, LoadSessionRequest, LoadSessionResponse, Method,
     NewSessionRequest, NewSessionResponse, ParsedRequest, PromptTurnState, ProtocolError,
-    ProtocolState, ServerInfo, SessionCancelRequest, SessionNotification, SessionPromptRequest,
-    SessionPromptResponse, SessionUpdate, ToolCallUpdate, UserMessageChunk,
+    ProtocolState, ReplayFidelity, ServerInfo, SessionCancelRequest, SessionNotification,
+    SessionPromptRequest, SessionPromptResponse, SessionUpdate, ToolCallUpdate, UserMessageChunk,
 };
 use crate::transport::StdioTransport;
 
@@ -57,6 +57,8 @@ const ACP_AUTH_REQUIRED: i32 = -32000;
 const ACP_RESOURCE_NOT_FOUND: i32 = -32002;
 const ACP_ACTIVE_PROMPT: i32 = -32003;
 const ACP_TEST_PROBES_ENV_VAR: &str = "FLUENT_CODE_ACP_ENABLE_TEST_PROBES";
+const ACP_META_LATEST_PROMPT_STATE_KEY: &str = "fluentCodeLatestPromptState";
+const ACP_META_REPLAY_FIDELITY_KEY: &str = "fluentCodeReplayFidelity";
 const SESSION_UPDATE_METHOD: &str = "session/update";
 const SESSION_REQUEST_PERMISSION_METHOD: &str = "session/request_permission";
 const CANCELLED_TOOL_MESSAGE: &str =
@@ -1291,9 +1293,10 @@ impl PromptTurnEmissionState {
                     Some(SessionUpdate::ToolCallUpdate(tool_call_update.clone()))
                 }
             }
-            SessionUpdate::SessionInfoUpdate(session_info_update) => Some(
-                SessionUpdate::SessionInfoUpdate(session_info_update.clone()),
-            ),
+            SessionUpdate::SessionInfoUpdate(session_info_update) => {
+                (session_info_update.title.is_some() || session_info_update.updated_at.is_some())
+                    .then(|| SessionUpdate::SessionInfoUpdate(session_info_update.clone()))
+            }
         }
     }
 
@@ -1802,6 +1805,11 @@ impl AcpServer {
             LoadSessionResponse {
                 config_options: self.mapper.session_config_options(),
                 latest_prompt_state,
+                replay_fidelity: replay_fidelity(&host.state().session),
+                meta: Some(load_session_meta(
+                    latest_prompt_state,
+                    replay_fidelity(&host.state().session),
+                )),
             },
         ))?);
 
@@ -1921,25 +1929,27 @@ impl AcpServer {
             })?;
         let mut managed_session = managed_session.lock().await;
 
-        let mut outbound_frames = self
-            .drain_live_prompt_turn_updates(
+        self.ensure_live_prompt_turn_seeded(
+            &session_cancel_request.session_id,
+            &mut managed_session,
+        )?;
+        let prompt_request_id = managed_session.pending_prompt_request_id;
+        let (mut outbound_frames, mut prompt_completion_frames) = split_prompt_completion_frames(
+            prompt_request_id,
+            self.drain_live_prompt_turn_updates(
                 &session_cancel_request.session_id,
                 &mut managed_session,
             )
-            .await?;
-        outbound_frames.push(serialize_value(JsonRpcResponse::new(
-            request.id,
-            SessionPromptResponse {
-                stop_reason: crate::protocol::StopReason::Cancelled,
-            },
-        ))?);
+            .await?,
+        );
         let cancel_target = cancel_target(managed_session.host.state()).ok_or_else(|| {
             RpcResponseError::invalid_params(format!(
                 "session `{session_id}` does not have an active prompt turn to cancel"
             ))
         })?;
 
-        outbound_frames.extend(
+        let (cancel_frames, cancel_prompt_completion_frames) = split_prompt_completion_frames(
+            prompt_request_id,
             self.cancel_prompt_turn(
                 &session_cancel_request.session_id,
                 &mut managed_session,
@@ -1947,6 +1957,15 @@ impl AcpServer {
             )
             .await?,
         );
+        outbound_frames.extend(cancel_frames);
+        outbound_frames.push(serialize_value(JsonRpcResponse::new(
+            request.id,
+            SessionPromptResponse {
+                stop_reason: crate::protocol::StopReason::Cancelled,
+            },
+        ))?);
+        prompt_completion_frames.extend(cancel_prompt_completion_frames);
+        outbound_frames.extend(prompt_completion_frames);
         Ok(outbound_frames)
     }
 
@@ -2069,9 +2088,13 @@ impl AcpServer {
         managed_session: &mut ManagedSession,
         request_id: u64,
     ) -> std::result::Result<Vec<Value>, RpcResponseError> {
-        let mut outbound_frames = self
-            .drain_live_prompt_turn_updates(session_id, managed_session)
-            .await?;
+        self.ensure_live_prompt_turn_seeded(session_id, managed_session)?;
+        let prompt_request_id = managed_session.pending_prompt_request_id;
+        let (mut outbound_frames, mut prompt_completion_frames) = split_prompt_completion_frames(
+            prompt_request_id,
+            self.drain_live_prompt_turn_updates(session_id, managed_session)
+                .await?,
+        );
         outbound_frames.push(serialize_value(JsonRpcResponse::new(
             request_id,
             SessionPromptResponse {
@@ -2084,11 +2107,30 @@ impl AcpServer {
             ))
         })?;
 
-        outbound_frames.extend(
+        let (cancel_frames, cancel_prompt_completion_frames) = split_prompt_completion_frames(
+            prompt_request_id,
             self.cancel_prompt_turn(session_id, managed_session, cancel_target)
                 .await?,
         );
+        outbound_frames.extend(cancel_frames);
+        prompt_completion_frames.extend(cancel_prompt_completion_frames);
+        outbound_frames.extend(prompt_completion_frames);
         Ok(outbound_frames)
+    }
+
+    fn ensure_live_prompt_turn_seeded(
+        &self,
+        session_id: &str,
+        managed_session: &mut ManagedSession,
+    ) -> std::result::Result<(), RpcResponseError> {
+        if managed_session.live_prompt_turn.is_some() {
+            return Ok(());
+        }
+
+        managed_session.live_prompt_turn = self
+            .seed_live_prompt_turn_state(session_id, &managed_session.host)
+            .map_err(|error| RpcResponseError::internal(error.to_string()))?;
+        Ok(())
     }
 
     async fn apply_permission_response(
@@ -2448,6 +2490,33 @@ fn latest_prompt_state(state: &AppState) -> Option<PromptTurnState> {
     None
 }
 
+fn replay_fidelity(session: &Session) -> ReplayFidelity {
+    match session.transcript_fidelity {
+        fluent_code_app::session::model::TranscriptFidelity::Exact => ReplayFidelity::Exact,
+        fluent_code_app::session::model::TranscriptFidelity::Approximate => {
+            ReplayFidelity::Approximate
+        }
+    }
+}
+
+fn load_session_meta(
+    latest_prompt_state: Option<PromptTurnState>,
+    replay_fidelity: ReplayFidelity,
+) -> serde_json::Map<String, Value> {
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        ACP_META_LATEST_PROMPT_STATE_KEY.to_string(),
+        serde_json::to_value(latest_prompt_state)
+            .expect("load-session prompt state metadata should serialize"),
+    );
+    meta.insert(
+        ACP_META_REPLAY_FIDELITY_KEY.to_string(),
+        serde_json::to_value(replay_fidelity)
+            .expect("load-session replay fidelity metadata should serialize"),
+    );
+    meta
+}
+
 #[cfg(test)]
 fn frame_ids_from_responses(frames: &[Value]) -> Vec<u64> {
     frames
@@ -2735,6 +2804,29 @@ fn buffered_prompt_completion_from_outbound_frames(
     Ok(buffered_prompt_completion)
 }
 
+fn split_prompt_completion_frames(
+    prompt_request_id: Option<u64>,
+    outbound_frames: Vec<Value>,
+) -> (Vec<Value>, Vec<Value>) {
+    let Some(prompt_request_id) = prompt_request_id else {
+        return (outbound_frames, Vec::new());
+    };
+
+    let mut leading_frames = Vec::new();
+    let mut prompt_completion_frames = Vec::new();
+
+    for frame in outbound_frames {
+        let frame_id = frame.get("id").and_then(Value::as_u64);
+        if frame_id == Some(prompt_request_id) {
+            prompt_completion_frames.push(frame);
+        } else {
+            leading_frames.push(frame);
+        }
+    }
+
+    (leading_frames, prompt_completion_frames)
+}
+
 fn current_prompt_turn_root_run_id(state: &AppState) -> Option<RunId> {
     root_run_id_for(state, state.active_run_id?)
 }
@@ -2925,9 +3017,10 @@ fn projection_phase_key(phase: ProjectionEventPhase) -> u8 {
         ProjectionEventPhase::UserMessage => 0,
         ProjectionEventPhase::AgentThought => 1,
         ProjectionEventPhase::AgentMessage => 2,
-        ProjectionEventPhase::ToolCallCreate => 3,
-        ProjectionEventPhase::ToolCallPatch => 4,
-        ProjectionEventPhase::PermissionRequest => 5,
+        ProjectionEventPhase::SessionInfoUpdate => 3,
+        ProjectionEventPhase::ToolCallCreate => 4,
+        ProjectionEventPhase::ToolCallPatch => 5,
+        ProjectionEventPhase::PermissionRequest => 6,
     }
 }
 
@@ -3114,7 +3207,7 @@ mod tests {
         ForegroundOwnerRecord, ForegroundPhase, Role, RunRecord, RunStatus, RunTerminalStopReason,
         Session, TaskDelegationRecord, TaskDelegationStatus, ToolApprovalState, ToolExecutionState,
         ToolInvocationRecord, ToolPermissionAction, ToolPermissionRule, ToolPermissionSubject,
-        ToolSource, Turn,
+        ToolSource, TranscriptItemRecord, TranscriptPermissionState, TranscriptStreamState, Turn,
     };
     use fluent_code_app::session::store::{FsSessionStore, SessionStore};
     use fluent_code_provider::{MockProvider, ProviderClient, ProviderToolCall};
@@ -3125,9 +3218,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        AcpConnectionState, AcpServer, AcpServerDependencies, CANCELLED_TOOL_MESSAGE,
-        JSONRPC_INTERNAL_ERROR, LivePromptTurnState, ManagedAppHost, ManagedSession,
-        PromptTurnEmissionState, ReaderEvent, wait_for_live_prompt_turn_activity,
+        ACP_META_LATEST_PROMPT_STATE_KEY, ACP_META_REPLAY_FIDELITY_KEY, AcpConnectionState,
+        AcpServer, AcpServerDependencies, CANCELLED_TOOL_MESSAGE, JSONRPC_INTERNAL_ERROR,
+        LivePromptTurnState, ManagedAppHost, ManagedSession, PromptTurnEmissionState, ReaderEvent,
+        wait_for_live_prompt_turn_activity,
     };
     use crate::dev_harness::ScriptedJsonlHarness;
     use crate::protocol::{Method, ParsedRequest};
@@ -3378,6 +3472,7 @@ mod tests {
             responses[5]["result"]["configOptions"][0]["id"],
             "system_prompt"
         );
+        assert_eq!(responses[5]["result"]["replayFidelity"], "approximate");
         assert!(responses[5]["result"].get("modes").is_none());
 
         cleanup(temp_dir);
@@ -3426,6 +3521,10 @@ mod tests {
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(permission_requests.len(), 1);
         assert_eq!(
+            responses.last().unwrap()["result"]["replayFidelity"],
+            "approximate"
+        );
+        assert_eq!(
             permission_requests[0]["params"]["toolCall"]["toolCallId"],
             "glob-call-2"
         );
@@ -3438,6 +3537,65 @@ mod tests {
                 .iter()
                 .all(|index| *index < permission_request_index),
             "expected tool_call replays before the pending permission request"
+        );
+
+        cleanup(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_permission_and_tool_boundaries_from_canonical_items() {
+        let temp_dir = unique_temp_dir("fluent-code-acp-canonical-replay");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let store = FsSessionStore::new(temp_dir.clone());
+        let session = canonical_exact_replay_session(&store);
+        let server = AcpServer::build(test_config(temp_dir.clone())).unwrap();
+        let load_request = format!(
+            concat!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/load\",\"params\":{{\"sessionId\":\"{}\",\"cwd\":\"/tmp\",\"mcpServers\":[]}}}}\n"
+            ),
+            session.id
+        );
+        let mut reader = Cursor::new(load_request.into_bytes());
+        let mut output = Vec::new();
+
+        server.serve_frames(&mut reader, &mut output).await.unwrap();
+
+        let responses = output_frames(output);
+        let replay_events = responses
+            .iter()
+            .filter_map(|frame| match frame.get("method").and_then(Value::as_str) {
+                Some("session/update") => Some(
+                    frame["params"]["update"]["sessionUpdate"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                ),
+                Some("session/request_permission") => Some(format!(
+                    "request_permission:{}",
+                    frame["params"]["toolCall"]["toolCallId"].as_str().unwrap()
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            replay_events,
+            vec![
+                "user_message_chunk",
+                "agent_thought_chunk",
+                "agent_message_chunk",
+                "tool_call",
+                "request_permission:glob-call-1",
+                "user_message_chunk",
+                "agent_message_chunk",
+                "tool_call",
+                "tool_call_update",
+            ]
+        );
+        assert_eq!(
+            responses.last().unwrap()["result"]["replayFidelity"],
+            "exact"
         );
 
         cleanup(temp_dir);
@@ -4002,6 +4160,14 @@ mod tests {
         assert_eq!(
             responses.last().unwrap()["result"]["latestPromptState"],
             "interrupted"
+        );
+        assert_eq!(
+            responses.last().unwrap()["result"]["_meta"][ACP_META_LATEST_PROMPT_STATE_KEY],
+            "interrupted"
+        );
+        assert_eq!(
+            responses.last().unwrap()["result"]["_meta"][ACP_META_REPLAY_FIDELITY_KEY],
+            "approximate"
         );
 
         cleanup(temp_dir);
@@ -5092,6 +5258,173 @@ mod tests {
         });
 
         session.upsert_run_with_stop_reason(run_id, RunStatus::Completed, None);
+        store.create(&session).unwrap();
+        session
+    }
+
+    fn canonical_exact_replay_session(store: &FsSessionStore) -> Session {
+        let mut session = Session::new("canonical exact replay session");
+        let root_run_id = Uuid::new_v4();
+        let child_run_id = Uuid::new_v4();
+        let root_assistant_turn_id = Uuid::new_v4();
+        let child_assistant_turn_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let root_user_turn = Turn {
+            id: Uuid::new_v4(),
+            run_id: root_run_id,
+            role: Role::User,
+            content: "inspect and delegate".to_string(),
+            reasoning: String::new(),
+            sequence_number: 41,
+            timestamp: now,
+        };
+        let root_assistant_turn = Turn {
+            id: root_assistant_turn_id,
+            run_id: root_run_id,
+            role: Role::Assistant,
+            content: "I will inspect the repo.".to_string(),
+            reasoning: "plan first".to_string(),
+            sequence_number: 42,
+            timestamp: now,
+        };
+        let child_user_turn = Turn {
+            id: Uuid::new_v4(),
+            run_id: child_run_id,
+            role: Role::User,
+            content: "inspect child state".to_string(),
+            reasoning: String::new(),
+            sequence_number: 43,
+            timestamp: now,
+        };
+        let child_assistant_turn = Turn {
+            id: child_assistant_turn_id,
+            run_id: child_run_id,
+            role: Role::Assistant,
+            content: "Child summary".to_string(),
+            reasoning: String::new(),
+            sequence_number: 44,
+            timestamp: now,
+        };
+
+        let mut pending_invocation = ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id: root_run_id,
+            tool_call_id: "glob-call-1".to_string(),
+            tool_name: "glob".to_string(),
+            tool_source: ToolSource::BuiltIn,
+            arguments: serde_json::json!({ "pattern": "**/*.rs", "path": "/tmp/project" }),
+            preceding_turn_id: Some(root_assistant_turn_id),
+            approval_state: ToolApprovalState::Pending,
+            execution_state: ToolExecutionState::NotStarted,
+            result: None,
+            error: None,
+            delegation: None,
+            sequence_number: 60,
+            requested_at: now,
+            approved_at: None,
+            completed_at: None,
+        };
+        let child_invocation = ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id: child_run_id,
+            tool_call_id: "read-call-2".to_string(),
+            tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
+            arguments: serde_json::json!({ "path": "/tmp/child.txt" }),
+            preceding_turn_id: Some(child_assistant_turn_id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("<path>/tmp/child.txt</path>\n1: child output".to_string()),
+            error: None,
+            delegation: None,
+            sequence_number: 61,
+            requested_at: now,
+            approved_at: Some(now),
+            completed_at: Some(now),
+        };
+
+        session.runs = vec![
+            RunRecord {
+                id: root_run_id,
+                status: RunStatus::InProgress,
+                parent_run_id: None,
+                parent_tool_invocation_id: None,
+                created_sequence: 80,
+                terminal_sequence: None,
+                terminal_stop_reason: None,
+                created_at: now,
+                updated_at: now,
+            },
+            RunRecord {
+                id: child_run_id,
+                status: RunStatus::Completed,
+                parent_run_id: Some(root_run_id),
+                parent_tool_invocation_id: Some(pending_invocation.id),
+                created_sequence: 90,
+                terminal_sequence: Some(91),
+                terminal_stop_reason: Some(RunTerminalStopReason::Completed),
+                created_at: now,
+                updated_at: now,
+            },
+        ];
+        session.turns = vec![
+            root_user_turn.clone(),
+            root_assistant_turn.clone(),
+            child_user_turn.clone(),
+            child_assistant_turn.clone(),
+        ];
+        session.tool_invocations = vec![pending_invocation.clone(), child_invocation.clone()];
+        session.transcript_items = vec![
+            TranscriptItemRecord::from_turn(&Turn {
+                sequence_number: 1,
+                ..root_user_turn
+            }),
+            TranscriptItemRecord::assistant_reasoning(
+                root_run_id,
+                root_assistant_turn_id,
+                2,
+                "plan first",
+                TranscriptStreamState::Committed,
+            ),
+            TranscriptItemRecord::assistant_text(
+                root_run_id,
+                root_assistant_turn_id,
+                3,
+                "I will inspect the repo.",
+                TranscriptStreamState::Committed,
+            ),
+            TranscriptItemRecord::from_tool_invocation(&ToolInvocationRecord {
+                sequence_number: 4,
+                ..pending_invocation.clone()
+            }),
+            TranscriptItemRecord::permission(
+                &pending_invocation,
+                5,
+                TranscriptPermissionState::Pending,
+                None,
+            ),
+            TranscriptItemRecord::from_turn(&Turn {
+                sequence_number: 6,
+                ..child_user_turn
+            }),
+            TranscriptItemRecord::from_turn(&Turn {
+                sequence_number: 7,
+                ..child_assistant_turn
+            }),
+            TranscriptItemRecord::from_tool_invocation(&ToolInvocationRecord {
+                sequence_number: 8,
+                ..child_invocation
+            }),
+        ];
+        session.next_replay_sequence = 100;
+        session.foreground_owner = Some(ForegroundOwnerRecord {
+            run_id: root_run_id,
+            phase: ForegroundPhase::AwaitingToolApproval,
+            batch_anchor_turn_id: Some(root_assistant_turn_id),
+        });
+        pending_invocation.sequence_number = 60;
+        session.rebuild_run_indexes();
         store.create(&session).unwrap();
         session
     }

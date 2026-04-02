@@ -9,7 +9,9 @@ use crate::app::request_builder::{build_provider_request, child_provider_request
 use crate::app::{AppState, AppStatus, Effect, Msg};
 use crate::session::model::{
     ForegroundPhase, Role, RunStatus, RunTerminalStopReason, TaskDelegationStatus,
-    ToolApprovalState, ToolExecutionState, ToolInvocationId, Turn,
+    ToolApprovalState, ToolExecutionState, ToolInvocationId, TranscriptItemRecord,
+    TranscriptStreamState, Turn, transcript_assistant_reasoning_item_id,
+    transcript_assistant_text_item_id, transcript_delegated_child_item_id,
 };
 
 pub const RESTART_INTERRUPTED_TASK_RESULT: &str =
@@ -96,6 +98,7 @@ pub fn start_child_run(
             task_request.prompt.clone(),
         );
     }
+    upsert_tool_invocation_transcript_item(state, invocation_id);
 
     state.session.upsert_run_with_parent(
         child_run_id,
@@ -103,6 +106,9 @@ pub fn start_child_run(
         Some(parent_run_id),
         Some(invocation_id),
     );
+    upsert_run_started_transcript_item(state, child_run_id);
+    let delegated_child_sequence = state.session.allocate_replay_sequence();
+    upsert_delegated_child_transcript_item(state, invocation_id, Some(delegated_child_sequence));
     state.set_foreground(child_run_id, ForegroundPhase::Generating, None);
 
     let sequence_number = state.session.allocate_replay_sequence();
@@ -115,6 +121,15 @@ pub fn start_child_run(
         sequence_number,
         timestamp: Utc::now(),
     });
+    let child_prompt_turn = state
+        .session
+        .turns
+        .last()
+        .expect("child prompt turn just pushed")
+        .clone();
+    state
+        .session
+        .upsert_transcript_item(TranscriptItemRecord::from_turn(&child_prompt_turn));
     state.session.updated_at = Utc::now();
 
     let child_request = child_provider_request(
@@ -199,6 +214,8 @@ pub fn complete_child_run(
     state
         .session
         .upsert_run_with_stop_reason(child_run_id, child_status, child_stop_reason);
+    commit_open_assistant_transcript_items_for_run(state, child_run_id);
+    upsert_run_terminal_transcript_item(state, child_run_id);
 
     if let Some(invocation) = state
         .session
@@ -206,6 +223,8 @@ pub fn complete_child_run(
     {
         invocation.set_task_delegation_status(delegation_status);
     }
+    upsert_tool_invocation_transcript_item(state, parent_tool_invocation_id);
+    upsert_delegated_child_transcript_item(state, parent_tool_invocation_id, None);
 
     state.set_foreground(parent_run_id, ForegroundPhase::Generating, None);
 
@@ -314,6 +333,8 @@ fn finish_task_invocation_with_error(
         invocation.completed_at = Some(Utc::now());
         invocation.set_task_delegation_status(TaskDelegationStatus::Failed);
     }
+    upsert_tool_invocation_transcript_item(state, invocation_id);
+    upsert_delegated_child_transcript_item(state, invocation_id, None);
     state.session.updated_at = Utc::now();
 }
 
@@ -478,6 +499,94 @@ fn fail_closed_startup_recovery(state: &mut AppState, message: String) -> Vec<Ef
     state.active_run_id = None;
     state.status = AppStatus::Error(message);
     Vec::new()
+}
+
+fn upsert_tool_invocation_transcript_item(state: &mut AppState, invocation_id: ToolInvocationId) {
+    let Some(invocation) = state
+        .session
+        .tool_invocations
+        .iter()
+        .find(|invocation| invocation.id == invocation_id)
+        .cloned()
+    else {
+        return;
+    };
+
+    state
+        .session
+        .upsert_transcript_item(TranscriptItemRecord::from_tool_invocation(&invocation));
+}
+
+fn upsert_delegated_child_transcript_item(
+    state: &mut AppState,
+    invocation_id: ToolInvocationId,
+    sequence_number_override: Option<u64>,
+) {
+    let Some(invocation) = state
+        .session
+        .tool_invocations
+        .iter()
+        .find(|invocation| invocation.id == invocation_id)
+        .cloned()
+    else {
+        return;
+    };
+
+    if invocation.task_delegation().is_none() {
+        return;
+    }
+
+    let item_id = transcript_delegated_child_item_id(invocation_id);
+    let sequence_number = state
+        .session
+        .find_transcript_item(item_id)
+        .map(|item| item.sequence_number)
+        .or(sequence_number_override)
+        .unwrap_or_else(|| state.session.allocate_replay_sequence());
+    let item = TranscriptItemRecord::delegated_child(&invocation, sequence_number);
+    state.session.upsert_transcript_item(item);
+}
+
+fn upsert_run_started_transcript_item(state: &mut AppState, run_id: Uuid) {
+    let Some(run) = state.session.find_run(run_id).cloned() else {
+        return;
+    };
+
+    state
+        .session
+        .upsert_transcript_item(TranscriptItemRecord::run_started(&run));
+}
+
+fn upsert_run_terminal_transcript_item(state: &mut AppState, run_id: Uuid) {
+    let Some(run) = state.session.find_run(run_id).cloned() else {
+        return;
+    };
+
+    state
+        .session
+        .upsert_transcript_item(TranscriptItemRecord::run_terminal(&run));
+}
+
+fn commit_open_assistant_transcript_items_for_run(state: &mut AppState, run_id: Uuid) {
+    let Some(turn_id) = state
+        .session
+        .turns
+        .iter()
+        .rev()
+        .find(|turn| turn.run_id == run_id && matches!(turn.role, Role::Assistant))
+        .map(|turn| turn.id)
+    else {
+        return;
+    };
+
+    for item_id in [
+        transcript_assistant_reasoning_item_id(turn_id),
+        transcript_assistant_text_item_id(turn_id),
+    ] {
+        if let Some(item) = state.session.find_transcript_item_mut(item_id) {
+            item.stream_state = TranscriptStreamState::Committed;
+        }
+    }
 }
 
 #[cfg(test)]

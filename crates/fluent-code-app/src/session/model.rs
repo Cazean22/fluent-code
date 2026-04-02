@@ -10,6 +10,7 @@ pub type SessionId = Uuid;
 pub type TurnId = Uuid;
 pub type RunId = Uuid;
 pub type ToolInvocationId = Uuid;
+pub type TranscriptItemId = Uuid;
 pub type ReplaySequence = u64;
 
 const FIRST_REPLAY_SEQUENCE: ReplaySequence = 1;
@@ -24,6 +25,10 @@ pub struct Session {
     pub next_replay_sequence: ReplaySequence,
     #[serde(default)]
     pub permissions: SessionPermissionState,
+    #[serde(default)]
+    pub transcript_fidelity: TranscriptFidelity,
+    #[serde(default)]
+    pub transcript_items: Vec<TranscriptItemRecord>,
     #[serde(default)]
     pub runs: Vec<RunRecord>,
     #[serde(default)]
@@ -49,6 +54,8 @@ impl Session {
             updated_at: now,
             next_replay_sequence: default_next_replay_sequence(),
             permissions: SessionPermissionState::default(),
+            transcript_fidelity: TranscriptFidelity::Exact,
+            transcript_items: Vec::new(),
             runs: Vec::new(),
             turns: Vec::new(),
             tool_invocations: Vec::new(),
@@ -192,6 +199,9 @@ impl Session {
             self.resequence_from_legacy_timestamps();
         }
 
+        self.transcript_items
+            .sort_by_key(|item| item.sequence_number);
+
         for run in &mut self.runs {
             run.normalize_terminal_stop_reason();
         }
@@ -201,6 +211,14 @@ impl Session {
             .map(|sequence| sequence.saturating_add(1))
             .unwrap_or(FIRST_REPLAY_SEQUENCE);
         self.rebuild_run_indexes();
+    }
+
+    pub fn has_replay_visible_legacy_items(&self) -> bool {
+        !self.runs.is_empty() || !self.turns.is_empty() || !self.tool_invocations.is_empty()
+    }
+
+    pub fn requires_approximate_transcript_synthesis(&self) -> bool {
+        self.transcript_items.is_empty() && self.has_replay_visible_legacy_items()
     }
 
     pub fn find_run(&self, run_id: RunId) -> Option<&RunRecord> {
@@ -288,6 +306,32 @@ impl Session {
             .find(|invocation| invocation.id == invocation_id)
     }
 
+    pub fn find_transcript_item(&self, item_id: TranscriptItemId) -> Option<&TranscriptItemRecord> {
+        self.transcript_items
+            .iter()
+            .find(|item| item.item_id == item_id)
+    }
+
+    pub fn find_transcript_item_mut(
+        &mut self,
+        item_id: TranscriptItemId,
+    ) -> Option<&mut TranscriptItemRecord> {
+        self.transcript_items
+            .iter_mut()
+            .find(|item| item.item_id == item_id)
+    }
+
+    pub fn upsert_transcript_item(&mut self, item: TranscriptItemRecord) {
+        if let Some(existing) = self.find_transcript_item_mut(item.item_id) {
+            *existing = item;
+            return;
+        }
+
+        self.transcript_items.push(item);
+        self.transcript_items
+            .sort_by_key(|item| item.sequence_number);
+    }
+
     fn has_legacy_replay_metadata(&self) -> bool {
         self.runs.iter().any(|run| run.created_sequence == 0)
             || self.turns.iter().any(|turn| turn.sequence_number == 0)
@@ -302,18 +346,46 @@ impl Session {
     }
 
     fn max_replay_sequence(&self) -> Option<ReplaySequence> {
-        self.runs
+        self.transcript_items
             .iter()
-            .map(|run| run.created_sequence)
-            .chain(self.runs.iter().filter_map(|run| run.terminal_sequence))
-            .chain(self.turns.iter().map(|turn| turn.sequence_number))
+            .map(|item| item.sequence_number)
             .chain(
-                self.tool_invocations
+                self.runs
                     .iter()
-                    .map(|invocation| invocation.sequence_number),
+                    .map(|run| run.created_sequence)
+                    .chain(self.runs.iter().filter_map(|run| run.terminal_sequence))
+                    .chain(self.turns.iter().map(|turn| turn.sequence_number))
+                    .chain(
+                        self.tool_invocations
+                            .iter()
+                            .map(|invocation| invocation.sequence_number),
+                    ),
             )
             .filter(|sequence| *sequence >= FIRST_REPLAY_SEQUENCE)
             .max()
+    }
+
+    pub fn synthesize_approximate_transcript_items(&mut self) {
+        let mut transcript_items = Vec::new();
+
+        for run in &self.runs {
+            transcript_items.push(TranscriptItemRecord::run_started(run));
+
+            if run.status.is_terminal() {
+                transcript_items.push(TranscriptItemRecord::run_terminal(run));
+            }
+        }
+
+        transcript_items.extend(self.turns.iter().map(TranscriptItemRecord::from_turn));
+        transcript_items.extend(
+            self.tool_invocations
+                .iter()
+                .map(TranscriptItemRecord::from_tool_invocation),
+        );
+        transcript_items.sort_by_key(|item| item.sequence_number);
+
+        self.transcript_fidelity = TranscriptFidelity::Approximate;
+        self.transcript_items = transcript_items;
     }
 
     fn resolve_root_run_id(&mut self, run_id: RunId) -> Option<RunId> {
@@ -407,6 +479,412 @@ impl Session {
             next_sequence = next_sequence.saturating_add(1);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptFidelity {
+    #[default]
+    Exact,
+    Approximate,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptStreamState {
+    Open,
+    #[default]
+    Committed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptItemKind {
+    Turn,
+    ToolInvocation,
+    RunLifecycle,
+    Permission,
+    DelegatedChild,
+    Marker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptItemRecord {
+    pub item_id: TranscriptItemId,
+    pub sequence_number: ReplaySequence,
+    pub run_id: RunId,
+    pub kind: TranscriptItemKind,
+    #[serde(default)]
+    pub stream_state: TranscriptStreamState,
+    #[serde(default)]
+    pub turn_id: Option<TurnId>,
+    #[serde(default)]
+    pub tool_invocation_id: Option<ToolInvocationId>,
+    #[serde(default)]
+    pub parent_item_id: Option<TranscriptItemId>,
+    #[serde(default)]
+    pub parent_tool_invocation_id: Option<ToolInvocationId>,
+    #[serde(default)]
+    pub child_run_id: Option<RunId>,
+    pub content: TranscriptItemContent,
+}
+
+impl TranscriptItemRecord {
+    pub fn from_turn(turn: &Turn) -> Self {
+        Self {
+            item_id: turn.id,
+            sequence_number: turn.sequence_number,
+            run_id: turn.run_id,
+            kind: TranscriptItemKind::Turn,
+            stream_state: TranscriptStreamState::Committed,
+            turn_id: Some(turn.id),
+            tool_invocation_id: None,
+            parent_item_id: None,
+            parent_tool_invocation_id: None,
+            child_run_id: None,
+            content: TranscriptItemContent::Turn(TranscriptTurnContent {
+                role: turn.role,
+                content: turn.content.clone(),
+                reasoning: turn.reasoning.clone(),
+            }),
+        }
+    }
+
+    pub fn from_tool_invocation(invocation: &ToolInvocationRecord) -> Self {
+        Self {
+            item_id: invocation.id,
+            sequence_number: invocation.sequence_number,
+            run_id: invocation.run_id,
+            kind: TranscriptItemKind::ToolInvocation,
+            stream_state: if matches!(
+                invocation.execution_state,
+                ToolExecutionState::NotStarted | ToolExecutionState::Running
+            ) {
+                TranscriptStreamState::Open
+            } else {
+                TranscriptStreamState::Committed
+            },
+            turn_id: invocation.preceding_turn_id,
+            tool_invocation_id: Some(invocation.id),
+            parent_item_id: invocation.preceding_turn_id,
+            parent_tool_invocation_id: None,
+            child_run_id: invocation.child_run_id(),
+            content: TranscriptItemContent::ToolInvocation(TranscriptToolInvocationContent {
+                tool_call_id: invocation.tool_call_id.clone(),
+                tool_name: invocation.tool_name.clone(),
+                tool_source: invocation.tool_source.clone(),
+                arguments: invocation.arguments.clone(),
+                preceding_turn_id: invocation.preceding_turn_id,
+                approval_state: invocation.approval_state,
+                execution_state: invocation.execution_state,
+                result: invocation.result.clone(),
+                error: invocation.error.clone(),
+                delegation: invocation.delegation.clone(),
+            }),
+        }
+    }
+
+    pub fn run_started(run: &RunRecord) -> Self {
+        Self {
+            item_id: transcript_run_marker_id(run.id, TranscriptRunLifecycleEvent::Started),
+            sequence_number: run.created_sequence,
+            run_id: run.id,
+            kind: TranscriptItemKind::RunLifecycle,
+            stream_state: TranscriptStreamState::Committed,
+            turn_id: None,
+            tool_invocation_id: None,
+            parent_item_id: None,
+            parent_tool_invocation_id: run.parent_tool_invocation_id,
+            child_run_id: None,
+            content: TranscriptItemContent::RunLifecycle(TranscriptRunLifecycleContent {
+                event: TranscriptRunLifecycleEvent::Started,
+                status: RunStatus::InProgress,
+                stop_reason: None,
+            }),
+        }
+    }
+
+    pub fn run_terminal(run: &RunRecord) -> Self {
+        Self {
+            item_id: transcript_run_marker_id(run.id, TranscriptRunLifecycleEvent::Terminal),
+            sequence_number: run.terminal_sequence.unwrap_or(run.created_sequence),
+            run_id: run.id,
+            kind: TranscriptItemKind::RunLifecycle,
+            stream_state: TranscriptStreamState::Committed,
+            turn_id: None,
+            tool_invocation_id: None,
+            parent_item_id: None,
+            parent_tool_invocation_id: run.parent_tool_invocation_id,
+            child_run_id: None,
+            content: TranscriptItemContent::RunLifecycle(TranscriptRunLifecycleContent {
+                event: TranscriptRunLifecycleEvent::Terminal,
+                status: run.status,
+                stop_reason: run.terminal_stop_reason,
+            }),
+        }
+    }
+
+    pub fn assistant_reasoning(
+        run_id: RunId,
+        turn_id: TurnId,
+        sequence_number: ReplaySequence,
+        reasoning: impl Into<String>,
+        stream_state: TranscriptStreamState,
+    ) -> Self {
+        Self {
+            item_id: transcript_assistant_reasoning_item_id(turn_id),
+            sequence_number,
+            run_id,
+            kind: TranscriptItemKind::Turn,
+            stream_state,
+            turn_id: Some(turn_id),
+            tool_invocation_id: None,
+            parent_item_id: None,
+            parent_tool_invocation_id: None,
+            child_run_id: None,
+            content: TranscriptItemContent::Turn(TranscriptTurnContent {
+                role: Role::Assistant,
+                content: String::new(),
+                reasoning: reasoning.into(),
+            }),
+        }
+    }
+
+    pub fn assistant_text(
+        run_id: RunId,
+        turn_id: TurnId,
+        sequence_number: ReplaySequence,
+        content: impl Into<String>,
+        stream_state: TranscriptStreamState,
+    ) -> Self {
+        Self {
+            item_id: transcript_assistant_text_item_id(turn_id),
+            sequence_number,
+            run_id,
+            kind: TranscriptItemKind::Turn,
+            stream_state,
+            turn_id: Some(turn_id),
+            tool_invocation_id: None,
+            parent_item_id: None,
+            parent_tool_invocation_id: None,
+            child_run_id: None,
+            content: TranscriptItemContent::Turn(TranscriptTurnContent {
+                role: Role::Assistant,
+                content: content.into(),
+                reasoning: String::new(),
+            }),
+        }
+    }
+
+    pub fn permission(
+        invocation: &ToolInvocationRecord,
+        sequence_number: ReplaySequence,
+        state: TranscriptPermissionState,
+        decision: Option<ToolPermissionAction>,
+    ) -> Self {
+        Self {
+            item_id: transcript_permission_item_id(invocation.id),
+            sequence_number,
+            run_id: invocation.run_id,
+            kind: TranscriptItemKind::Permission,
+            stream_state: if state == TranscriptPermissionState::Pending {
+                TranscriptStreamState::Open
+            } else {
+                TranscriptStreamState::Committed
+            },
+            turn_id: invocation.preceding_turn_id,
+            tool_invocation_id: Some(invocation.id),
+            parent_item_id: invocation.preceding_turn_id,
+            parent_tool_invocation_id: Some(invocation.id),
+            child_run_id: invocation.child_run_id(),
+            content: TranscriptItemContent::Permission(TranscriptPermissionContent {
+                tool_name: invocation.tool_name.clone(),
+                tool_source: invocation.tool_source.clone(),
+                state,
+                decision,
+            }),
+        }
+    }
+
+    pub fn delegated_child(
+        invocation: &ToolInvocationRecord,
+        sequence_number: ReplaySequence,
+    ) -> Self {
+        let delegation = invocation.task_delegation().cloned().unwrap_or_default();
+        let status = delegation.status;
+        Self {
+            item_id: transcript_delegated_child_item_id(invocation.id),
+            sequence_number,
+            run_id: invocation.run_id,
+            kind: TranscriptItemKind::DelegatedChild,
+            stream_state: if matches!(
+                status,
+                TaskDelegationStatus::Pending | TaskDelegationStatus::Running
+            ) {
+                TranscriptStreamState::Open
+            } else {
+                TranscriptStreamState::Committed
+            },
+            turn_id: invocation.preceding_turn_id,
+            tool_invocation_id: Some(invocation.id),
+            parent_item_id: invocation.preceding_turn_id,
+            parent_tool_invocation_id: Some(invocation.id),
+            child_run_id: delegation.child_run_id,
+            content: TranscriptItemContent::DelegatedChild(TranscriptDelegatedChildContent {
+                child_run_id: delegation.child_run_id,
+                agent_name: delegation.agent_name,
+                prompt: delegation.prompt,
+                status,
+            }),
+        }
+    }
+
+    pub fn marker(
+        run_id: RunId,
+        sequence_number: ReplaySequence,
+        label: impl Into<String>,
+        detail: Option<String>,
+        parent_tool_invocation_id: Option<ToolInvocationId>,
+        child_run_id: Option<RunId>,
+    ) -> Self {
+        Self {
+            item_id: Uuid::new_v4(),
+            sequence_number,
+            run_id,
+            kind: TranscriptItemKind::Marker,
+            stream_state: TranscriptStreamState::Committed,
+            turn_id: None,
+            tool_invocation_id: None,
+            parent_item_id: None,
+            parent_tool_invocation_id,
+            child_run_id,
+            content: TranscriptItemContent::Marker(TranscriptMarkerContent {
+                label: label.into(),
+                detail,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TranscriptItemContent {
+    Turn(TranscriptTurnContent),
+    ToolInvocation(TranscriptToolInvocationContent),
+    RunLifecycle(TranscriptRunLifecycleContent),
+    Permission(TranscriptPermissionContent),
+    DelegatedChild(TranscriptDelegatedChildContent),
+    Marker(TranscriptMarkerContent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptTurnContent {
+    pub role: Role,
+    pub content: String,
+    #[serde(default)]
+    pub reasoning: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptToolInvocationContent {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_source: ToolSource,
+    pub arguments: serde_json::Value,
+    #[serde(default)]
+    pub preceding_turn_id: Option<TurnId>,
+    #[serde(default)]
+    pub approval_state: ToolApprovalState,
+    #[serde(default)]
+    pub execution_state: ToolExecutionState,
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<TaskDelegationRecord>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptRunLifecycleEvent {
+    Started,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptRunLifecycleContent {
+    pub event: TranscriptRunLifecycleEvent,
+    pub status: RunStatus,
+    #[serde(default)]
+    pub stop_reason: Option<RunTerminalStopReason>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptPermissionState {
+    #[default]
+    Pending,
+    Approved,
+    Denied,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptPermissionContent {
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_source: ToolSource,
+    #[serde(default)]
+    pub state: TranscriptPermissionState,
+    #[serde(default)]
+    pub decision: Option<ToolPermissionAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptDelegatedChildContent {
+    #[serde(default)]
+    pub child_run_id: Option<RunId>,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub status: TaskDelegationStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptMarkerContent {
+    pub label: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+fn transcript_run_marker_id(run_id: RunId, event: TranscriptRunLifecycleEvent) -> TranscriptItemId {
+    let salt = match event {
+        TranscriptRunLifecycleEvent::Started => 0xfeed_face_feed_face_feed_face_feed_face_u128,
+        TranscriptRunLifecycleEvent::Terminal => 0xdead_beef_dead_beef_dead_beef_dead_beef_u128,
+    };
+
+    Uuid::from_u128(run_id.as_u128() ^ salt)
+}
+
+pub fn transcript_assistant_reasoning_item_id(turn_id: TurnId) -> TranscriptItemId {
+    Uuid::from_u128(turn_id.as_u128() ^ 0xa11c_e001_a11c_e001_a11c_e001_a11c_e001_u128)
+}
+
+pub fn transcript_assistant_text_item_id(turn_id: TurnId) -> TranscriptItemId {
+    Uuid::from_u128(turn_id.as_u128() ^ 0xa11c_e002_a11c_e002_a11c_e002_a11c_e002_u128)
+}
+
+pub fn transcript_permission_item_id(tool_invocation_id: ToolInvocationId) -> TranscriptItemId {
+    Uuid::from_u128(tool_invocation_id.as_u128() ^ 0xc0de_0001_c0de_0001_c0de_0001_c0de_0001_u128)
+}
+
+pub fn transcript_delegated_child_item_id(
+    tool_invocation_id: ToolInvocationId,
+) -> TranscriptItemId {
+    Uuid::from_u128(tool_invocation_id.as_u128() ^ 0xde1e_0002_de1e_0002_de1e_0002_de1e_0002_u128)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -826,7 +1304,7 @@ const fn default_next_replay_sequence() -> ReplaySequence {
     FIRST_REPLAY_SEQUENCE
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Role {
     User,
     Assistant,

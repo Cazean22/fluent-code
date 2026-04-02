@@ -7,7 +7,10 @@ use crate::app::request_builder::build_provider_request;
 use crate::app::{AppState, Effect};
 use crate::session::model::{
     ForegroundOwnerRecord, ForegroundPhase, RunStatus, RunTerminalStopReason, ToolApprovalState,
-    ToolExecutionState,
+    ToolExecutionState, TranscriptItemContent, TranscriptItemRecord, TranscriptPermissionState,
+    TranscriptStreamState, transcript_assistant_reasoning_item_id,
+    transcript_assistant_text_item_id, transcript_delegated_child_item_id,
+    transcript_permission_item_id,
 };
 
 const INTERRUPTED_RUNNING_TOOL_MESSAGE: &str =
@@ -102,6 +105,7 @@ fn recover_root_generating(state: &mut AppState, owner: ForegroundOwnerRecord) -
     }
 
     state.set_foreground(owner.run_id, ForegroundPhase::Generating, None);
+    restore_generating_transcript_items(state, owner.run_id);
     let request = build_provider_request(state, owner.run_id);
     vec![Effect::StartAssistant {
         run_id: owner.run_id,
@@ -130,6 +134,11 @@ fn recover_awaiting_tool_approval(
     state.set_foreground(
         owner.run_id,
         ForegroundPhase::AwaitingToolApproval,
+        owner.batch_anchor_turn_id,
+    );
+    restore_awaiting_tool_approval_transcript_items(
+        state,
+        owner.run_id,
         owner.batch_anchor_turn_id,
     );
     Vec::new()
@@ -170,10 +179,35 @@ fn interrupt_running_tool_recovery(
         }
     }
 
+    let affected_invocation_ids = state
+        .session
+        .tool_invocations
+        .iter()
+        .filter(|invocation| {
+            invocation.run_id == owner.run_id
+                && invocation.preceding_turn_id == owner.batch_anchor_turn_id
+                && invocation.approval_state == ToolApprovalState::Approved
+                && matches!(invocation.execution_state, ToolExecutionState::Failed)
+        })
+        .map(|invocation| invocation.id)
+        .collect::<Vec<_>>();
+
+    for invocation_id in affected_invocation_ids {
+        upsert_tool_invocation_transcript_item(state, invocation_id);
+        upsert_delegated_child_transcript_item(state, invocation_id);
+    }
+
     state.session.upsert_run_with_stop_reason(
         owner.run_id,
         RunStatus::Failed,
         Some(RunTerminalStopReason::Interrupted),
+    );
+    upsert_run_terminal_transcript_item(state, owner.run_id);
+    append_interrupted_marker(
+        state,
+        owner.run_id,
+        owner.batch_anchor_turn_id,
+        message.clone(),
     );
     state.session.updated_at = interrupted_at;
     state.clear_foreground();
@@ -193,6 +227,157 @@ fn fail_closed_startup_recovery(state: &mut AppState, message: String) -> Vec<Ef
     Vec::new()
 }
 
+fn restore_generating_transcript_items(state: &mut AppState, run_id: uuid::Uuid) {
+    let Some(turn_id) = state
+        .session
+        .turns
+        .iter()
+        .rev()
+        .find(|turn| {
+            turn.run_id == run_id
+                && matches!(turn.role, crate::session::model::Role::Assistant)
+                && !state
+                    .session
+                    .tool_invocations
+                    .iter()
+                    .any(|invocation| invocation.preceding_turn_id == Some(turn.id))
+        })
+        .map(|turn| turn.id)
+    else {
+        return;
+    };
+
+    for item_id in [
+        transcript_assistant_reasoning_item_id(turn_id),
+        transcript_assistant_text_item_id(turn_id),
+    ] {
+        if let Some(item) = state.session.find_transcript_item_mut(item_id) {
+            item.stream_state = TranscriptStreamState::Open;
+        }
+    }
+}
+
+fn restore_awaiting_tool_approval_transcript_items(
+    state: &mut AppState,
+    run_id: uuid::Uuid,
+    batch_anchor_turn_id: Option<uuid::Uuid>,
+) {
+    let invocation_ids = state
+        .session
+        .tool_invocations
+        .iter()
+        .filter(|invocation| {
+            invocation.run_id == run_id
+                && invocation.preceding_turn_id == batch_anchor_turn_id
+                && invocation.approval_state == ToolApprovalState::Pending
+        })
+        .map(|invocation| invocation.id)
+        .collect::<Vec<_>>();
+
+    for invocation_id in invocation_ids {
+        if let Some(item) = state.session.find_transcript_item_mut(invocation_id) {
+            item.stream_state = TranscriptStreamState::Open;
+        }
+
+        let permission_item_id = transcript_permission_item_id(invocation_id);
+        if let Some(item) = state.session.find_transcript_item_mut(permission_item_id) {
+            item.stream_state = TranscriptStreamState::Open;
+            if let TranscriptItemContent::Permission(content) = &mut item.content {
+                content.state = TranscriptPermissionState::Pending;
+                content.decision = None;
+            }
+        }
+    }
+}
+
+fn upsert_tool_invocation_transcript_item(
+    state: &mut AppState,
+    invocation_id: crate::session::model::ToolInvocationId,
+) {
+    let Some(invocation) = state
+        .session
+        .tool_invocations
+        .iter()
+        .find(|invocation| invocation.id == invocation_id)
+        .cloned()
+    else {
+        return;
+    };
+
+    state
+        .session
+        .upsert_transcript_item(TranscriptItemRecord::from_tool_invocation(&invocation));
+}
+
+fn upsert_delegated_child_transcript_item(
+    state: &mut AppState,
+    invocation_id: crate::session::model::ToolInvocationId,
+) {
+    let Some(invocation) = state
+        .session
+        .tool_invocations
+        .iter()
+        .find(|invocation| invocation.id == invocation_id)
+        .cloned()
+    else {
+        return;
+    };
+
+    if invocation.task_delegation().is_none() {
+        return;
+    }
+
+    let item_id = transcript_delegated_child_item_id(invocation_id);
+    let sequence_number = state
+        .session
+        .find_transcript_item(item_id)
+        .map(|item| item.sequence_number)
+        .unwrap_or_else(|| state.session.allocate_replay_sequence());
+    state
+        .session
+        .upsert_transcript_item(TranscriptItemRecord::delegated_child(
+            &invocation,
+            sequence_number,
+        ));
+}
+
+fn upsert_run_terminal_transcript_item(state: &mut AppState, run_id: uuid::Uuid) {
+    let Some(run) = state.session.find_run(run_id).cloned() else {
+        return;
+    };
+
+    state
+        .session
+        .upsert_transcript_item(TranscriptItemRecord::run_terminal(&run));
+}
+
+fn append_interrupted_marker(
+    state: &mut AppState,
+    run_id: uuid::Uuid,
+    batch_anchor_turn_id: Option<uuid::Uuid>,
+    detail: String,
+) {
+    let parent_tool_invocation_id = state
+        .session
+        .tool_invocations
+        .iter()
+        .find(|invocation| {
+            invocation.run_id == run_id && invocation.preceding_turn_id == batch_anchor_turn_id
+        })
+        .map(|invocation| invocation.id);
+    let sequence_number = state.session.allocate_replay_sequence();
+    state
+        .session
+        .upsert_transcript_item(TranscriptItemRecord::marker(
+            run_id,
+            sequence_number,
+            "interrupted",
+            Some(detail),
+            parent_tool_invocation_id,
+            None,
+        ));
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -204,7 +389,8 @@ mod tests {
     use crate::session::model::{
         ForegroundOwnerRecord, ForegroundPhase, Role, RunRecord, RunStatus, RunTerminalStopReason,
         Session, TaskDelegationRecord, TaskDelegationStatus, ToolApprovalState, ToolExecutionState,
-        ToolInvocationRecord, ToolSource, Turn,
+        ToolInvocationRecord, ToolSource, TranscriptItemContent, TranscriptItemRecord,
+        TranscriptPermissionState, TranscriptRunLifecycleEvent, TranscriptStreamState, Turn,
     };
 
     #[test]
@@ -280,6 +466,110 @@ mod tests {
     }
 
     #[test]
+    fn startup_foreground_restores_open_transcript_item_or_marks_it_interrupted() {
+        let mut generating_state = AppState::new(root_generating_session());
+        let generating_run_id = generating_state
+            .session
+            .foreground_owner
+            .as_ref()
+            .expect("generating owner")
+            .run_id;
+
+        let generating_effects = recover_startup_foreground(&mut generating_state);
+
+        assert!(matches!(
+            generating_effects.as_slice(),
+            [Effect::StartAssistant { .. }]
+        ));
+        let generating_items = ordered_transcript_items(&generating_state.session.transcript_items);
+        assert!(generating_items.iter().any(|item| {
+            item.run_id == generating_run_id
+                && item.stream_state == TranscriptStreamState::Open
+                && matches!(
+                    &item.content,
+                    TranscriptItemContent::Turn(content)
+                        if matches!(content.role, Role::Assistant)
+                            && content.content == "partial answer"
+                )
+        }));
+
+        let mut awaiting_state = AppState::new(awaiting_tool_approval_session());
+        let awaiting_owner = awaiting_state
+            .session
+            .foreground_owner
+            .clone()
+            .expect("awaiting owner");
+
+        let awaiting_effects = recover_startup_foreground(&mut awaiting_state);
+
+        assert!(awaiting_effects.is_empty());
+        let awaiting_items = ordered_transcript_items(&awaiting_state.session.transcript_items);
+        assert!(awaiting_items.iter().any(|item| {
+            item.run_id == awaiting_owner.run_id
+                && item.stream_state == TranscriptStreamState::Open
+                && matches!(
+                    &item.content,
+                    TranscriptItemContent::ToolInvocation(content)
+                        if content.tool_name == "read"
+                            && matches!(content.execution_state, ToolExecutionState::NotStarted)
+                )
+        }));
+        assert!(awaiting_items.iter().any(|item| {
+            item.run_id == awaiting_owner.run_id
+                && item.stream_state == TranscriptStreamState::Open
+                && matches!(
+                    &item.content,
+                    TranscriptItemContent::Permission(content)
+                        if content.state == TranscriptPermissionState::Pending
+                )
+        }));
+
+        let mut running_state = AppState::new(running_tool_session());
+        let running_run_id = running_state
+            .session
+            .foreground_owner
+            .as_ref()
+            .expect("running owner")
+            .run_id;
+
+        let running_effects = recover_startup_foreground(&mut running_state);
+
+        assert!(matches!(
+            running_effects.as_slice(),
+            [Effect::PersistSession]
+        ));
+        let running_items = ordered_transcript_items(&running_state.session.transcript_items);
+        assert!(running_items.iter().any(|item| {
+            item.run_id == running_run_id
+                && matches!(
+                    &item.content,
+                    TranscriptItemContent::RunLifecycle(content)
+                        if content.event == TranscriptRunLifecycleEvent::Terminal
+                            && content.stop_reason == Some(RunTerminalStopReason::Interrupted)
+                )
+        }));
+        let interrupted_marker = running_items
+            .iter()
+            .find(|item| {
+                item.run_id == running_run_id
+                    && matches!(
+                        &item.content,
+                        TranscriptItemContent::Marker(content) if content.label == "interrupted"
+                    )
+            })
+            .expect("interrupted marker item");
+        assert_eq!(
+            interrupted_marker.stream_state,
+            TranscriptStreamState::Committed
+        );
+        assert!(matches!(
+            &interrupted_marker.content,
+            TranscriptItemContent::Marker(content)
+                if content.detail.as_deref().is_some_and(|detail| detail.contains("refuses to guess"))
+        ));
+    }
+
+    #[test]
     fn startup_foreground_falls_back_to_legacy_interrupted_child_recovery_when_owner_absent() {
         let mut state = AppState::new(interrupted_child_session(false));
 
@@ -314,7 +604,7 @@ mod tests {
         });
         session.rebuild_run_indexes();
         let turn_sequence = session.allocate_replay_sequence();
-        session.turns.push(Turn {
+        let user_turn = Turn {
             id: Uuid::new_v4(),
             run_id,
             role: Role::User,
@@ -322,7 +612,33 @@ mod tests {
             reasoning: String::new(),
             sequence_number: turn_sequence,
             timestamp: Utc::now(),
-        });
+        };
+        session.turns.push(user_turn.clone());
+        session
+            .transcript_items
+            .push(TranscriptItemRecord::run_started(&session.runs[0]));
+        session
+            .transcript_items
+            .push(TranscriptItemRecord::from_turn(&user_turn));
+        let assistant_turn = Turn {
+            id: Uuid::new_v4(),
+            run_id,
+            role: Role::Assistant,
+            content: "partial answer".to_string(),
+            reasoning: String::new(),
+            sequence_number: session.allocate_replay_sequence(),
+            timestamp: Utc::now(),
+        };
+        session.turns.push(assistant_turn.clone());
+        session
+            .transcript_items
+            .push(TranscriptItemRecord::assistant_text(
+                run_id,
+                assistant_turn.id,
+                assistant_turn.sequence_number,
+                assistant_turn.content.clone(),
+                TranscriptStreamState::Open,
+            ));
         session.foreground_owner = Some(ForegroundOwnerRecord {
             run_id,
             phase: ForegroundPhase::Generating,
@@ -349,7 +665,7 @@ mod tests {
         });
         session.rebuild_run_indexes();
         let user_turn_sequence = session.allocate_replay_sequence();
-        session.turns.push(Turn {
+        let user_turn = Turn {
             id: Uuid::new_v4(),
             run_id,
             role: Role::User,
@@ -357,9 +673,10 @@ mod tests {
             reasoning: String::new(),
             sequence_number: user_turn_sequence,
             timestamp: Utc::now(),
-        });
+        };
+        session.turns.push(user_turn.clone());
         let assistant_turn_sequence = session.allocate_replay_sequence();
-        session.turns.push(Turn {
+        let assistant_turn = Turn {
             id: assistant_turn_id,
             run_id,
             role: Role::Assistant,
@@ -367,9 +684,10 @@ mod tests {
             reasoning: String::new(),
             sequence_number: assistant_turn_sequence,
             timestamp: Utc::now(),
-        });
+        };
+        session.turns.push(assistant_turn.clone());
         let invocation_sequence = session.allocate_replay_sequence();
-        session.tool_invocations.push(ToolInvocationRecord {
+        let invocation = ToolInvocationRecord {
             id: Uuid::new_v4(),
             run_id,
             tool_call_id: "read-call-1".to_string(),
@@ -386,7 +704,35 @@ mod tests {
             requested_at: Utc::now(),
             approved_at: None,
             completed_at: None,
-        });
+        };
+        session.tool_invocations.push(invocation.clone());
+        session
+            .transcript_items
+            .push(TranscriptItemRecord::run_started(&session.runs[0]));
+        session
+            .transcript_items
+            .push(TranscriptItemRecord::from_turn(&user_turn));
+        session
+            .transcript_items
+            .push(TranscriptItemRecord::assistant_text(
+                run_id,
+                assistant_turn.id,
+                assistant_turn.sequence_number,
+                assistant_turn.content.clone(),
+                TranscriptStreamState::Committed,
+            ));
+        session
+            .transcript_items
+            .push(TranscriptItemRecord::from_tool_invocation(&invocation));
+        let permission_sequence = session.allocate_replay_sequence();
+        session
+            .transcript_items
+            .push(TranscriptItemRecord::permission(
+                &invocation,
+                permission_sequence,
+                TranscriptPermissionState::Pending,
+                None,
+            ));
         session.foreground_owner = Some(ForegroundOwnerRecord {
             run_id,
             phase: ForegroundPhase::AwaitingToolApproval,
@@ -400,6 +746,16 @@ mod tests {
         let run_id = session.foreground_owner.as_ref().expect("owner").run_id;
         session.tool_invocations[0].approval_state = ToolApprovalState::Approved;
         session.tool_invocations[0].execution_state = ToolExecutionState::Running;
+        let invocation = session.tool_invocations[0].clone();
+        session.upsert_transcript_item(TranscriptItemRecord::from_tool_invocation(&invocation));
+        let permission_item_id =
+            crate::session::model::transcript_permission_item_id(invocation.id);
+        if let Some(item) = session.find_transcript_item_mut(permission_item_id) {
+            item.stream_state = TranscriptStreamState::Committed;
+            if let TranscriptItemContent::Permission(content) = &mut item.content {
+                content.state = TranscriptPermissionState::Approved;
+            }
+        }
         session.foreground_owner = Some(ForegroundOwnerRecord {
             run_id,
             phase: ForegroundPhase::RunningTool,
@@ -491,5 +847,11 @@ mod tests {
             });
         }
         session
+    }
+
+    fn ordered_transcript_items(items: &[TranscriptItemRecord]) -> Vec<&TranscriptItemRecord> {
+        let mut ordered = items.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|item| item.sequence_number);
+        ordered
     }
 }

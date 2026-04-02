@@ -12,18 +12,29 @@ use std::time::Duration;
 
 use agent_client_protocol::{self as acp, Agent as _};
 use async_trait::async_trait;
+use chrono::Utc;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use fluent_code_app::app::AppStatus;
 use fluent_code_app::config::Config;
 use fluent_code_app::error::{FluentCodeError, Result};
-use futures::StreamExt;
+#[cfg(test)]
+use fluent_code_app::session::model::ToolSource;
+use fluent_code_app::session::model::{
+    ForegroundPhase, Role, Session, TaskDelegationRecord, ToolApprovalState, ToolExecutionState,
+    ToolInvocationRecord, TranscriptFidelity, TranscriptItemContent, TranscriptItemRecord,
+    TranscriptStreamState, Turn,
+};
+use futures::{FutureExt, StreamExt};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 #[cfg(test)]
@@ -33,34 +44,113 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::info;
+use uuid::Uuid;
 
+use crate::conversation::{ConversationRow, derive_history_cells_for_session};
 use crate::terminal;
 use crate::theme::TUI_THEME;
+use crate::view::{conversation_lines_from_cells, resolve_transcript_scroll};
 
 const ACP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const ACP_TEST_PROBES_ENV_VAR: &str = "FLUENT_CODE_ACP_ENABLE_TEST_PROBES";
 const PROJECTION_ACTIVITY_BURST_DRAIN_LIMIT: usize = 8;
+const PROJECTION_QUEUED_INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(10);
+const PROJECTION_PAGE_SCROLL_LINES: u16 = 8;
+const ACP_META_LATEST_PROMPT_STATE_KEY: &str = "fluentCodeLatestPromptState";
+const ACP_META_REPLAY_FIDELITY_KEY: &str = "fluentCodeReplayFidelity";
+const ACP_META_TOOL_INVOCATION_KEY: &str = "fluentCodeToolInvocation";
+const ACP_META_TRANSCRIPT_ITEM_KEY: &str = "fluentCodeTranscriptItem";
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TuiProjectionState {
     pub session: SessionProjection,
-    pub transcript_rows: Vec<TranscriptRowProjection>,
-    pub tool_statuses: Vec<ToolStatusProjection>,
     pub pending_permission: Option<PendingPermissionProjection>,
     pub subprocess: SubprocessProjection,
     pub draft_input: String,
     pub prompt_in_flight: bool,
+    pub prompt_status: Option<PromptStatusProjection>,
+    pub replay_fidelity: ReplayFidelityProjection,
     pub prompt_error: Option<String>,
     pub startup_error: Option<String>,
-    transcript_merge_start: usize,
+    pub transcript_scroll_top: u16,
+    pub transcript_follow_tail: bool,
+    transcript_session: Session,
+    transcript_run_id: Uuid,
+    active_run_id: Option<Uuid>,
+    current_user_turn_id: Option<Uuid>,
+    current_assistant_turn_id: Option<Uuid>,
+    current_reasoning_turn_id: Option<Uuid>,
 }
+
+impl Default for TuiProjectionState {
+    fn default() -> Self {
+        let transcript_run_id = Uuid::new_v4();
+        Self {
+            session: SessionProjection::default(),
+            pending_permission: None,
+            subprocess: SubprocessProjection::default(),
+            draft_input: String::new(),
+            prompt_in_flight: false,
+            prompt_status: None,
+            replay_fidelity: ReplayFidelityProjection::Exact,
+            prompt_error: None,
+            startup_error: None,
+            transcript_scroll_top: 0,
+            transcript_follow_tail: true,
+            transcript_session: Session::new("ACP session"),
+            transcript_run_id,
+            active_run_id: None,
+            current_user_turn_id: None,
+            current_assistant_turn_id: None,
+            current_reasoning_turn_id: None,
+        }
+    }
+}
+
+impl PartialEq for TuiProjectionState {
+    fn eq(&self, other: &Self) -> bool {
+        self.session == other.session
+            && self.transcript_rows() == other.transcript_rows()
+            && self.tool_statuses() == other.tool_statuses()
+            && self.pending_permission == other.pending_permission
+            && self.subprocess == other.subprocess
+            && self.draft_input == other.draft_input
+            && self.prompt_in_flight == other.prompt_in_flight
+            && self.prompt_status == other.prompt_status
+            && self.replay_fidelity == other.replay_fidelity
+            && self.prompt_error == other.prompt_error
+            && self.startup_error == other.startup_error
+            && self.transcript_scroll_top == other.transcript_scroll_top
+            && self.transcript_follow_tail == other.transcript_follow_tail
+    }
+}
+
+impl Eq for TuiProjectionState {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionProjection {
     pub session_id: Option<String>,
     pub title: Option<String>,
     pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReplayFidelityProjection {
+    #[default]
+    Exact,
+    Approximate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptStatusProjection {
+    Running,
+    AwaitingToolApproval,
+    RunningTool,
+    Completed,
+    Cancelled,
+    Failed,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +209,38 @@ pub struct SubprocessProjection {
     pub status: SubprocessStatus,
 }
 
+#[derive(Debug, Clone, Default)]
+struct LoadedSessionMetadataProjection {
+    replay_fidelity: Option<ReplayFidelityProjection>,
+    prompt_status: Option<Option<PromptStatusProjection>>,
+}
+
+impl LoadedSessionMetadataProjection {
+    fn is_complete(&self) -> bool {
+        self.replay_fidelity.is_some() && self.prompt_status.is_some()
+    }
+
+    fn apply_fallback_session(&mut self, session: &Session) {
+        self.replay_fidelity
+            .get_or_insert(match session.transcript_fidelity {
+                TranscriptFidelity::Approximate => ReplayFidelityProjection::Approximate,
+                TranscriptFidelity::Exact => ReplayFidelityProjection::Exact,
+            });
+        self.prompt_status.get_or_insert_with(|| {
+            Some(
+                match session.foreground_owner.as_ref().map(|owner| owner.phase) {
+                    Some(ForegroundPhase::Generating) => PromptStatusProjection::Running,
+                    Some(ForegroundPhase::AwaitingToolApproval) => {
+                        PromptStatusProjection::AwaitingToolApproval
+                    }
+                    Some(ForegroundPhase::RunningTool) => PromptStatusProjection::RunningTool,
+                    None => return None,
+                },
+            )
+        });
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionActivitySnapshot {
@@ -132,13 +254,23 @@ impl TuiProjectionState {
             session_id,
             ..SessionProjection::default()
         };
-        self.transcript_rows.clear();
-        self.transcript_merge_start = 0;
-        self.tool_statuses.clear();
         self.pending_permission = None;
         self.draft_input.clear();
-        self.prompt_in_flight = false;
+        self.set_prompt_status(None);
+        self.replay_fidelity = ReplayFidelityProjection::Exact;
         self.prompt_error = None;
+        self.transcript_scroll_top = 0;
+        self.transcript_follow_tail = true;
+        self.transcript_session = Session::new(
+            self.session
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "ACP session".to_string()),
+        );
+        self.transcript_session.transcript_fidelity = TranscriptFidelity::Exact;
+        self.transcript_run_id = Uuid::new_v4();
+        self.active_run_id = None;
+        self.break_transcript_merge();
     }
 
     fn mark_spawned(&mut self, binary_path: PathBuf, pid: u32) {
@@ -162,7 +294,7 @@ impl TuiProjectionState {
 
     fn mark_startup_error(&mut self, message: String) {
         self.startup_error = Some(message.clone());
-        self.prompt_in_flight = false;
+        self.set_prompt_status(None);
         self.break_transcript_merge();
         self.subprocess.status = SubprocessStatus::Failed { message };
     }
@@ -183,20 +315,50 @@ impl TuiProjectionState {
 
     fn mark_prompt_started(&mut self) {
         self.prompt_error = None;
-        self.prompt_in_flight = true;
         self.draft_input.clear();
+        self.transcript_run_id = Uuid::new_v4();
+        self.active_run_id = Some(self.transcript_run_id);
+        self.set_prompt_status(Some(PromptStatusProjection::Running));
         self.break_transcript_merge();
     }
 
-    fn mark_prompt_finished(&mut self) {
-        self.prompt_in_flight = false;
+    fn mark_prompt_finished(&mut self, stop_reason: acp::StopReason) {
+        self.active_run_id = None;
+        self.set_prompt_status(Some(match stop_reason {
+            acp::StopReason::Cancelled => PromptStatusProjection::Cancelled,
+            _ => PromptStatusProjection::Completed,
+        }));
+        self.commit_open_transcript_items();
         self.break_transcript_merge();
     }
 
     fn mark_prompt_error(&mut self, message: String) {
-        self.prompt_in_flight = false;
+        self.active_run_id = None;
+        self.set_prompt_status(Some(PromptStatusProjection::Failed));
         self.prompt_error = Some(message);
+        self.commit_open_transcript_items();
         self.break_transcript_merge();
+    }
+
+    fn apply_loaded_session_projection(&mut self, metadata: LoadedSessionMetadataProjection) {
+        if let Some(replay_fidelity) = metadata.replay_fidelity {
+            self.replay_fidelity = replay_fidelity;
+            self.transcript_session.transcript_fidelity = match replay_fidelity {
+                ReplayFidelityProjection::Approximate => TranscriptFidelity::Approximate,
+                ReplayFidelityProjection::Exact => TranscriptFidelity::Exact,
+            };
+        }
+        if let Some(prompt_status) = metadata.prompt_status {
+            self.set_prompt_status(prompt_status);
+        }
+        self.active_run_id = self.prompt_in_flight.then_some(self.transcript_run_id);
+    }
+
+    #[cfg(test)]
+    fn apply_loaded_session_metadata(&mut self, session: &Session) {
+        let mut metadata = LoadedSessionMetadataProjection::default();
+        metadata.apply_fallback_session(session);
+        self.apply_loaded_session_projection(metadata);
     }
 
     fn can_edit_draft(&self) -> bool {
@@ -218,24 +380,17 @@ impl TuiProjectionState {
 
         match notification.update {
             acp::SessionUpdate::UserMessageChunk(chunk) => {
-                self.transcript_rows.push(TranscriptRowProjection {
-                    source: TranscriptSource::User,
-                    content: content_block_label(chunk.content),
-                });
+                self.append_user_chunk(chunk.content);
             }
             acp::SessionUpdate::AgentMessageChunk(chunk) => {
-                self.append_transcript_chunk(TranscriptSource::Agent, chunk.content);
+                self.append_assistant_message_chunk(chunk.content);
             }
             acp::SessionUpdate::AgentThoughtChunk(chunk) => {
-                self.append_transcript_chunk(TranscriptSource::Thought, chunk.content);
+                self.append_assistant_reasoning_chunk(chunk.content);
             }
             acp::SessionUpdate::ToolCall(tool_call) => {
                 self.break_transcript_merge();
-                self.upsert_tool_status(
-                    tool_call.tool_call_id.to_string(),
-                    tool_call.title,
-                    tool_call_status_label(tool_call.status),
-                );
+                self.apply_tool_call_snapshot(tool_call);
             }
             acp::SessionUpdate::ToolCallUpdate(update) => {
                 self.break_transcript_merge();
@@ -243,10 +398,14 @@ impl TuiProjectionState {
             }
             acp::SessionUpdate::SessionInfoUpdate(update) => {
                 if let Some(title) = update.title.take() {
+                    self.transcript_session.title = title.clone();
                     self.session.title = Some(title);
                 }
                 if let Some(updated_at) = update.updated_at.take() {
                     self.session.updated_at = Some(updated_at);
+                }
+                if let Some(item) = transcript_item_from_meta(update.meta.as_ref()) {
+                    self.apply_transcript_metadata_item(item);
                 }
             }
             acp::SessionUpdate::Plan(_)
@@ -286,67 +445,526 @@ impl TuiProjectionState {
                 })
                 .collect(),
         });
+        if let Some(index) =
+            self.find_tool_invocation_index(&request.tool_call.tool_call_id.to_string())
+        {
+            self.transcript_session.tool_invocations[index].approval_state =
+                ToolApprovalState::Pending;
+            let transcript_item = TranscriptItemRecord::from_tool_invocation(
+                &self.transcript_session.tool_invocations[index],
+            );
+            self.transcript_session
+                .upsert_transcript_item(transcript_item);
+        }
+        self.set_prompt_status(Some(PromptStatusProjection::AwaitingToolApproval));
+        self.active_run_id = Some(self.transcript_run_id);
     }
 
-    fn append_transcript_chunk(&mut self, source: TranscriptSource, content: acp::ContentBlock) {
+    fn apply_permission_selection(&mut self, option_id: &str) {
+        let Some(tool_call_id) = self
+            .pending_permission
+            .as_ref()
+            .map(|permission| permission.tool_call_id.clone())
+        else {
+            return;
+        };
+
+        if let Some(index) = self.find_tool_invocation_index(&tool_call_id) {
+            self.transcript_session.tool_invocations[index].approval_state =
+                if option_id.starts_with("allow") {
+                    ToolApprovalState::Approved
+                } else {
+                    ToolApprovalState::Denied
+                };
+            let transcript_item = TranscriptItemRecord::from_tool_invocation(
+                &self.transcript_session.tool_invocations[index],
+            );
+            self.transcript_session
+                .upsert_transcript_item(transcript_item);
+        }
+
+        self.pending_permission = None;
+        self.set_prompt_status(Some(if option_id.starts_with("allow") {
+            PromptStatusProjection::RunningTool
+        } else {
+            PromptStatusProjection::Running
+        }));
+    }
+
+    fn append_user_chunk(&mut self, content: acp::ContentBlock) {
+        self.current_assistant_turn_id = None;
+        self.current_reasoning_turn_id = None;
         let content = content_block_label(content);
         if content.is_empty() {
             return;
         }
 
-        let can_merge_last_row = self.transcript_merge_start < self.transcript_rows.len()
-            && self
-                .transcript_rows
-                .last()
-                .is_some_and(|row| row.source == source);
-
-        if can_merge_last_row {
-            let existing = self
-                .transcript_rows
-                .last_mut()
-                .expect("last row to exist when merge is allowed");
-            existing.content.push_str(&content);
+        if let Some(turn_id) = self.current_user_turn_id
+            && let Some(turn) = self
+                .transcript_session
+                .turns
+                .iter_mut()
+                .find(|turn| turn.id == turn_id)
+        {
+            turn.content.push_str(&content);
+            let transcript_item = TranscriptItemRecord::from_turn(turn);
+            self.transcript_session
+                .upsert_transcript_item(transcript_item);
             return;
         }
 
-        self.transcript_rows
-            .push(TranscriptRowProjection { source, content });
+        let turn = Turn {
+            id: Uuid::new_v4(),
+            run_id: self.transcript_run_id,
+            role: Role::User,
+            content,
+            reasoning: String::new(),
+            sequence_number: self.transcript_session.allocate_replay_sequence(),
+            timestamp: Utc::now(),
+        };
+        self.current_user_turn_id = Some(turn.id);
+        self.transcript_session.turns.push(turn.clone());
+        self.transcript_session
+            .upsert_transcript_item(TranscriptItemRecord::from_turn(&turn));
     }
 
     fn break_transcript_merge(&mut self) {
-        self.transcript_merge_start = self.transcript_rows.len();
+        self.current_user_turn_id = None;
+        self.current_assistant_turn_id = None;
+        self.current_reasoning_turn_id = None;
     }
 
-    fn upsert_tool_status(&mut self, tool_call_id: String, title: String, status: String) {
-        if let Some(existing) = self
-            .tool_statuses
-            .iter_mut()
-            .find(|tool| tool.tool_call_id == tool_call_id)
-        {
-            existing.title = title;
-            existing.status = status;
+    fn append_assistant_message_chunk(&mut self, content: acp::ContentBlock) {
+        if self.prompt_in_flight {
+            self.set_prompt_status(Some(PromptStatusProjection::Running));
+            self.active_run_id = Some(self.transcript_run_id);
+        }
+        self.append_assistant_chunk(content, TranscriptSource::Agent);
+    }
+
+    fn append_assistant_reasoning_chunk(&mut self, content: acp::ContentBlock) {
+        if self.prompt_in_flight {
+            self.set_prompt_status(Some(PromptStatusProjection::Running));
+            self.active_run_id = Some(self.transcript_run_id);
+        }
+        self.append_assistant_chunk(content, TranscriptSource::Thought);
+    }
+
+    fn append_assistant_chunk(&mut self, content: acp::ContentBlock, source: TranscriptSource) {
+        match source {
+            TranscriptSource::Agent => {
+                self.current_reasoning_turn_id = None;
+                self.current_user_turn_id = None;
+            }
+            TranscriptSource::Thought => {
+                self.current_assistant_turn_id = None;
+                self.current_user_turn_id = None;
+            }
+            TranscriptSource::User => return,
+        }
+
+        let content = content_block_label(content);
+        if content.is_empty() {
             return;
         }
 
-        self.tool_statuses.push(ToolStatusProjection {
-            tool_call_id,
-            title,
-            status,
-        });
+        let turn_id = match source {
+            TranscriptSource::User => return,
+            TranscriptSource::Agent => &mut self.current_assistant_turn_id,
+            TranscriptSource::Thought => &mut self.current_reasoning_turn_id,
+        };
+
+        if let Some(existing_turn_id) = *turn_id {
+            self.update_assistant_transcript_item(existing_turn_id, source, &content);
+            return;
+        }
+
+        let new_turn_id = Uuid::new_v4();
+        let sequence_number = self.transcript_session.allocate_replay_sequence();
+        let transcript_item = match source {
+            TranscriptSource::Agent => TranscriptItemRecord::assistant_text(
+                self.transcript_run_id,
+                new_turn_id,
+                sequence_number,
+                content,
+                TranscriptStreamState::Open,
+            ),
+            TranscriptSource::Thought => TranscriptItemRecord::assistant_reasoning(
+                self.transcript_run_id,
+                new_turn_id,
+                sequence_number,
+                content,
+                TranscriptStreamState::Open,
+            ),
+            TranscriptSource::User => return,
+        };
+        *turn_id = Some(new_turn_id);
+        self.transcript_session
+            .upsert_transcript_item(transcript_item);
     }
 
     fn apply_tool_call_update(&mut self, update: acp::ToolCallUpdate) {
         let tool_call_id = update.tool_call_id.to_string();
-        let status = update
-            .fields
-            .status
-            .map(tool_call_status_label)
-            .unwrap_or_else(|| "pending".to_string());
         let title = update
             .fields
             .title
-            .unwrap_or_else(|| format!("tool {}", tool_call_id));
-        self.upsert_tool_status(tool_call_id, title, status);
+            .clone()
+            .unwrap_or_else(|| format!("tool {tool_call_id}"));
+        let tool_name = normalized_tool_name(&title, update.fields.kind);
+        let raw_input = update.fields.raw_input.clone();
+        let raw_output = update.fields.raw_output.clone();
+        let content = update.fields.content.clone();
+        let status = update.fields.status;
+        let tool_invocation = tool_invocation_from_meta(update.meta.as_ref());
+
+        self.upsert_tool_invocation(
+            &tool_call_id,
+            &tool_name,
+            raw_input,
+            raw_output,
+            content,
+            status,
+            tool_invocation,
+        );
+
+        if matches!(status, Some(acp::ToolCallStatus::InProgress)) {
+            self.set_prompt_status(Some(PromptStatusProjection::RunningTool));
+            self.active_run_id = Some(self.transcript_run_id);
+        }
+    }
+
+    fn apply_tool_call_snapshot(&mut self, tool_call: acp::ToolCall) {
+        let tool_call_id = tool_call.tool_call_id.to_string();
+        let tool_name = normalized_tool_name(&tool_call.title, Some(tool_call.kind));
+        self.upsert_tool_invocation(
+            &tool_call_id,
+            &tool_name,
+            tool_call.raw_input,
+            tool_call.raw_output,
+            Some(tool_call.content),
+            Some(tool_call.status),
+            tool_invocation_from_meta(tool_call.meta.as_ref()),
+        );
+    }
+
+    fn upsert_tool_invocation(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        raw_input: Option<Value>,
+        raw_output: Option<Value>,
+        content: Option<Vec<acp::ToolCallContent>>,
+        status: Option<acp::ToolCallStatus>,
+        tool_invocation: Option<ToolInvocationRecord>,
+    ) {
+        let meta_result = tool_invocation
+            .as_ref()
+            .and_then(|invocation| invocation.result.clone());
+        let meta_error = tool_invocation
+            .as_ref()
+            .and_then(|invocation| invocation.error.clone());
+        let (result, error) = tool_output_previews(raw_output, content.as_deref());
+        let now = Utc::now();
+        let invocation_index = self
+            .transcript_session
+            .tool_invocations
+            .iter()
+            .position(|invocation| invocation.tool_call_id == tool_call_id);
+        let approval_state = invocation_index
+            .and_then(|index| {
+                self.transcript_session
+                    .tool_invocations
+                    .get(index)
+                    .map(|invocation| invocation.approval_state)
+            })
+            .unwrap_or(ToolApprovalState::Approved);
+        let execution_state = tool_execution_state(status);
+
+        let invocation = ToolInvocationRecord {
+            id: tool_invocation
+                .as_ref()
+                .map(|invocation| invocation.id)
+                .or_else(|| {
+                    invocation_index.and_then(|index| {
+                        self.transcript_session
+                            .tool_invocations
+                            .get(index)
+                            .map(|invocation| invocation.id)
+                    })
+                })
+                .unwrap_or_else(Uuid::new_v4),
+            run_id: tool_invocation
+                .as_ref()
+                .map(|invocation| invocation.run_id)
+                .unwrap_or(self.transcript_run_id),
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            tool_source: tool_invocation
+                .as_ref()
+                .map(|invocation| invocation.tool_source.clone())
+                .unwrap_or(fluent_code_app::session::model::ToolSource::BuiltIn),
+            arguments: raw_input.unwrap_or_else(|| {
+                tool_invocation
+                    .as_ref()
+                    .map(|invocation| invocation.arguments.clone())
+                    .unwrap_or_else(|| json!({}))
+            }),
+            preceding_turn_id: tool_invocation
+                .as_ref()
+                .and_then(|invocation| invocation.preceding_turn_id)
+                .or_else(|| self.latest_transcript_turn_id()),
+            approval_state,
+            execution_state,
+            result: result.or(meta_result),
+            error: error.or(meta_error),
+            delegation: tool_invocation
+                .as_ref()
+                .and_then(|invocation| invocation.delegation.clone())
+                .or_else(|| {
+                    invocation_index.and_then(|index| {
+                        self.transcript_session
+                            .tool_invocations
+                            .get(index)
+                            .and_then(|invocation| invocation.delegation.clone())
+                    })
+                }),
+            sequence_number: tool_invocation
+                .as_ref()
+                .map(|invocation| invocation.sequence_number)
+                .or_else(|| {
+                    invocation_index.and_then(|index| {
+                        self.transcript_session
+                            .tool_invocations
+                            .get(index)
+                            .map(|invocation| invocation.sequence_number)
+                    })
+                })
+                .unwrap_or_else(|| self.transcript_session.allocate_replay_sequence()),
+            requested_at: tool_invocation
+                .as_ref()
+                .map(|invocation| invocation.requested_at)
+                .or_else(|| {
+                    invocation_index.and_then(|index| {
+                        self.transcript_session
+                            .tool_invocations
+                            .get(index)
+                            .map(|invocation| invocation.requested_at)
+                    })
+                })
+                .unwrap_or(now),
+            approved_at: tool_invocation
+                .as_ref()
+                .and_then(|invocation| invocation.approved_at),
+            completed_at: matches!(
+                execution_state,
+                ToolExecutionState::Completed | ToolExecutionState::Failed
+            )
+            .then_some(now)
+            .or_else(|| {
+                tool_invocation
+                    .as_ref()
+                    .and_then(|invocation| invocation.completed_at)
+            }),
+        };
+
+        match invocation_index {
+            Some(index) => self.transcript_session.tool_invocations[index] = invocation.clone(),
+            None => self
+                .transcript_session
+                .tool_invocations
+                .push(invocation.clone()),
+        }
+
+        self.transcript_session
+            .upsert_transcript_item(TranscriptItemRecord::from_tool_invocation(&invocation));
+    }
+
+    fn apply_transcript_metadata_item(&mut self, item: TranscriptItemRecord) {
+        let mut parent_invocation_transcript_item = None;
+        if let TranscriptItemContent::DelegatedChild(content) = &item.content
+            && let Some(tool_invocation_id) = item.parent_tool_invocation_id
+            && let Some(invocation) = self
+                .transcript_session
+                .tool_invocations
+                .iter_mut()
+                .find(|invocation| invocation.id == tool_invocation_id)
+        {
+            invocation.delegation = Some(TaskDelegationRecord {
+                child_run_id: content.child_run_id,
+                agent_name: content.agent_name.clone(),
+                prompt: content.prompt.clone(),
+                status: content.status,
+            });
+            parent_invocation_transcript_item =
+                Some(TranscriptItemRecord::from_tool_invocation(invocation));
+        }
+
+        if let Some(parent_invocation_transcript_item) = parent_invocation_transcript_item {
+            self.transcript_session
+                .upsert_transcript_item(parent_invocation_transcript_item);
+        }
+
+        self.transcript_session.next_replay_sequence = self
+            .transcript_session
+            .next_replay_sequence
+            .max(item.sequence_number.saturating_add(1));
+        self.transcript_session.upsert_transcript_item(item);
+    }
+
+    fn update_assistant_transcript_item(
+        &mut self,
+        turn_id: Uuid,
+        source: TranscriptSource,
+        content_chunk: &str,
+    ) {
+        let item_id = match source {
+            TranscriptSource::Agent => {
+                fluent_code_app::session::model::transcript_assistant_text_item_id(turn_id)
+            }
+            TranscriptSource::Thought => {
+                fluent_code_app::session::model::transcript_assistant_reasoning_item_id(turn_id)
+            }
+            TranscriptSource::User => return,
+        };
+        let Some(existing) = self.transcript_session.find_transcript_item_mut(item_id) else {
+            return;
+        };
+
+        if let TranscriptItemContent::Turn(turn) = &mut existing.content {
+            match source {
+                TranscriptSource::Agent => turn.content.push_str(content_chunk),
+                TranscriptSource::Thought => turn.reasoning.push_str(content_chunk),
+                TranscriptSource::User => {}
+            }
+        }
+    }
+
+    fn latest_transcript_turn_id(&self) -> Option<Uuid> {
+        self.transcript_session
+            .transcript_items
+            .iter()
+            .rev()
+            .find_map(|item| item.turn_id)
+    }
+
+    fn find_tool_invocation_index(&self, tool_call_id: &str) -> Option<usize> {
+        self.transcript_session
+            .tool_invocations
+            .iter()
+            .position(|invocation| invocation.tool_call_id == tool_call_id)
+    }
+
+    fn commit_open_transcript_items(&mut self) {
+        for item in &mut self.transcript_session.transcript_items {
+            if item.stream_state == TranscriptStreamState::Open {
+                item.stream_state = TranscriptStreamState::Committed;
+            }
+        }
+    }
+
+    fn set_prompt_status(&mut self, prompt_status: Option<PromptStatusProjection>) {
+        self.prompt_in_flight = prompt_status.is_some_and(prompt_status_is_active);
+        self.prompt_status = prompt_status;
+    }
+
+    fn app_status(&self) -> AppStatus {
+        if let Some(error) = self.prompt_error.as_ref().or(self.startup_error.as_ref()) {
+            return AppStatus::Error(error.clone());
+        }
+
+        match self.prompt_status {
+            Some(PromptStatusProjection::AwaitingToolApproval) => AppStatus::AwaitingToolApproval,
+            Some(PromptStatusProjection::RunningTool) => AppStatus::RunningTool,
+            Some(PromptStatusProjection::Running) => AppStatus::Generating,
+            _ => AppStatus::Idle,
+        }
+    }
+
+    fn history_cells(&self) -> crate::conversation::DerivedHistoryCells {
+        derive_history_cells_for_session(
+            &self.transcript_session,
+            &self.app_status(),
+            self.active_run_id,
+        )
+    }
+
+    pub fn transcript_rows(&self) -> Vec<TranscriptRowProjection> {
+        let mut transcript_rows = Vec::new();
+
+        for row in self.history_cells().iter_rows() {
+            match row {
+                ConversationRow::Turn(turn)
+                    if turn.role == Role::User && !turn.content.is_empty() =>
+                {
+                    transcript_rows.push(TranscriptRowProjection {
+                        source: TranscriptSource::User,
+                        content: turn.content.clone(),
+                    });
+                }
+                ConversationRow::Reasoning(reasoning) if !reasoning.content.is_empty() => {
+                    transcript_rows.push(TranscriptRowProjection {
+                        source: TranscriptSource::Thought,
+                        content: reasoning.content.clone(),
+                    });
+                }
+                ConversationRow::Turn(turn)
+                    if turn.role == Role::Assistant && !turn.content.is_empty() =>
+                {
+                    transcript_rows.push(TranscriptRowProjection {
+                        source: TranscriptSource::Agent,
+                        content: turn.content.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        transcript_rows
+    }
+
+    pub fn tool_statuses(&self) -> Vec<ToolStatusProjection> {
+        let mut tool_statuses = Vec::new();
+
+        for row in self.history_cells().iter_rows() {
+            match row {
+                ConversationRow::Tool(tool) => {
+                    tool_statuses.push(ToolStatusProjection {
+                        tool_call_id: tool.tool_call_id.clone(),
+                        title: tool.display_name.clone(),
+                        status: tool_execution_label(tool.execution_state, tool.approval_state),
+                    });
+                }
+                ConversationRow::ToolGroup(group) => {
+                    tool_statuses.extend(group.items.iter().map(|tool| ToolStatusProjection {
+                        tool_call_id: tool.tool_call_id.clone(),
+                        title: tool.display_name.clone(),
+                        status: tool_execution_label(tool.execution_state, tool.approval_state),
+                    }));
+                }
+                _ => {}
+            }
+        }
+
+        tool_statuses
+    }
+
+    fn scroll_transcript_up(&mut self, lines: u16) {
+        self.transcript_follow_tail = false;
+        self.transcript_scroll_top = self.transcript_scroll_top.saturating_sub(lines);
+    }
+
+    fn scroll_transcript_down(&mut self, lines: u16) {
+        self.transcript_follow_tail = false;
+        self.transcript_scroll_top = self.transcript_scroll_top.saturating_add(lines);
+    }
+
+    fn jump_transcript_top(&mut self) {
+        self.transcript_follow_tail = false;
+        self.transcript_scroll_top = 0;
+    }
+
+    fn jump_transcript_bottom(&mut self) {
+        self.transcript_follow_tail = true;
     }
 }
 
@@ -592,7 +1210,7 @@ impl ProjectionSharedState {
             )));
         }
 
-        self.projection.pending_permission = None;
+        self.projection.apply_permission_selection(option_id);
         Ok((
             pending_request.response_sender,
             acp::RequestPermissionResponse::new(acp::RequestPermissionOutcome::Selected(
@@ -663,18 +1281,43 @@ impl ProjectionSharedState {
         self.mark_activity();
     }
 
+    fn scroll_transcript_up(&mut self, lines: u16) {
+        self.projection.scroll_transcript_up(lines);
+        self.mark_activity();
+    }
+
+    fn scroll_transcript_down(&mut self, lines: u16) {
+        self.projection.scroll_transcript_down(lines);
+        self.mark_activity();
+    }
+
+    fn jump_transcript_top(&mut self) {
+        self.projection.jump_transcript_top();
+        self.mark_activity();
+    }
+
+    fn jump_transcript_bottom(&mut self) {
+        self.projection.jump_transcript_bottom();
+        self.mark_activity();
+    }
+
     fn mark_prompt_started(&mut self) {
         self.projection.mark_prompt_started();
         self.mark_activity();
     }
 
-    fn mark_prompt_finished(&mut self) {
-        self.projection.mark_prompt_finished();
+    fn mark_prompt_finished(&mut self, stop_reason: acp::StopReason) {
+        self.projection.mark_prompt_finished(stop_reason);
         self.mark_activity();
     }
 
     fn mark_prompt_error(&mut self, message: String) {
         self.projection.mark_prompt_error(message);
+        self.mark_activity();
+    }
+
+    fn apply_loaded_session_projection(&mut self, metadata: LoadedSessionMetadataProjection) {
+        self.projection.apply_loaded_session_projection(metadata);
         self.mark_activity();
     }
 
@@ -1373,6 +2016,13 @@ impl AcpClientRuntimeInner {
             .prepare_session_load(session_id);
     }
 
+    async fn apply_loaded_session_projection(&self, metadata: LoadedSessionMetadataProjection) {
+        self.projection
+            .lock()
+            .await
+            .apply_loaded_session_projection(metadata);
+    }
+
     async fn select_permission_option(&self, option_id: &str) -> Result<()> {
         resolve_pending_permission_selection(self.projection(), option_id).await
     }
@@ -1621,7 +2271,18 @@ impl AcpClientRuntime {
                 cwd.clone(),
             ))
             .await?;
-        self.inner.register_session_cwd(session_id, cwd).await?;
+        self.inner
+            .register_session_cwd(session_id.clone(), cwd)
+            .await?;
+        let mut loaded_metadata = loaded_session_metadata_from_response(&response);
+        if !loaded_metadata.is_complete()
+            && let Ok(Some(session_metadata)) = load_local_session_metadata(&session_id)
+        {
+            loaded_metadata.apply_fallback_session(&session_metadata);
+        }
+        self.inner
+            .apply_loaded_session_projection(loaded_metadata)
+            .await;
         Ok(response)
     }
 
@@ -1999,18 +2660,25 @@ async fn wait_for_projection_action(
     input: &mut ProjectionLoopInput,
     snapshot: &ProjectionSnapshot,
 ) -> Result<ProjectionWaitOutcome> {
-    let activity_wait = controller.wait_for_activity(snapshot.activity_sequence);
-    tokio::pin!(activity_wait);
+    loop {
+        if let Some(event) = input.try_next_event()? {
+            return Ok(ProjectionWaitOutcome::Action(projection_action_from_event(
+                &snapshot.projection,
+                event,
+            )));
+        }
 
-    let input_wait = input.next_event();
-    tokio::pin!(input_wait);
+        let activity_wait = controller.wait_for_activity(snapshot.activity_sequence);
+        tokio::pin!(activity_wait);
 
-    tokio::select! {
-        biased;
-        () = &mut activity_wait => Ok(ProjectionWaitOutcome::Activity),
-        event = &mut input_wait => Ok(ProjectionWaitOutcome::Action(
-            projection_action_from_event(&snapshot.projection, event?)
-        )),
+        let poll_delay = tokio::time::sleep(PROJECTION_QUEUED_INPUT_POLL_TIMEOUT);
+        tokio::pin!(poll_delay);
+
+        tokio::select! {
+            biased;
+            () = &mut activity_wait => return Ok(ProjectionWaitOutcome::Activity),
+            () = &mut poll_delay => {}
+        }
     }
 }
 
@@ -2042,6 +2710,34 @@ async fn apply_projection_action(
         ProjectionAction::Quit => Ok(true),
         ProjectionAction::NewSession => {
             controller.create_new_session().await?;
+            Ok(false)
+        }
+        ProjectionAction::ScrollUp => {
+            controller.scroll_transcript_up(1).await;
+            Ok(false)
+        }
+        ProjectionAction::ScrollDown => {
+            controller.scroll_transcript_down(1).await;
+            Ok(false)
+        }
+        ProjectionAction::PageUp => {
+            controller
+                .scroll_transcript_up(PROJECTION_PAGE_SCROLL_LINES)
+                .await;
+            Ok(false)
+        }
+        ProjectionAction::PageDown => {
+            controller
+                .scroll_transcript_down(PROJECTION_PAGE_SCROLL_LINES)
+                .await;
+            Ok(false)
+        }
+        ProjectionAction::JumpTop => {
+            controller.jump_transcript_top().await;
+            Ok(false)
+        }
+        ProjectionAction::JumpBottom => {
+            controller.jump_transcript_bottom().await;
             Ok(false)
         }
         ProjectionAction::UpdateDraft(draft_input) => {
@@ -2085,13 +2781,16 @@ fn render_projection(frame: &mut Frame, projection: &TuiProjectionState) {
     ]));
     frame.render_widget(status, layout[0]);
 
-    let body = Paragraph::new(Text::from(projection_lines(projection)))
+    let body_lines = projection_lines(projection);
+    let body_scroll = projection_body_scroll(projection, &body_lines, layout[1]);
+    let body = Paragraph::new(Text::from(body_lines))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(TUI_THEME.panel_border)
                 .title(Span::styled(" acp client ", TUI_THEME.title)),
         )
+        .scroll((body_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(body, layout[1]);
 
@@ -2141,14 +2840,28 @@ fn projection_lines(projection: &TuiProjectionState) -> Vec<Line<'static>> {
         lines.push(Line::from(format!("Title: {title}")));
     }
 
-    lines.push(Line::from(format!(
-        "Transcript rows: {}  |  Tool updates: {}",
-        projection.transcript_rows.len(),
-        projection.tool_statuses.len()
-    )));
+    lines.push(Line::from(vec![
+        Span::styled("Replay fidelity: ", TUI_THEME.text_muted),
+        Span::styled(
+            match projection.replay_fidelity {
+                ReplayFidelityProjection::Exact => "exact",
+                ReplayFidelityProjection::Approximate => "approximate",
+            },
+            match projection.replay_fidelity {
+                ReplayFidelityProjection::Exact => TUI_THEME.success,
+                ReplayFidelityProjection::Approximate => TUI_THEME.warning,
+            },
+        ),
+    ]));
 
-    if projection.prompt_in_flight {
-        lines.push(Line::from("Prompt status: running"));
+    if let Some(prompt_status) = projection.prompt_status {
+        lines.push(Line::from(vec![
+            Span::styled("Prompt status: ", TUI_THEME.text_muted),
+            Span::styled(
+                prompt_status_label(prompt_status),
+                prompt_status_style(prompt_status),
+            ),
+        ]));
     }
 
     if let Some(permission) = &projection.pending_permission {
@@ -2178,20 +2891,33 @@ fn projection_lines(projection: &TuiProjectionState) -> Vec<Line<'static>> {
         lines.push(Line::from(format!("  {error}")));
     }
 
-    if !projection.transcript_rows.is_empty() {
+    let transcript_lines = projection_transcript_lines(projection);
+    if !transcript_lines.is_empty() {
         lines.push(Line::default());
-        lines.push(Line::styled("Recent transcript", TUI_THEME.text_muted));
-        for row in projection.transcript_rows.iter().rev().take(5).rev() {
-            let label = match row.source {
-                TranscriptSource::User => "you",
-                TranscriptSource::Agent => "assistant",
-                TranscriptSource::Thought => "reasoning",
-            };
-            lines.push(Line::from(format!("  {label}: {}", row.content)));
-        }
+        lines.extend(transcript_lines);
     }
 
     lines
+}
+
+fn projection_history_cells(
+    projection: &TuiProjectionState,
+) -> crate::conversation::DerivedHistoryCells {
+    projection.history_cells()
+}
+
+fn projection_transcript_lines(projection: &TuiProjectionState) -> Vec<Line<'static>> {
+    conversation_lines_from_cells(&projection_history_cells(projection), false)
+}
+
+fn projection_body_scroll(projection: &TuiProjectionState, lines: &[Line<'_>], area: Rect) -> u16 {
+    resolve_transcript_scroll(
+        lines,
+        area.width,
+        area.height,
+        projection.transcript_follow_tail,
+        projection.transcript_scroll_top,
+    )
 }
 
 fn line_from_status(status: &SubprocessStatus) -> Line<'static> {
@@ -2376,6 +3102,12 @@ enum ProjectionAction {
     None,
     Quit,
     NewSession,
+    ScrollUp,
+    ScrollDown,
+    PageUp,
+    PageDown,
+    JumpTop,
+    JumpBottom,
     UpdateDraft(String),
     SubmitPrompt,
     Select(String),
@@ -2393,27 +3125,50 @@ fn projection_action_from_event(snapshot: &TuiProjectionState, event: Event) -> 
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             if snapshot.pending_permission.is_some() {
                 permission_action_for_key(snapshot, key.code, key.modifiers)
-            } else if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-            {
-                if snapshot.prompt_in_flight {
-                    ProjectionAction::CancelActivePrompt
-                } else {
-                    ProjectionAction::Quit
+            } else if key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::Up => ProjectionAction::ScrollUp,
+                    KeyCode::Down => ProjectionAction::ScrollDown,
+                    KeyCode::PageUp => ProjectionAction::PageUp,
+                    KeyCode::PageDown => ProjectionAction::PageDown,
+                    KeyCode::Home => ProjectionAction::JumpTop,
+                    KeyCode::End => ProjectionAction::JumpBottom,
+                    _ => projection_key_action(snapshot, key.code, key.modifiers),
                 }
-            } else if key.code == KeyCode::Char('n')
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-                && !snapshot.prompt_in_flight
-            {
-                ProjectionAction::NewSession
-            } else if snapshot.can_edit_draft() {
-                draft_action_for_key(snapshot, key.code, key.modifiers)
             } else {
-                ProjectionAction::None
+                projection_key_action(snapshot, key.code, key.modifiers)
             }
         }
         _ => ProjectionAction::None,
     }
+}
+
+fn projection_key_action(
+    snapshot: &TuiProjectionState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> ProjectionAction {
+    if matches!(code, KeyCode::Char('q') | KeyCode::Esc)
+        || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL))
+    {
+        if snapshot.prompt_in_flight {
+            return ProjectionAction::CancelActivePrompt;
+        }
+        return ProjectionAction::Quit;
+    }
+
+    if code == KeyCode::Char('n')
+        && modifiers.contains(KeyModifiers::CONTROL)
+        && !snapshot.prompt_in_flight
+    {
+        return ProjectionAction::NewSession;
+    }
+
+    if snapshot.can_edit_draft() {
+        return draft_action_for_key(snapshot, code, modifiers);
+    }
+
+    ProjectionAction::None
 }
 
 fn permission_action_for_key(
@@ -2547,6 +3302,22 @@ impl ProjectionController {
         self.projection.lock().await.set_draft_input(draft_input);
     }
 
+    async fn scroll_transcript_up(&self, lines: u16) {
+        self.projection.lock().await.scroll_transcript_up(lines);
+    }
+
+    async fn scroll_transcript_down(&self, lines: u16) {
+        self.projection.lock().await.scroll_transcript_down(lines);
+    }
+
+    async fn jump_transcript_top(&self) {
+        self.projection.lock().await.jump_transcript_top();
+    }
+
+    async fn jump_transcript_bottom(&self) {
+        self.projection.lock().await.jump_transcript_bottom();
+    }
+
     async fn create_new_session(&mut self) -> Result<()> {
         let Some(runtime) = self.runtime.as_ref() else {
             return Ok(());
@@ -2644,8 +3415,11 @@ impl ProjectionController {
             .take()
             .expect("active prompt should exist");
         match active_prompt.task.await {
-            Ok(Ok(_response)) => {
-                self.projection.lock().await.mark_prompt_finished();
+            Ok(Ok(response)) => {
+                self.projection
+                    .lock()
+                    .await
+                    .mark_prompt_finished(response.stop_reason);
             }
             Ok(Err(error)) => {
                 self.projection.lock().await.mark_prompt_error(format!(
@@ -2689,19 +3463,27 @@ impl ProjectionLoopInput {
         }
     }
 
-    async fn next_event(&mut self) -> Result<Event> {
-        let next_event = match &mut self.source {
-            ProjectionLoopInputSource::Stream(stream) => stream.next().await,
+    fn try_next_event(&mut self) -> Result<Option<Event>> {
+        match &mut self.source {
+            ProjectionLoopInputSource::Stream(stream) => match stream.next().now_or_never() {
+                Some(Some(Ok(event))) => Ok(Some(event)),
+                Some(Some(Err(error))) => Err(error.into()),
+                Some(None) => Err(FluentCodeError::Provider(
+                    "ACP projection input pump stopped unexpectedly".to_string(),
+                )),
+                None => Ok(None),
+            },
             #[cfg(test)]
-            ProjectionLoopInputSource::Receiver(receiver) => receiver.recv().await,
-        };
-
-        match next_event {
-            Some(Ok(event)) => Ok(event),
-            Some(Err(error)) => Err(error.into()),
-            None => Err(FluentCodeError::Provider(
-                "ACP projection input pump stopped unexpectedly".to_string(),
-            )),
+            ProjectionLoopInputSource::Receiver(receiver) => match receiver.try_recv() {
+                Ok(Ok(event)) => Ok(Some(event)),
+                Ok(Err(error)) => Err(error.into()),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    Err(FluentCodeError::Provider(
+                        "ACP projection input pump stopped unexpectedly".to_string(),
+                    ))
+                }
+            },
         }
     }
 }
@@ -2853,14 +3635,187 @@ fn protocol_version_label(version: acp::ProtocolVersion) -> String {
     }
 }
 
-fn tool_call_status_label(status: acp::ToolCallStatus) -> String {
-    match status {
-        acp::ToolCallStatus::Pending => "pending".to_string(),
-        acp::ToolCallStatus::InProgress => "in_progress".to_string(),
-        acp::ToolCallStatus::Completed => "completed".to_string(),
-        acp::ToolCallStatus::Failed => "failed".to_string(),
-        _ => format!("{status:?}"),
+fn meta_value<T>(meta: Option<&acp::Meta>, key: &str) -> Option<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(meta?.get(key)?.clone()).ok()
+}
+
+fn meta_optional_string(meta: Option<&acp::Meta>, key: &str) -> Option<Option<String>> {
+    let value = meta?.get(key)?;
+    if value.is_null() {
+        return Some(None);
     }
+
+    serde_json::from_value::<String>(value.clone())
+        .ok()
+        .map(Some)
+}
+
+fn tool_invocation_from_meta(meta: Option<&acp::Meta>) -> Option<ToolInvocationRecord> {
+    meta_value(meta, ACP_META_TOOL_INVOCATION_KEY)
+}
+
+fn transcript_item_from_meta(meta: Option<&acp::Meta>) -> Option<TranscriptItemRecord> {
+    meta_value(meta, ACP_META_TRANSCRIPT_ITEM_KEY)
+}
+
+fn loaded_session_metadata_from_response(
+    response: &acp::LoadSessionResponse,
+) -> LoadedSessionMetadataProjection {
+    let replay_fidelity =
+        meta_optional_string(response.meta.as_ref(), ACP_META_REPLAY_FIDELITY_KEY)
+            .and_then(|value| value)
+            .and_then(|value| match value.as_str() {
+                "exact" => Some(ReplayFidelityProjection::Exact),
+                "approximate" => Some(ReplayFidelityProjection::Approximate),
+                _ => None,
+            });
+    let prompt_status =
+        match meta_optional_string(response.meta.as_ref(), ACP_META_LATEST_PROMPT_STATE_KEY) {
+            Some(Some(value)) => match value.as_str() {
+                "running" => Some(Some(PromptStatusProjection::Running)),
+                "awaiting_tool_approval" => {
+                    Some(Some(PromptStatusProjection::AwaitingToolApproval))
+                }
+                "running_tool" => Some(Some(PromptStatusProjection::RunningTool)),
+                "completed" => Some(Some(PromptStatusProjection::Completed)),
+                "cancelled" => Some(Some(PromptStatusProjection::Cancelled)),
+                "failed" => Some(Some(PromptStatusProjection::Failed)),
+                "interrupted" => Some(Some(PromptStatusProjection::Interrupted)),
+                _ => None,
+            },
+            Some(None) => Some(None),
+            None => None,
+        };
+
+    LoadedSessionMetadataProjection {
+        replay_fidelity,
+        prompt_status,
+    }
+}
+
+fn load_local_session_metadata(session_id: &acp::SessionId) -> Result<Option<Session>> {
+    let session_path = Config::load()?
+        .data_dir
+        .join("sessions")
+        .join(session_id.to_string())
+        .join("session.json");
+    if !session_path.exists() {
+        return Ok(None);
+    }
+
+    let session_contents = fs::read_to_string(&session_path)?;
+    let mut session = serde_json::from_str::<Session>(&session_contents).map_err(|error| {
+        FluentCodeError::Session(format!(
+            "failed to parse ACP session metadata `{}`: {error}",
+            session_path.display()
+        ))
+    })?;
+    session.normalize_persistence();
+    Ok(Some(session))
+}
+
+fn prompt_status_is_active(status: PromptStatusProjection) -> bool {
+    matches!(
+        status,
+        PromptStatusProjection::Running
+            | PromptStatusProjection::AwaitingToolApproval
+            | PromptStatusProjection::RunningTool
+    )
+}
+
+fn prompt_status_label(status: PromptStatusProjection) -> &'static str {
+    match status {
+        PromptStatusProjection::Running => "running",
+        PromptStatusProjection::AwaitingToolApproval => "awaiting approval",
+        PromptStatusProjection::RunningTool => "running tool",
+        PromptStatusProjection::Completed => "completed",
+        PromptStatusProjection::Cancelled => "cancelled",
+        PromptStatusProjection::Failed => "failed",
+        PromptStatusProjection::Interrupted => "interrupted",
+    }
+}
+
+fn prompt_status_style(status: PromptStatusProjection) -> ratatui::style::Style {
+    match status {
+        PromptStatusProjection::Running | PromptStatusProjection::RunningTool => TUI_THEME.info,
+        PromptStatusProjection::AwaitingToolApproval => TUI_THEME.warning,
+        PromptStatusProjection::Completed => TUI_THEME.success,
+        PromptStatusProjection::Cancelled
+        | PromptStatusProjection::Failed
+        | PromptStatusProjection::Interrupted => TUI_THEME.error,
+    }
+}
+
+fn normalized_tool_name(title: &str, kind: Option<acp::ToolKind>) -> String {
+    let base_title = title.split(" (").next().unwrap_or(title).trim();
+    if !base_title.is_empty() {
+        return base_title.replace(' ', "_");
+    }
+
+    match kind {
+        Some(acp::ToolKind::Read) => "read".to_string(),
+        Some(acp::ToolKind::Edit) => "edit".to_string(),
+        Some(acp::ToolKind::Delete) => "delete".to_string(),
+        Some(acp::ToolKind::Move) => "move".to_string(),
+        Some(acp::ToolKind::Search) => "grep".to_string(),
+        Some(acp::ToolKind::Execute) => "bash".to_string(),
+        Some(acp::ToolKind::Think) => "task".to_string(),
+        Some(acp::ToolKind::Fetch) => "fetch".to_string(),
+        Some(acp::ToolKind::SwitchMode) => "switch_mode".to_string(),
+        _ => "tool".to_string(),
+    }
+}
+
+fn tool_execution_state(status: Option<acp::ToolCallStatus>) -> ToolExecutionState {
+    match status {
+        Some(acp::ToolCallStatus::InProgress) => ToolExecutionState::Running,
+        Some(acp::ToolCallStatus::Completed) => ToolExecutionState::Completed,
+        Some(acp::ToolCallStatus::Failed) => ToolExecutionState::Failed,
+        _ => ToolExecutionState::NotStarted,
+    }
+}
+
+fn tool_execution_label(
+    execution_state: ToolExecutionState,
+    approval_state: ToolApprovalState,
+) -> String {
+    if approval_state == ToolApprovalState::Pending {
+        return "pending".to_string();
+    }
+
+    match execution_state {
+        ToolExecutionState::NotStarted => "queued".to_string(),
+        ToolExecutionState::Running => "in_progress".to_string(),
+        ToolExecutionState::Completed => "completed".to_string(),
+        ToolExecutionState::Failed => "failed".to_string(),
+        ToolExecutionState::Skipped => "skipped".to_string(),
+    }
+}
+
+fn tool_output_previews(
+    raw_output: Option<Value>,
+    _content: Option<&[acp::ToolCallContent]>,
+) -> (Option<String>, Option<String>) {
+    if let Some(raw_output) = raw_output {
+        if let Some(result) = raw_output.get("result") {
+            return (Some(tool_output_value_to_string(result)), None);
+        }
+        if let Some(error) = raw_output.get("error") {
+            return (None, Some(tool_output_value_to_string(error)));
+        }
+    }
+
+    (None, None)
+}
+
+fn tool_output_value_to_string(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn content_block_label(content: acp::ContentBlock) -> String {
@@ -2913,8 +3868,8 @@ pub(crate) async fn assert_projection_loop_redraws_stream_updates_without_waitin
         Duration::from_millis(100),
         run_projection_iteration(&mut controller, &mut input, |snapshot| {
             let agent_rows = snapshot
-                .transcript_rows
-                .iter()
+                .transcript_rows()
+                .into_iter()
                 .filter(|row| row.source == TranscriptSource::Agent)
                 .collect::<Vec<_>>();
             assert_eq!(agent_rows.len(), 1);
@@ -3003,7 +3958,7 @@ pub(crate) async fn assert_projection_loop_batches_notifications_without_starvin
         Duration::from_millis(100),
         run_projection_iteration(&mut controller, &mut input, |snapshot| {
             assert_eq!(draw_count.fetch_add(1, Ordering::SeqCst), 0);
-            assert!(snapshot.transcript_rows.is_empty());
+            assert!(snapshot.transcript_rows().is_empty());
 
             let projection_for_burst = Arc::clone(&projection_for_burst);
             let input_sender_for_burst = input_sender_for_burst.clone();
@@ -3035,7 +3990,7 @@ pub(crate) async fn assert_projection_loop_batches_notifications_without_starvin
         run_projection_iteration(&mut controller, &mut input, |snapshot| {
             assert_eq!(draw_count.fetch_add(1, Ordering::SeqCst), 1);
             assert_eq!(
-                snapshot.transcript_rows,
+                snapshot.transcript_rows(),
                 vec![TranscriptRowProjection {
                     source: TranscriptSource::Agent,
                     content: "burst activity done".to_string(),
@@ -3218,7 +4173,7 @@ async fn assert_projection_state_flushes_terminal_stream_updates_immediately_for
                 "expected {outcome:?} prompt completion to flush the terminal projection before waiting for more input"
             );
             assert_eq!(
-                snapshot.transcript_rows,
+                snapshot.transcript_rows(),
                 vec![TranscriptRowProjection {
                     source: TranscriptSource::Agent,
                     content: "final streamed chunk".to_string(),
@@ -3304,7 +4259,7 @@ pub(crate) async fn assert_projection_loop_flushes_terminal_update_before_queued
             assert_eq!(draw_count.fetch_add(1, Ordering::SeqCst), 0);
             assert!(snapshot.prompt_in_flight);
             assert_eq!(
-                snapshot.transcript_rows,
+                snapshot.transcript_rows(),
                 vec![TranscriptRowProjection {
                     source: TranscriptSource::Agent,
                     content: "streamed ".to_string(),
@@ -3346,7 +4301,7 @@ pub(crate) async fn assert_projection_loop_flushes_terminal_update_before_queued
             );
             assert!(snapshot.prompt_error.is_none());
             assert_eq!(
-                snapshot.transcript_rows,
+                snapshot.transcript_rows(),
                 vec![TranscriptRowProjection {
                     source: TranscriptSource::Agent,
                     content: "streamed final response".to_string(),
@@ -3370,6 +4325,558 @@ pub(crate) async fn assert_projection_loop_flushes_terminal_update_before_queued
     Ok(())
 }
 
+const TEST_FRAME_WIDTH: u16 = 110;
+const TEST_FRAME_HEIGHT: u16 = 28;
+
+fn normalize_projection_buffer(buffer: &Buffer) -> String {
+    let mut lines = Vec::with_capacity(buffer.area.height as usize);
+
+    for y in 0..buffer.area.height {
+        let mut line = String::new();
+        for x in 0..buffer.area.width {
+            line.push_str(buffer[(x, y)].symbol());
+        }
+        lines.push(line.trim_end_matches(' ').to_string());
+    }
+
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+
+    lines.join("\n")
+}
+
+fn expected_projection_panel_lines(
+    title: &str,
+    width: u16,
+    height: u16,
+    inner_lines: &[&str],
+) -> Vec<String> {
+    assert!(
+        height >= 2,
+        "panel height must include top and bottom borders"
+    );
+
+    let inner_width = width.saturating_sub(2) as usize;
+    let inner_height = height.saturating_sub(2) as usize;
+    assert!(
+        inner_lines.len() <= inner_height,
+        "expected at most {inner_height} lines inside `{title}`, got {}",
+        inner_lines.len()
+    );
+
+    let mut lines = Vec::with_capacity(height as usize);
+    let title_width = title.chars().count();
+    let top_fill = width as usize - 2 - title_width;
+    lines.push(format!("┌{title}{}┐", "─".repeat(top_fill)));
+
+    for line in inner_lines {
+        let visible_width = line.chars().count();
+        assert!(
+            visible_width <= inner_width,
+            "line `{line}` exceeds panel width {inner_width}"
+        );
+        lines.push(format!(
+            "│{line}{: <padding$}│",
+            "",
+            padding = inner_width - visible_width
+        ));
+    }
+
+    for _ in inner_lines.len()..inner_height {
+        lines.push(format!("│{}│", " ".repeat(inner_width)));
+    }
+
+    lines.push(format!("└{}┘", "─".repeat(inner_width)));
+    lines
+}
+
+#[doc(hidden)]
+pub fn expected_projection_frame_text_for_tests(
+    status_line: &str,
+    body_lines: &[&str],
+    draft_input: &str,
+    footer_line: &str,
+) -> String {
+    let body_height = TEST_FRAME_HEIGHT - 1 - 3 - 1;
+    let mut lines = Vec::new();
+    lines.push(status_line.to_string());
+    lines.extend(expected_projection_panel_lines(
+        " acp client ",
+        TEST_FRAME_WIDTH,
+        body_height,
+        body_lines,
+    ));
+    lines.extend(expected_projection_panel_lines(
+        " > ",
+        TEST_FRAME_WIDTH,
+        3,
+        &[draft_input],
+    ));
+    lines.push(footer_line.to_string());
+    lines.join("\n")
+}
+
+#[doc(hidden)]
+pub fn render_projection_frame_text_for_tests(projection: &TuiProjectionState) -> String {
+    let backend = TestBackend::new(TEST_FRAME_WIDTH, TEST_FRAME_HEIGHT);
+    let mut terminal = Terminal::new(backend).expect("create ACP render regression terminal");
+    terminal
+        .draw(|frame| render_projection(frame, projection))
+        .expect("draw ACP projection regression frame");
+    normalize_projection_buffer(terminal.backend().buffer())
+}
+
+#[cfg(test)]
+fn projection_with_session(
+    session_id: &str,
+    session: Session,
+    prompt_status: Option<PromptStatusProjection>,
+    active_run_id: Option<Uuid>,
+    pending_permission: Option<PendingPermissionProjection>,
+) -> TuiProjectionState {
+    let mut projection = TuiProjectionState::default();
+    projection.session.session_id = Some(session_id.to_string());
+    projection.replay_fidelity = match session.transcript_fidelity {
+        TranscriptFidelity::Approximate => ReplayFidelityProjection::Approximate,
+        TranscriptFidelity::Exact => ReplayFidelityProjection::Exact,
+    };
+    projection.transcript_session = session;
+    projection.pending_permission = pending_permission;
+    projection.active_run_id = active_run_id;
+    projection.set_prompt_status(prompt_status);
+    projection
+}
+
+#[cfg(test)]
+fn make_turn(run_id: Uuid, role: Role, content: &str, sequence_number: u64) -> Turn {
+    Turn {
+        id: Uuid::new_v4(),
+        run_id,
+        role,
+        content: content.to_string(),
+        reasoning: String::new(),
+        sequence_number,
+        timestamp: Utc::now(),
+    }
+}
+
+#[cfg(test)]
+fn make_tool_invocation(
+    run_id: Uuid,
+    preceding_turn_id: Option<Uuid>,
+    tool_name: &str,
+    arguments: Value,
+    sequence_number: u64,
+) -> ToolInvocationRecord {
+    ToolInvocationRecord {
+        id: Uuid::new_v4(),
+        run_id,
+        tool_call_id: format!("call-{sequence_number}"),
+        tool_name: tool_name.to_string(),
+        tool_source: ToolSource::BuiltIn,
+        arguments,
+        preceding_turn_id,
+        approval_state: ToolApprovalState::Approved,
+        execution_state: ToolExecutionState::Completed,
+        result: None,
+        error: None,
+        delegation: None,
+        sequence_number,
+        requested_at: Utc::now(),
+        approved_at: Some(Utc::now()),
+        completed_at: Some(Utc::now()),
+    }
+}
+
+#[cfg(test)]
+fn completed_projection_for_regression() -> TuiProjectionState {
+    let run_id = Uuid::new_v4();
+    let mut session = Session::new("completed transcript");
+    let user_turn = make_turn(run_id, Role::User, "first prompt", 1);
+    let assistant_turn = make_turn(run_id, Role::Assistant, "first answer", 2);
+
+    session
+        .turns
+        .extend([user_turn.clone(), assistant_turn.clone()]);
+    session.transcript_items = vec![
+        TranscriptItemRecord::from_turn(&user_turn),
+        TranscriptItemRecord::from_turn(&assistant_turn),
+    ];
+    session.upsert_run(
+        run_id,
+        fluent_code_app::session::model::RunStatus::Completed,
+    );
+
+    projection_with_session(
+        "session-completed",
+        session,
+        Some(PromptStatusProjection::Completed),
+        None,
+        None,
+    )
+}
+
+#[cfg(test)]
+fn streaming_projection_for_regression() -> TuiProjectionState {
+    let run_id = Uuid::new_v4();
+    let mut session = Session::new("streaming transcript");
+    let user_turn = make_turn(run_id, Role::User, "follow-up", 1);
+    let assistant_turn_id = Uuid::new_v4();
+
+    session.turns.push(user_turn.clone());
+    session.transcript_items = vec![
+        TranscriptItemRecord::from_turn(&user_turn),
+        TranscriptItemRecord::assistant_text(
+            run_id,
+            assistant_turn_id,
+            2,
+            "streamed answer in progress",
+            TranscriptStreamState::Open,
+        ),
+    ];
+
+    projection_with_session(
+        "session-streaming",
+        session,
+        Some(PromptStatusProjection::Running),
+        Some(run_id),
+        None,
+    )
+}
+
+#[cfg(test)]
+fn permission_projection_for_regression() -> TuiProjectionState {
+    let run_id = Uuid::new_v4();
+    let mut session = Session::new("permission transcript");
+    let user_turn = make_turn(run_id, Role::User, "inspect src/main.rs", 1);
+    let mut invocation = make_tool_invocation(
+        run_id,
+        Some(user_turn.id),
+        "read",
+        json!({"path": "src/main.rs"}),
+        2,
+    );
+    invocation.approval_state = ToolApprovalState::Pending;
+    invocation.execution_state = ToolExecutionState::NotStarted;
+    invocation.approved_at = None;
+    invocation.completed_at = None;
+
+    session.turns.push(user_turn.clone());
+    session.tool_invocations.push(invocation.clone());
+    session.transcript_items = vec![
+        TranscriptItemRecord::from_turn(&user_turn),
+        TranscriptItemRecord::from_tool_invocation(&invocation),
+        TranscriptItemRecord::permission(
+            &invocation,
+            3,
+            fluent_code_app::session::model::TranscriptPermissionState::Pending,
+            None,
+        ),
+    ];
+
+    projection_with_session(
+        "session-permission",
+        session,
+        Some(PromptStatusProjection::AwaitingToolApproval),
+        Some(run_id),
+        Some(PendingPermissionProjection {
+            tool_call_id: invocation.tool_call_id.clone(),
+            title: "read src/main.rs".to_string(),
+            options: vec![PermissionOptionProjection {
+                option_id: "allow_once".to_string(),
+                name: "Allow once".to_string(),
+            }],
+        }),
+    )
+}
+
+#[cfg(test)]
+fn delegation_projection_for_regression() -> TuiProjectionState {
+    let parent_run_id = Uuid::new_v4();
+    let child_run_id = Uuid::new_v4();
+    let mut session = Session::new("delegation transcript");
+    let parent_turn = make_turn(parent_run_id, Role::Assistant, "Delegating child work.", 1);
+    let child_turn = make_turn(
+        child_run_id,
+        Role::Assistant,
+        "Child output remains visible after replay.",
+        4,
+    );
+    let mut invocation = make_tool_invocation(
+        parent_run_id,
+        Some(parent_turn.id),
+        "task",
+        json!({"agent": "explore", "prompt": "Inspect delegated child output"}),
+        2,
+    );
+    invocation.delegation = Some(fluent_code_app::session::model::TaskDelegationRecord {
+        child_run_id: Some(child_run_id),
+        agent_name: Some("explore".to_string()),
+        prompt: Some("Inspect delegated child output".to_string()),
+        status: fluent_code_app::session::model::TaskDelegationStatus::Completed,
+    });
+
+    session
+        .turns
+        .extend([parent_turn.clone(), child_turn.clone()]);
+    session.tool_invocations.push(invocation.clone());
+    session.upsert_run(
+        parent_run_id,
+        fluent_code_app::session::model::RunStatus::Completed,
+    );
+    session.upsert_run_with_parent(
+        child_run_id,
+        fluent_code_app::session::model::RunStatus::Completed,
+        Some(parent_run_id),
+        Some(invocation.id),
+    );
+    session.transcript_items = vec![
+        TranscriptItemRecord::from_turn(&parent_turn),
+        TranscriptItemRecord::from_tool_invocation(&invocation),
+        TranscriptItemRecord::delegated_child(&invocation, 3),
+        TranscriptItemRecord::from_turn(&child_turn),
+    ];
+
+    projection_with_session("session-delegation", session, None, None, None)
+}
+
+#[cfg(test)]
+fn legacy_approximate_projection_for_regression() -> TuiProjectionState {
+    let run_id = Uuid::new_v4();
+    let mut session = Session::new("legacy transcript");
+    session.transcript_fidelity = TranscriptFidelity::Approximate;
+    session.turns.extend([
+        make_turn(run_id, Role::User, "legacy prompt", 1),
+        make_turn(run_id, Role::Assistant, "legacy answer", 2),
+    ]);
+
+    projection_with_session("session-legacy", session, None, None, None)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn assert_session_render_regression_completed_and_streaming() {
+    let completed_frame =
+        render_projection_frame_text_for_tests(&completed_projection_for_regression());
+    let expected_completed = expected_projection_frame_text_for_tests(
+        " fluent-code │ bootstrapping",
+        &[
+            "ACP subprocess: not started",
+            "Session: session-completed",
+            "Replay fidelity: exact",
+            "Prompt status: completed",
+            "",
+            "you",
+            "first prompt",
+            "",
+            "",
+            "assistant",
+            "first answer",
+        ],
+        "",
+        "Type a prompt and press Enter. Ctrl-N starts a new ACP session. q/Esc/Ctrl-C exits.",
+    );
+    assert_eq!(completed_frame, expected_completed);
+
+    let streaming_frame =
+        render_projection_frame_text_for_tests(&streaming_projection_for_regression());
+    let expected_streaming = expected_projection_frame_text_for_tests(
+        " fluent-code │ bootstrapping",
+        &[
+            "ACP subprocess: not started",
+            "Session: session-streaming",
+            "Replay fidelity: exact",
+            "Prompt status: running",
+            "",
+            "you",
+            "follow-up",
+            "",
+            "",
+            "assistant",
+            "streamed answer in progress",
+            "",
+            "",
+            "  ● running",
+        ],
+        "",
+        "Prompt running through ACP. Esc/Ctrl-C cancels the active turn.",
+    );
+    assert_eq!(streaming_frame, expected_streaming);
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn assert_session_render_regression_permission_delegation_and_legacy() {
+    let permission_frame =
+        render_projection_frame_text_for_tests(&permission_projection_for_regression());
+    let expected_permission = expected_projection_frame_text_for_tests(
+        " fluent-code │ bootstrapping",
+        &[
+            "ACP subprocess: not started",
+            "Session: session-permission",
+            "Replay fidelity: exact",
+            "Prompt status: awaiting approval",
+            "",
+            "Pending permission",
+            "  read src/main.rs (call-2)",
+            "  - Allow once [allow_once]",
+            "",
+            "you",
+            "inspect src/main.rs",
+            "",
+            "",
+            "  ⏵ read · pending / queued",
+            "    read src/main.rs",
+            "    action Enter/Y allow once • A always allow • N deny batch",
+            "",
+            "  ● awaiting approval",
+        ],
+        "",
+        "Permission: Enter/y allow once, a allow always, n reject once, r reject always, q/Esc/Ctrl-C cancel.",
+    );
+    assert_eq!(permission_frame, expected_permission);
+
+    let delegation_frame =
+        render_projection_frame_text_for_tests(&delegation_projection_for_regression());
+    let expected_delegation = expected_projection_frame_text_for_tests(
+        " fluent-code │ bootstrapping",
+        &[
+            "ACP subprocess: not started",
+            "Session: session-delegation",
+            "Replay fidelity: exact",
+            "",
+            "assistant",
+            "Delegating child work.",
+            "",
+            "",
+            "  ⏵ task explore · approved / completed",
+            "    task explore · Inspect delegated child output",
+            "",
+            "assistant",
+            "Child output remains visible after replay.",
+        ],
+        "",
+        "Type a prompt and press Enter. Ctrl-N starts a new ACP session. q/Esc/Ctrl-C exits.",
+    );
+    assert_eq!(delegation_frame, expected_delegation);
+
+    let legacy_frame =
+        render_projection_frame_text_for_tests(&legacy_approximate_projection_for_regression());
+    let expected_legacy = expected_projection_frame_text_for_tests(
+        " fluent-code │ bootstrapping",
+        &[
+            "ACP subprocess: not started",
+            "Session: session-legacy",
+            "Replay fidelity: approximate",
+            "",
+            "you",
+            "legacy prompt",
+            "",
+            "",
+            "assistant",
+            "legacy answer",
+        ],
+        "",
+        "Type a prompt and press Enter. Ctrl-N starts a new ACP session. q/Esc/Ctrl-C exits.",
+    );
+    assert_eq!(legacy_frame, expected_legacy);
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn assert_acp_default_render_shows_full_transcript_with_active_cell() {
+    let mut projection = TuiProjectionState::default();
+
+    projection.mark_session_created(acp::SessionId::new("session-1"));
+    projection.mark_prompt_started();
+    projection.apply_session_notification(tests::user_message_chunk("first prompt"));
+    projection.apply_session_notification(tests::agent_message_chunk("first answer"));
+    projection.mark_prompt_finished(acp::StopReason::EndTurn);
+
+    projection.mark_prompt_started();
+    projection.apply_session_notification(tests::user_message_chunk("second prompt"));
+    projection.apply_session_notification(tests::agent_message_chunk("second answer"));
+    projection.mark_prompt_finished(acp::StopReason::EndTurn);
+
+    projection.mark_prompt_started();
+    projection.apply_session_notification(tests::user_message_chunk("follow-up"));
+    projection.apply_session_notification(tests::agent_thought_chunk("thinking through the reply"));
+    projection.apply_session_notification(tests::agent_message_chunk(
+        "# Partial third answer\n- streamed bullet",
+    ));
+
+    let rendered = projection_lines(&projection)
+        .into_iter()
+        .map(tests::line_to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(projection.prompt_in_flight);
+    assert!(rendered.contains("Session: session-1"));
+    assert!(rendered.contains("Replay fidelity: exact"));
+    assert!(rendered.contains("Prompt status: running"));
+    assert!(rendered.contains("first prompt"));
+    assert!(rendered.contains("first answer"));
+    assert!(rendered.contains("second prompt"));
+    assert!(rendered.contains("second answer"));
+    assert!(rendered.contains("follow-up"));
+    assert!(rendered.contains("thinking through the reply"));
+    assert!(rendered.contains("Partial third answer"));
+    assert!(rendered.contains("streamed bullet"));
+    assert!(rendered.contains("running"));
+    assert!(!rendered.contains("Transcript rows:"));
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn assert_acp_default_render_preserves_markdown_scroll_and_fidelity_state() {
+    let mut projection = TuiProjectionState::default();
+    projection.mark_session_created(acp::SessionId::new("session-1"));
+
+    let mut persisted_session = Session::new("session-1");
+    persisted_session.transcript_fidelity = TranscriptFidelity::Approximate;
+    projection.apply_loaded_session_metadata(&persisted_session);
+
+    projection.mark_prompt_started();
+    projection.apply_session_notification(tests::user_message_chunk("history"));
+    projection.apply_session_notification(tests::agent_message_chunk(
+        "# Heading\nUse **bold** and [docs](https://example.com).",
+    ));
+    projection.mark_prompt_finished(acp::StopReason::EndTurn);
+
+    projection.mark_prompt_started();
+    projection.apply_session_notification(tests::agent_message_chunk(
+        "Committed line\nUse [docs](https://exam",
+    ));
+    projection.transcript_follow_tail = false;
+    projection.transcript_scroll_top = 1;
+
+    let lines = projection_lines(&projection);
+    let rendered = lines
+        .iter()
+        .cloned()
+        .map(tests::line_to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let manual_scroll = projection_body_scroll(&projection, &lines, Rect::new(0, 0, 40, 6));
+
+    assert_eq!(
+        projection.replay_fidelity,
+        ReplayFidelityProjection::Approximate
+    );
+    assert_eq!(manual_scroll, 1);
+    assert!(rendered.contains("Replay fidelity: approximate"));
+    assert!(rendered.contains("# Heading"));
+    assert!(rendered.contains("docs (https://example.com)"));
+    assert!(rendered.contains("Committed line Use [docs](https://exam"));
+}
+
+#[cfg(test)]
+pub(crate) fn assert_render_contract_distinguishes_committed_history_from_active_cell() {
+    assert_acp_default_render_shows_full_transcript_with_active_cell();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3383,7 +4890,7 @@ mod tests {
         projection.apply_session_notification(agent_message_chunk("hello"));
 
         assert_eq!(
-            projection.transcript_rows,
+            projection.transcript_rows(),
             vec![TranscriptRowProjection {
                 source: TranscriptSource::Agent,
                 content: "Mock assistant response: hello".to_string(),
@@ -3400,7 +4907,7 @@ mod tests {
         projection.apply_session_notification(agent_thought_chunk(" steps"));
 
         assert_eq!(
-            projection.transcript_rows,
+            projection.transcript_rows(),
             vec![TranscriptRowProjection {
                 source: TranscriptSource::Thought,
                 content: "thinking through steps".to_string(),
@@ -3414,14 +4921,14 @@ mod tests {
 
         projection.apply_session_notification(agent_message_chunk(""));
         projection.apply_session_notification(agent_thought_chunk(""));
-        assert!(projection.transcript_rows.is_empty());
+        assert!(projection.transcript_rows().is_empty());
 
         projection.apply_session_notification(agent_message_chunk("hello"));
         projection.apply_session_notification(agent_message_chunk(""));
         projection.apply_session_notification(agent_thought_chunk(""));
 
         assert_eq!(
-            projection.transcript_rows,
+            projection.transcript_rows(),
             vec![TranscriptRowProjection {
                 source: TranscriptSource::Agent,
                 content: "hello".to_string(),
@@ -3439,7 +4946,7 @@ mod tests {
         projection.apply_session_notification(agent_message_chunk(" done"));
 
         assert_eq!(
-            projection.transcript_rows,
+            projection.transcript_rows(),
             vec![
                 TranscriptRowProjection {
                     source: TranscriptSource::Thought,
@@ -3470,15 +4977,15 @@ mod tests {
         projection.apply_session_notification(agent_message_chunk(" second answer"));
 
         assert_eq!(
-            projection.transcript_rows,
+            projection.transcript_rows(),
             vec![
-                TranscriptRowProjection {
-                    source: TranscriptSource::Agent,
-                    content: "first answer".to_string(),
-                },
                 TranscriptRowProjection {
                     source: TranscriptSource::User,
                     content: "follow-up".to_string(),
+                },
+                TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: "first answer".to_string(),
                 },
                 TranscriptRowProjection {
                     source: TranscriptSource::Agent,
@@ -3497,7 +5004,7 @@ mod tests {
         projection.apply_session_notification(agent_message_chunk(" after tool"));
 
         assert_eq!(
-            projection.transcript_rows,
+            projection.transcript_rows(),
             vec![
                 TranscriptRowProjection {
                     source: TranscriptSource::Agent,
@@ -3520,7 +5027,7 @@ mod tests {
         projection.apply_session_notification(agent_message_chunk(" after tool"));
 
         assert_eq!(
-            projection.transcript_rows,
+            projection.transcript_rows(),
             vec![
                 TranscriptRowProjection {
                     source: TranscriptSource::Agent,
@@ -3550,7 +5057,7 @@ mod tests {
 
         assert_eq!(projection.session.session_id.as_deref(), Some("session-2"));
         assert_eq!(
-            projection.transcript_rows,
+            projection.transcript_rows(),
             vec![TranscriptRowProjection {
                 source: TranscriptSource::Agent,
                 content: "fresh output".to_string(),
@@ -3576,7 +5083,7 @@ mod tests {
         ));
 
         assert_eq!(projection.session.session_id.as_deref(), Some("session-2"));
-        assert!(projection.transcript_rows.is_empty());
+        assert!(projection.transcript_rows().is_empty());
 
         projection.apply_session_notification(agent_message_chunk_for_session(
             "session-2",
@@ -3584,7 +5091,7 @@ mod tests {
         ));
 
         assert_eq!(
-            projection.transcript_rows,
+            projection.transcript_rows(),
             vec![TranscriptRowProjection {
                 source: TranscriptSource::Agent,
                 content: "fresh output".to_string(),
@@ -3615,18 +5122,112 @@ mod tests {
     }
 
     #[test]
+    fn load_session_metadata_from_response_overrides_local_fallback_values() {
+        let mut projection = TuiProjectionState::default();
+        let mut fallback_session = Session::new("session-1");
+        fallback_session.transcript_fidelity = TranscriptFidelity::Approximate;
+        fallback_session.foreground_owner =
+            Some(fluent_code_app::session::model::ForegroundOwnerRecord {
+                run_id: Uuid::new_v4(),
+                phase: ForegroundPhase::RunningTool,
+                batch_anchor_turn_id: None,
+            });
+
+        let mut metadata = loaded_session_metadata_from_response(&load_session_response_with_meta(
+            Some("exact"),
+            Some(Some("interrupted")),
+        ));
+        metadata.apply_fallback_session(&fallback_session);
+        projection.apply_loaded_session_projection(metadata);
+
+        assert_eq!(projection.replay_fidelity, ReplayFidelityProjection::Exact);
+        assert_eq!(
+            projection.prompt_status,
+            Some(PromptStatusProjection::Interrupted)
+        );
+        assert!(!projection.prompt_in_flight);
+    }
+
+    #[test]
+    fn apply_session_notification_preserves_delegation_and_terminal_marker_metadata() {
+        let mut projection = TuiProjectionState::default();
+        projection.mark_session_created(acp::SessionId::new("session-1"));
+
+        let root_run_id = Uuid::new_v4();
+        let child_run_id = Uuid::new_v4();
+        let mut invocation = make_tool_invocation(
+            root_run_id,
+            None,
+            "task",
+            json!({"agent":"explore","prompt":"Inspect delegated child state"}),
+            1,
+        );
+        invocation.tool_call_id = "task-call-1".to_string();
+        invocation.delegation = Some(fluent_code_app::session::model::TaskDelegationRecord {
+            child_run_id: Some(child_run_id),
+            agent_name: Some("explore".to_string()),
+            prompt: Some("Inspect delegated child state".to_string()),
+            status: fluent_code_app::session::model::TaskDelegationStatus::Running,
+        });
+
+        projection.apply_session_notification(tool_call_with_metadata("session-1", &invocation));
+        projection.apply_session_notification(session_info_with_transcript_item(
+            "session-1",
+            TranscriptItemRecord::delegated_child(&invocation, 2),
+        ));
+        projection.apply_session_notification(session_info_with_transcript_item(
+            "session-1",
+            TranscriptItemRecord::run_terminal(&fluent_code_app::session::model::RunRecord {
+                id: root_run_id,
+                status: fluent_code_app::session::model::RunStatus::Interrupted,
+                parent_run_id: None,
+                parent_tool_invocation_id: None,
+                created_sequence: 1,
+                terminal_sequence: Some(3),
+                terminal_stop_reason: Some(
+                    fluent_code_app::session::model::RunTerminalStopReason::Interrupted,
+                ),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }),
+        ));
+
+        assert_eq!(
+            projection.tool_statuses(),
+            vec![ToolStatusProjection {
+                tool_call_id: "task-call-1".to_string(),
+                title: "task explore".to_string(),
+                status: "pending".to_string(),
+            }]
+        );
+        assert_eq!(
+            projection.transcript_session.tool_invocations[0]
+                .delegation
+                .as_ref()
+                .and_then(|delegation| delegation.child_run_id),
+            Some(child_run_id)
+        );
+        assert!(projection.history_cells().iter_rows().any(|row| {
+            matches!(
+                row,
+                ConversationRow::RunMarker(marker) if marker.label == "interrupted"
+            )
+        }));
+    }
+
+    #[test]
     fn apply_session_notification_does_not_merge_across_prompt_turn_boundaries() {
         let mut projection = TuiProjectionState::default();
 
         projection.mark_prompt_started();
         projection.apply_session_notification(agent_message_chunk("first turn"));
-        projection.mark_prompt_finished();
+        projection.mark_prompt_finished(acp::StopReason::EndTurn);
 
         projection.mark_prompt_started();
         projection.apply_session_notification(agent_message_chunk("second turn"));
 
         assert_eq!(
-            projection.transcript_rows,
+            projection.transcript_rows(),
             vec![
                 TranscriptRowProjection {
                     source: TranscriptSource::Agent,
@@ -3696,7 +5297,7 @@ mod tests {
         ));
 
         assert_eq!(
-            projection.transcript_rows,
+            projection.transcript_rows(),
             vec![TranscriptRowProjection {
                 source: TranscriptSource::Agent,
                 content: "<image>".to_string(),
@@ -3704,7 +5305,12 @@ mod tests {
         );
     }
 
-    fn agent_message_chunk(text: &str) -> acp::SessionNotification {
+    #[test]
+    fn render_contract_distinguishes_committed_history_from_active_cell() {
+        super::assert_render_contract_distinguishes_committed_history_from_active_cell();
+    }
+
+    pub(super) fn agent_message_chunk(text: &str) -> acp::SessionNotification {
         agent_message_chunk_for_session("session-1", text)
     }
 
@@ -3720,7 +5326,7 @@ mod tests {
         )
     }
 
-    fn agent_thought_chunk(text: &str) -> acp::SessionNotification {
+    pub(super) fn agent_thought_chunk(text: &str) -> acp::SessionNotification {
         session_notification(
             "session-1",
             acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
@@ -3729,7 +5335,7 @@ mod tests {
         )
     }
 
-    fn user_message_chunk(text: &str) -> acp::SessionNotification {
+    pub(super) fn user_message_chunk(text: &str) -> acp::SessionNotification {
         session_notification(
             "session-1",
             acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
@@ -3773,10 +5379,73 @@ mod tests {
         )
     }
 
+    fn tool_call_with_metadata(
+        session_id: impl Into<acp::SessionId>,
+        invocation: &ToolInvocationRecord,
+    ) -> acp::SessionNotification {
+        let mut meta = acp::Meta::new();
+        meta.insert(
+            ACP_META_TOOL_INVOCATION_KEY.to_string(),
+            serde_json::to_value(invocation).expect("tool invocation metadata should serialize"),
+        );
+        session_notification(
+            session_id,
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new(
+                    invocation.tool_call_id.clone(),
+                    invocation.tool_name.clone(),
+                )
+                .meta(meta),
+            ),
+        )
+    }
+
+    fn session_info_with_transcript_item(
+        session_id: impl Into<acp::SessionId>,
+        item: TranscriptItemRecord,
+    ) -> acp::SessionNotification {
+        let mut meta = acp::Meta::new();
+        meta.insert(
+            ACP_META_TRANSCRIPT_ITEM_KEY.to_string(),
+            serde_json::to_value(item).expect("transcript item metadata should serialize"),
+        );
+        session_notification(
+            session_id,
+            acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().meta(meta)),
+        )
+    }
+
+    fn load_session_response_with_meta(
+        replay_fidelity: Option<&str>,
+        prompt_state: Option<Option<&str>>,
+    ) -> acp::LoadSessionResponse {
+        let mut meta = acp::Meta::new();
+        if let Some(replay_fidelity) = replay_fidelity {
+            meta.insert(
+                ACP_META_REPLAY_FIDELITY_KEY.to_string(),
+                Value::String(replay_fidelity.to_string()),
+            );
+        }
+        if let Some(prompt_state) = prompt_state {
+            meta.insert(
+                ACP_META_LATEST_PROMPT_STATE_KEY.to_string(),
+                prompt_state.map_or(Value::Null, |value| Value::String(value.to_string())),
+            );
+        }
+        acp::LoadSessionResponse::new().meta(meta)
+    }
+
     fn session_notification(
         session_id: impl Into<acp::SessionId>,
         update: acp::SessionUpdate,
     ) -> acp::SessionNotification {
         acp::SessionNotification::new(session_id, update)
+    }
+
+    pub(super) fn line_to_string(line: Line<'static>) -> String {
+        line.spans
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>()
     }
 }

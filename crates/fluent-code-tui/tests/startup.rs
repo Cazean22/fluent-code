@@ -27,11 +27,23 @@ use tokio::time::timeout;
 #[path = "../src/acp.rs"]
 mod acp_projection_regression;
 #[allow(dead_code)]
+#[path = "../src/conversation.rs"]
+mod conversation;
+#[allow(dead_code)]
+#[path = "../src/markdown_render.rs"]
+mod markdown_render;
+#[allow(dead_code)]
 #[path = "../src/terminal.rs"]
 mod terminal;
 #[allow(dead_code)]
 #[path = "../src/theme.rs"]
 mod theme;
+#[allow(dead_code)]
+#[path = "../src/ui_state.rs"]
+mod ui_state;
+#[allow(dead_code)]
+#[path = "../src/view.rs"]
+mod view;
 
 struct StartupRecoveryFixture {
     session: Session,
@@ -144,13 +156,13 @@ async fn startup_recovery_resumes_parent_and_persists_terminalized_child() {
                 assert_eq!(snapshot.session.session_id.as_deref(), Some(fixture.session.id.to_string().as_str()));
                 assert!(
                     snapshot
-                        .tool_statuses
+                        .tool_statuses()
                         .iter()
                         .any(|status| status.tool_call_id == "task-call-1"),
                     "expected ACP replay to project the terminalized delegated tool, got: {snapshot:?}"
                 );
                 assert!(
-                    !snapshot.transcript_rows.is_empty(),
+                    !snapshot.transcript_rows().is_empty(),
                     "expected ACP replay to restore transcript rows for the recovered session, got: {snapshot:?}"
                 );
 
@@ -215,7 +227,7 @@ async fn startup_recovery_fails_closed_for_malformed_lineage() {
                 assert!(snapshot.pending_permission.is_none());
                 assert!(
                     snapshot
-                        .tool_statuses
+                        .tool_statuses()
                         .iter()
                         .any(|status| status.tool_call_id == "task-call-1"),
                     "expected malformed lineage replay to surface the delegated task tool, got: {snapshot:?}"
@@ -380,13 +392,13 @@ async fn permission_allow_once_resumes_prompt_via_acp() {
             assert!(snapshot.pending_permission.is_none());
             assert!(
                 snapshot
-                    .tool_statuses
+                    .tool_statuses()
                     .iter()
                     .any(|status| status.status == "completed"),
                 "expected ACP tool status updates to include a completed tool"
             );
             assert!(
-                !snapshot.transcript_rows.is_empty(),
+                !snapshot.transcript_rows().is_empty(),
                 "expected ACP transcript projection to receive prompt-turn updates"
             );
 
@@ -492,13 +504,13 @@ async fn tui_prompt_flow_uses_acp_subprocess_end_to_end() {
                 let first_partial = &streaming_snapshots[0];
                 let second_partial = &streaming_snapshots[1];
                 let first_partial_agent_rows = first_partial
-                    .transcript_rows
-                    .iter()
+                    .transcript_rows()
+                    .into_iter()
                     .filter(|row| row.source == TranscriptSource::Agent)
                     .collect::<Vec<_>>();
                 let second_partial_agent_rows = second_partial
-                    .transcript_rows
-                    .iter()
+                    .transcript_rows()
+                    .into_iter()
                     .filter(|row| row.source == TranscriptSource::Agent)
                     .collect::<Vec<_>>();
                 assert_eq!(
@@ -534,8 +546,8 @@ async fn tui_prompt_flow_uses_acp_subprocess_end_to_end() {
 
                 let completed_snapshot = runtime.projection_snapshot().await;
                 let completed_agent_rows = completed_snapshot
-                    .transcript_rows
-                    .iter()
+                    .transcript_rows()
+                    .into_iter()
                     .filter(|row| row.source == TranscriptSource::Agent)
                     .collect::<Vec<_>>();
                 assert!(
@@ -557,8 +569,8 @@ async fn tui_prompt_flow_uses_acp_subprocess_end_to_end() {
             let snapshot = wait_for_agent_transcript_content(&runtime, full_response).await;
             assert!(snapshot.pending_permission.is_none());
             let agent_rows = snapshot
-                .transcript_rows
-                .iter()
+                .transcript_rows()
+                .into_iter()
                 .filter(|row| row.source == TranscriptSource::Agent)
                 .collect::<Vec<_>>();
             assert_eq!(
@@ -641,6 +653,112 @@ async fn projection_loop_flushes_terminal_update_before_queued_quit_under_burst_
         .expect("projection burst flush regression helper to pass");
 }
 
+#[test]
+fn render_contract_distinguishes_committed_history_from_active_cell() {
+    acp_projection_regression::assert_render_contract_distinguishes_committed_history_from_active_cell();
+}
+
+#[test]
+fn session_render_regression_completed_streaming_and_recovery() {
+    acp_projection_regression::assert_session_render_regression_completed_and_streaming();
+
+    let runtime = tokio::runtime::Runtime::new().expect("session render regression runtime");
+    runtime.block_on(async {
+        let _guard = startup_subprocess_test_lock().lock().await;
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).expect("create session render regression root");
+        write_acp_subprocess_test_config(&root);
+
+        let store = FsSessionStore::new(root.join(".fluent-code"));
+        let fixture = interrupted_delegation_fixture();
+        store
+            .create(&fixture.session)
+            .expect("persist ACP replay frame regression fixture");
+
+        let acp_binary = build_acp_binary();
+        {
+            let _cwd_guard = CurrentDirGuard::set(&root);
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let runtime =
+                        bootstrap_client_for_tests(AcpLaunchOptions::new(&acp_binary, &root))
+                            .await
+                            .expect("bootstrap ACP client subprocess for frame replay regression");
+                    initialize_default_session_for_tests(&runtime, &root)
+                        .await
+                        .expect("initialize default ACP session for frame replay regression");
+
+                    let snapshot =
+                        wait_for_projected_session(&runtime, &fixture.session.id.to_string()).await;
+                    assert!(snapshot.prompt_in_flight);
+                    assert!(
+                        snapshot
+                            .tool_statuses()
+                            .iter()
+                            .any(|status| status.status == "completed"),
+                        "expected recovered ACP replay to retain the synthesized completed task tool status, got: {snapshot:?}"
+                    );
+
+                    let mut rendered_snapshot = snapshot.clone();
+                    rendered_snapshot.session.title = None;
+                    rendered_snapshot.subprocess.status = SubprocessStatus::Initialized {
+                        binary_path: PathBuf::from("fluent-code-acp"),
+                        pid: 7,
+                        protocol_version: "1".to_string(),
+                    };
+
+                    let rendered =
+                        fluent_code_tui::render_projection_frame_text_for_tests(&rendered_snapshot);
+                    let recovery_body = vec![
+                        String::new(),
+                        "you".to_string(),
+                        "delegate work".to_string(),
+                        String::new(),
+                        String::new(),
+                        "you".to_string(),
+                        "Inspect startup recovery".to_string(),
+                        String::new(),
+                        String::new(),
+                        "  ⏵ tool_task-call-1 · approved / completed".to_string(),
+                        "    tool_task-call-1".to_string(),
+                        String::new(),
+                        "assistant".to_string(),
+                        "I will delegate that task.".to_string(),
+                        String::new(),
+                        String::new(),
+                        "assistant".to_string(),
+                        "Partial child output that should not be summarized".to_string(),
+                        String::new(),
+                        String::new(),
+                        "  ● running".to_string(),
+                    ];
+                    let recovery_body_refs =
+                        recovery_body.iter().map(String::as_str).collect::<Vec<_>>();
+                    let expected = fluent_code_tui::expected_projection_frame_text_for_tests(
+                        " fluent-code │ acp connected",
+                        &recovery_body_refs,
+                        "",
+                        "Prompt running through ACP. Esc/Ctrl-C cancels the active turn.",
+                    );
+                    assert_eq!(rendered, expected);
+
+                    runtime
+                        .shutdown()
+                        .await
+                        .expect("shutdown ACP subprocess after frame replay regression");
+                })
+                .await;
+        }
+
+        cleanup(root);
+    });
+}
+
+#[test]
+fn session_render_regression_permission_delegation_and_legacy_fidelity() {
+    acp_projection_regression::assert_session_render_regression_permission_delegation_and_legacy();
+}
+
 #[tokio::test]
 async fn tui_permission_and_tool_lifecycle_use_acp_end_to_end() {
     let _guard = startup_subprocess_test_lock().lock().await;
@@ -685,11 +803,11 @@ async fn tui_permission_and_tool_lifecycle_use_acp_end_to_end() {
             let snapshot = runtime.projection_snapshot().await;
             assert!(snapshot.pending_permission.is_none());
             assert!(
-                snapshot.tool_statuses.iter().any(|status| status.status == "completed"),
+                snapshot.tool_statuses().iter().any(|status| status.status == "completed"),
                 "expected ACP tool lifecycle projection to include a completed tool, got: {snapshot:?}"
             );
             let combined_agent_text = snapshot
-                .transcript_rows
+                .transcript_rows()
                 .iter()
                 .filter(|row| row.source == TranscriptSource::Agent)
                 .map(|row| row.content.as_str())
@@ -1039,10 +1157,10 @@ async fn wait_for_agent_transcript_content(
         &format!("an ACP agent transcript chunk containing `{needle}`"),
         |snapshot| {
             snapshot
-                .transcript_rows
-                .iter()
+                .transcript_rows()
+                .into_iter()
                 .filter(|row| row.source == TranscriptSource::Agent)
-                .map(|row| row.content.as_str())
+                .map(|row| row.content)
                 .collect::<String>()
                 .contains(needle)
         },
@@ -1062,8 +1180,8 @@ async fn wait_for_monotonic_in_flight_agent_transcript_growth(
     loop {
         let agent_rows = snapshot
             .projection
-            .transcript_rows
-            .iter()
+            .transcript_rows()
+            .into_iter()
             .filter(|row| row.source == TranscriptSource::Agent)
             .collect::<Vec<_>>();
 
@@ -1108,7 +1226,7 @@ async fn wait_for_tool_status(
         &format!("ACP tool status `{expected_status}`"),
         |snapshot| {
             snapshot
-                .tool_statuses
+                .tool_statuses()
                 .iter()
                 .any(|status| status.status == expected_status)
         },

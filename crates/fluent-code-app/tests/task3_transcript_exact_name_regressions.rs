@@ -3,47 +3,47 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
-fn replay_projects_canonical_transcript_items_in_exact_order() {
-    run_exact_acp_libtest(
-        "mapping::tests::replay_projects_canonical_transcript_items_in_exact_order",
+fn reducer_emits_canonical_transcript_items_in_exact_stream_order() {
+    run_exact_app_libtest(
+        "app::update::tests::reducer_emits_canonical_transcript_items_in_exact_stream_order",
     );
 }
 
 #[test]
-fn replay_preserves_permission_and_tool_boundaries_from_canonical_items() {
-    run_exact_acp_libtest(
-        "server::tests::replay_preserves_permission_and_tool_boundaries_from_canonical_items",
+fn startup_foreground_restores_open_transcript_item_or_marks_it_interrupted() {
+    run_exact_app_libtest(
+        "app::recovery::tests::startup_foreground_restores_open_transcript_item_or_marks_it_interrupted",
     );
 }
 
-fn run_exact_acp_libtest(module_qualified_test_name: &str) {
+fn run_exact_app_libtest(module_qualified_test_name: &str) {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let isolated_target_dir = unique_temp_dir("fluent-code-acp-task4-exact-wrapper");
+    let isolated_target_dir = unique_temp_dir("fluent-code-app-task3-exact-wrapper");
     let output = Command::new(cargo)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("CARGO_TARGET_DIR", &isolated_target_dir)
         .args([
             "test",
             "-p",
-            "fluent-code-acp",
+            "fluent-code-app",
             "--lib",
             module_qualified_test_name,
             "--",
             "--exact",
         ])
         .output()
-        .expect("spawn nested cargo test for module-qualified ACP libtest");
+        .expect("spawn nested cargo test for module-qualified app libtest");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
         output.status.success(),
-        "nested ACP libtest `{module_qualified_test_name}` failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "nested app libtest `{module_qualified_test_name}` failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         stdout.contains("running 1 test") || stderr.contains("running 1 test"),
-        "expected nested ACP libtest `{module_qualified_test_name}` to run exactly one test\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "expected nested app libtest `{module_qualified_test_name}` to run exactly one test\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     let _ = fs::remove_dir_all(isolated_target_dir);

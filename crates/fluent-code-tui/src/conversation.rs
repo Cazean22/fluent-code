@@ -1,7 +1,9 @@
 use fluent_code_app::app::{AppState, AppStatus};
 use fluent_code_app::session::model::{
-    ReplaySequence, Role, RunStatus, RunTerminalStopReason, Session, ToolApprovalState,
-    ToolExecutionState, ToolInvocationRecord, ToolSource,
+    Role, RunStatus, RunTerminalStopReason, Session, ToolApprovalState, ToolExecutionState,
+    ToolSource, TranscriptDelegatedChildContent, TranscriptItemContent, TranscriptItemRecord,
+    TranscriptPermissionContent, TranscriptPermissionState, TranscriptRunLifecycleEvent,
+    TranscriptStreamState, TranscriptToolInvocationContent, TranscriptTurnContent,
 };
 use uuid::Uuid;
 
@@ -31,17 +33,27 @@ pub(crate) struct ReasoningRow {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolRow {
+    pub(crate) invocation_id: Option<Uuid>,
+    pub(crate) tool_call_id: String,
+    pub(crate) run_id: Uuid,
     pub(crate) tool_name: String,
     pub(crate) display_name: String,
     pub(crate) summary: String,
     pub(crate) provenance_compact: Option<String>,
     pub(crate) provenance_expanded: Option<String>,
+    pub(crate) arguments: serde_json::Value,
     pub(crate) arguments_preview: String,
     pub(crate) delegated_task: Option<DelegatedTaskRow>,
     pub(crate) approval_state: ToolApprovalState,
     pub(crate) execution_state: ToolExecutionState,
     pub(crate) result_preview: Option<String>,
     pub(crate) error_preview: Option<String>,
+}
+
+impl ToolRow {
+    fn matches_invocation(&self, invocation_id: Uuid) -> bool {
+        self.invocation_id == Some(invocation_id)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -80,113 +92,249 @@ pub(crate) struct RunMarkerRow {
     pub(crate) label: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionCell {
+    pub(crate) rows: Vec<ConversationRow>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DerivedHistoryCells {
+    pub(crate) history: Vec<SessionCell>,
+    pub(crate) active: Option<SessionCell>,
+}
+
+impl DerivedHistoryCells {
+    pub(crate) fn iter_cells(&self) -> impl Iterator<Item = &SessionCell> {
+        self.history.iter().chain(self.active.iter())
+    }
+
+    pub(crate) fn iter_rows(&self) -> impl Iterator<Item = &ConversationRow> {
+        self.iter_cells().flat_map(|cell| cell.rows.iter())
+    }
+
+    pub(crate) fn delegated_task_for_child(&self, child_run_id: Uuid) -> Option<&DelegatedTaskRow> {
+        self.iter_rows().find_map(|row| match row {
+            ConversationRow::Tool(tool) => tool
+                .delegated_task
+                .as_ref()
+                .filter(|delegated_task| delegated_task.child_run_id == Some(child_run_id)),
+            ConversationRow::ToolGroup(group) => group.items.iter().find_map(|tool| {
+                tool.delegated_task
+                    .as_ref()
+                    .filter(|delegated_task| delegated_task.child_run_id == Some(child_run_id))
+            }),
+            _ => None,
+        })
+    }
+}
+
+#[allow(dead_code)]
 pub(crate) fn derive_conversation_rows(state: &AppState) -> Vec<ConversationRow> {
-    let session = &state.session;
+    derive_history_cells(state).iter_rows().cloned().collect()
+}
 
-    let mut timeline = build_timeline(state);
-    timeline.sort_by_key(|e| e.sort_key);
+pub(crate) fn derive_history_cells(state: &AppState) -> DerivedHistoryCells {
+    derive_history_cells_for_session(&state.session, &state.status, state.active_run_id)
+}
 
-    let mut rows = Vec::new();
-    let mut pending_tools: Vec<ToolRow> = Vec::new();
+pub(crate) fn derive_history_cells_for_session(
+    session: &Session,
+    status: &AppStatus,
+    active_run_id: Option<Uuid>,
+) -> DerivedHistoryCells {
+    derive_history_cells_from_parts(session, status, active_run_id)
+}
 
-    for entry in &timeline {
-        match entry.kind {
-            TimelineKind::Reasoning(turn_idx) => {
-                flush_pending_tools(&mut rows, &mut pending_tools);
-                let turn = &session.turns[turn_idx];
-                let is_streaming = matches!(turn.role, Role::Assistant)
-                    && state.active_run_id == Some(turn.run_id)
-                    && matches!(state.status, AppStatus::Generating);
-                rows.push(ConversationRow::Reasoning(ReasoningRow {
-                    content: turn.reasoning.clone(),
-                    is_streaming,
-                }));
+fn derive_history_cells_from_parts(
+    session: &Session,
+    status: &AppStatus,
+    active_run_id: Option<Uuid>,
+) -> DerivedHistoryCells {
+    let synthesized_session = (session.transcript_items.is_empty()
+        && session.requires_approximate_transcript_synthesis())
+    .then(|| {
+        let mut session = session.clone();
+        session.synthesize_approximate_transcript_items();
+        session
+    });
+    let session = synthesized_session.as_ref().unwrap_or(session);
+    let synthesized_from_legacy = synthesized_session.is_some();
+
+    let mut items = session
+        .transcript_items
+        .iter()
+        .enumerate()
+        .collect::<Vec<_>>();
+    items.sort_by_key(|(index, item)| (item.sequence_number, *index));
+
+    let mut history = Vec::new();
+    let mut pending_history_tools = Vec::new();
+    let mut active_rows = Vec::new();
+    let mut pending_active_tools = Vec::new();
+
+    for (_, item) in items {
+        let item_is_open =
+            !synthesized_from_legacy && item.stream_state == TranscriptStreamState::Open;
+        let target = if item_is_open {
+            CellTarget::Active
+        } else {
+            CellTarget::History
+        };
+
+        match &item.content {
+            TranscriptItemContent::Turn(content) => {
+                flush_pending_tool_cells(
+                    &mut history,
+                    &mut active_rows,
+                    &mut pending_history_tools,
+                    &mut pending_active_tools,
+                    target,
+                );
+                let rows = derive_turn_rows(content, item_is_open);
+                push_rows_into_target(&mut history, &mut active_rows, rows, target);
             }
-            TimelineKind::Turn(turn_idx) => {
-                flush_pending_tools(&mut rows, &mut pending_tools);
-                let turn = &session.turns[turn_idx];
-                let is_streaming = matches!(turn.role, Role::Assistant)
-                    && state.active_run_id == Some(turn.run_id)
-                    && matches!(state.status, AppStatus::Generating);
-                rows.push(ConversationRow::Turn(TurnRow {
-                    role: turn.role,
-                    content: turn.content.clone(),
-                    is_streaming,
-                }));
+            TranscriptItemContent::ToolInvocation(content) => {
+                pending_tool_buffer(
+                    &mut pending_history_tools,
+                    &mut pending_active_tools,
+                    target,
+                )
+                .push(derive_tool_row_from_transcript(session, item, content));
             }
-            TimelineKind::Tool(inv_idx) => {
-                let invocation = &session.tool_invocations[inv_idx];
-                pending_tools.push(derive_tool_row(session, invocation));
+            TranscriptItemContent::Permission(content) => {
+                update_pending_tool_permission(
+                    pending_tool_buffer(
+                        &mut pending_history_tools,
+                        &mut pending_active_tools,
+                        target,
+                    ),
+                    item,
+                    content,
+                );
             }
+            TranscriptItemContent::DelegatedChild(content) => {
+                update_pending_tool_delegated_child(
+                    session,
+                    pending_tool_buffer(
+                        &mut pending_history_tools,
+                        &mut pending_active_tools,
+                        target,
+                    ),
+                    item,
+                    content,
+                );
+            }
+            TranscriptItemContent::RunLifecycle(_) | TranscriptItemContent::Marker(_) => {}
         }
     }
 
-    flush_pending_tools(&mut rows, &mut pending_tools);
+    flush_pending_tool_cells(
+        &mut history,
+        &mut active_rows,
+        &mut pending_history_tools,
+        &mut pending_active_tools,
+        CellTarget::History,
+    );
+    flush_pending_tool_cells(
+        &mut history,
+        &mut active_rows,
+        &mut pending_history_tools,
+        &mut pending_active_tools,
+        CellTarget::Active,
+    );
 
-    if let Some(marker) = derive_run_marker(state) {
-        rows.push(ConversationRow::RunMarker(marker));
+    if let Some(marker) = derive_active_run_marker(session, status, active_run_id) {
+        active_rows.push(ConversationRow::RunMarker(marker));
+    } else if let Some(marker) = latest_root_terminal_marker(session) {
+        history.push(SessionCell {
+            rows: vec![ConversationRow::RunMarker(marker)],
+        });
+    }
+
+    DerivedHistoryCells {
+        history,
+        active: (!active_rows.is_empty()).then_some(SessionCell { rows: active_rows }),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CellTarget {
+    History,
+    Active,
+}
+
+fn derive_turn_rows(content: &TranscriptTurnContent, is_streaming: bool) -> Vec<ConversationRow> {
+    let mut rows = Vec::new();
+
+    if matches!(content.role, Role::Assistant) && !content.reasoning.is_empty() {
+        rows.push(ConversationRow::Reasoning(ReasoningRow {
+            content: content.reasoning.clone(),
+            is_streaming,
+        }));
+    }
+
+    if !content.content.is_empty() || !matches!(content.role, Role::Assistant) {
+        rows.push(ConversationRow::Turn(TurnRow {
+            role: content.role,
+            content: content.content.clone(),
+            is_streaming,
+        }));
     }
 
     rows
 }
 
-// ---------------------------------------------------------------------------
-// Timeline construction
-// ---------------------------------------------------------------------------
-
-const PRIORITY_REASONING: u8 = 0;
-const PRIORITY_TURN: u8 = 1;
-const PRIORITY_TOOL: u8 = 2;
-
-enum TimelineKind {
-    Reasoning(usize),
-    Turn(usize),
-    Tool(usize),
-}
-
-struct TimelineEntry {
-    sort_key: (ReplaySequence, u8),
-    kind: TimelineKind,
-}
-
-fn build_timeline(state: &AppState) -> Vec<TimelineEntry> {
-    let session = &state.session;
-    let mut entries = Vec::new();
-    for (i, turn) in session.turns.iter().enumerate() {
-        if matches!(turn.role, Role::Assistant) && !turn.reasoning.is_empty() {
-            entries.push(TimelineEntry {
-                sort_key: (turn.sequence_number, PRIORITY_REASONING),
-                kind: TimelineKind::Reasoning(i),
-            });
-        }
-
-        entries.push(TimelineEntry {
-            sort_key: (turn.sequence_number, PRIORITY_TURN),
-            kind: TimelineKind::Turn(i),
-        });
+fn push_rows_into_target(
+    history: &mut Vec<SessionCell>,
+    active_rows: &mut Vec<ConversationRow>,
+    rows: Vec<ConversationRow>,
+    target: CellTarget,
+) {
+    if rows.is_empty() {
+        return;
     }
 
-    for (i, invocation) in session.tool_invocations.iter().enumerate() {
-        entries.push(TimelineEntry {
-            sort_key: (invocation.sequence_number, PRIORITY_TOOL),
-            kind: TimelineKind::Tool(i),
-        });
+    match target {
+        CellTarget::History => history.push(SessionCell { rows }),
+        CellTarget::Active => active_rows.extend(rows),
     }
-
-    entries
 }
 
-fn flush_pending_tools(rows: &mut Vec<ConversationRow>, pending: &mut Vec<ToolRow>) {
+fn pending_tool_buffer<'a>(
+    pending_history_tools: &'a mut Vec<ToolRow>,
+    pending_active_tools: &'a mut Vec<ToolRow>,
+    target: CellTarget,
+) -> &'a mut Vec<ToolRow> {
+    match target {
+        CellTarget::History => pending_history_tools,
+        CellTarget::Active => pending_active_tools,
+    }
+}
+
+fn flush_pending_tool_cells(
+    history: &mut Vec<SessionCell>,
+    active_rows: &mut Vec<ConversationRow>,
+    pending_history_tools: &mut Vec<ToolRow>,
+    pending_active_tools: &mut Vec<ToolRow>,
+    target: CellTarget,
+) {
+    let pending = pending_tool_buffer(pending_history_tools, pending_active_tools, target);
     if pending.is_empty() {
         return;
     }
-    rows.extend(group_tool_rows(std::mem::take(pending)));
+
+    let rows = group_tool_rows(std::mem::take(pending));
+    push_rows_into_target(history, active_rows, rows, target);
 }
 
-fn derive_run_marker(state: &AppState) -> Option<RunMarkerRow> {
-    if state.active_run_id.is_some() {
-        let active_child_suffix = active_child_run_suffix(state);
-        return match &state.status {
+fn derive_active_run_marker(
+    session: &Session,
+    status: &AppStatus,
+    active_run_id: Option<Uuid>,
+) -> Option<RunMarkerRow> {
+    if active_run_id.is_some() {
+        let active_child_suffix = active_child_run_suffix(session, active_run_id);
+        return match status {
             AppStatus::AwaitingToolApproval => Some(RunMarkerRow {
                 kind: RunMarkerKind::AwaitingApproval,
                 label: format_run_marker_label("awaiting approval", active_child_suffix.as_deref()),
@@ -199,19 +347,30 @@ fn derive_run_marker(state: &AppState) -> Option<RunMarkerRow> {
         };
     }
 
-    latest_root_run_marker(state)
+    None
 }
 
-fn latest_root_run_marker(state: &AppState) -> Option<RunMarkerRow> {
-    let latest_root_run = state
-        .session
-        .runs
+fn latest_root_terminal_marker(session: &Session) -> Option<RunMarkerRow> {
+    let latest_root_terminal = session
+        .transcript_items
         .iter()
-        .filter(|run| run.parent_run_id.is_none())
-        .max_by_key(|run| run.latest_replay_sequence())?;
-    let stop_reason = latest_root_run
-        .terminal_stop_reason
-        .or_else(|| latest_root_run.status.default_terminal_stop_reason())?;
+        .filter_map(|item| match &item.content {
+            TranscriptItemContent::RunLifecycle(content)
+                if session
+                    .find_run(item.run_id)
+                    .map(|run| run.parent_run_id.is_none())
+                    .unwrap_or(item.parent_tool_invocation_id.is_none())
+                    && content.event == TranscriptRunLifecycleEvent::Terminal =>
+            {
+                Some((item.sequence_number, content))
+            }
+            _ => None,
+        })
+        .max_by_key(|(sequence_number, _)| *sequence_number)?;
+    let stop_reason = latest_root_terminal
+        .1
+        .stop_reason
+        .or_else(|| latest_root_terminal.1.status.default_terminal_stop_reason())?;
 
     Some(match stop_reason {
         RunTerminalStopReason::Completed => RunMarkerRow {
@@ -240,18 +399,18 @@ fn format_run_marker_label(base: &str, child_suffix: Option<&str>) -> String {
     }
 }
 
-fn active_child_run_suffix(state: &AppState) -> Option<String> {
-    let active_run_id = state.active_run_id?;
-    let invocation = state.session.tool_invocations.iter().find(|invocation| {
-        invocation.tool_name == "task" && invocation.child_run_id() == Some(active_run_id)
-    })?;
+fn active_child_run_suffix(session: &Session, active_run_id: Option<Uuid>) -> Option<String> {
+    let active_run_id = active_run_id?;
+    let agent_name = session
+        .tool_invocations
+        .iter()
+        .find(|invocation| {
+            invocation.tool_name == "task" && invocation.child_run_id() == Some(active_run_id)
+        })?
+        .delegation_agent_name();
 
     Some(
-        match invocation
-            .delegation_agent_name()
-            .map(str::trim)
-            .filter(|agent| !agent.is_empty())
-        {
+        match agent_name.map(str::trim).filter(|agent| !agent.is_empty()) {
             Some(agent) => format!("subagent {agent}"),
             None => "subagent".to_string(),
         },
@@ -272,7 +431,12 @@ fn group_tool_rows(tool_rows: Vec<ToolRow>) -> Vec<ConversationRow> {
             continue;
         }
 
-        if next_kind.is_some() && next_kind == current_kind {
+        if next_kind.is_some()
+            && next_kind == current_kind
+            && buffer
+                .last()
+                .is_some_and(|buffered_tool| buffered_tool.run_id == tool_row.run_id)
+        {
             buffer.push(tool_row);
             continue;
         }
@@ -326,16 +490,39 @@ fn classify_group_kind(tool: &ToolRow) -> Option<ToolGroupKind> {
     None
 }
 
-pub(crate) fn derive_tool_row(session: &Session, invocation: &ToolInvocationRecord) -> ToolRow {
-    let delegated_task = derive_delegated_task_row(session, invocation);
-    let display_name = delegated_task_display_name(invocation, delegated_task.as_ref());
+pub(crate) fn derive_tool_row_from_transcript(
+    session: &Session,
+    item: &TranscriptItemRecord,
+    invocation: &TranscriptToolInvocationContent,
+) -> ToolRow {
+    let delegated_task = derive_transcript_delegated_task_row(
+        session,
+        item.child_run_id,
+        invocation
+            .delegation
+            .as_ref()
+            .and_then(|delegation| delegation.agent_name.clone()),
+        invocation
+            .delegation
+            .as_ref()
+            .and_then(|delegation| delegation.prompt.clone()),
+    );
+    let display_name = delegated_task_display_name(&invocation.tool_name, delegated_task.as_ref());
 
     ToolRow {
+        invocation_id: item.tool_invocation_id,
+        tool_call_id: invocation.tool_call_id.clone(),
+        run_id: item.run_id,
         tool_name: invocation.tool_name.clone(),
         display_name,
-        summary: summarize_tool(invocation, delegated_task.as_ref()),
+        summary: summarize_tool(
+            &invocation.tool_name,
+            &invocation.arguments,
+            delegated_task.as_ref(),
+        ),
         provenance_compact: summarize_tool_provenance_compact(&invocation.tool_source),
         provenance_expanded: summarize_tool_provenance_expanded(&invocation.tool_source),
+        arguments: invocation.arguments.clone(),
         arguments_preview: summarize_json(&invocation.arguments),
         delegated_task,
         approval_state: invocation.approval_state,
@@ -345,27 +532,24 @@ pub(crate) fn derive_tool_row(session: &Session, invocation: &ToolInvocationReco
     }
 }
 
-fn derive_delegated_task_row(
+fn derive_transcript_delegated_task_row(
     session: &Session,
-    invocation: &ToolInvocationRecord,
+    child_run_id: Option<Uuid>,
+    agent_name: Option<String>,
+    prompt: Option<String>,
 ) -> Option<DelegatedTaskRow> {
-    if invocation.tool_name != "task" {
-        return None;
-    }
-
-    let agent_name = invocation
-        .delegation_agent_name()
+    let agent_name = agent_name
+        .as_deref()
         .map(str::trim)
         .filter(|agent| !agent.is_empty())
         .map(str::to_owned);
-    let prompt_preview = invocation
-        .delegation_prompt()
+    let prompt_preview = prompt
+        .as_deref()
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
         .map(summarize_text);
-    let child_run_status = invocation
-        .child_run_id()
-        .and_then(|child_run_id| session.find_run(child_run_id).map(|run| run.status));
+    let child_run_status =
+        child_run_id.and_then(|run_id| session.find_run(run_id).map(|run| run.status));
 
     if agent_name.is_none() && prompt_preview.is_none() && child_run_status.is_none() {
         return None;
@@ -374,22 +558,22 @@ fn derive_delegated_task_row(
     Some(DelegatedTaskRow {
         agent_name,
         prompt_preview,
-        child_run_id: invocation.child_run_id(),
+        child_run_id,
         child_run_status,
     })
 }
 
 fn delegated_task_display_name(
-    invocation: &ToolInvocationRecord,
+    tool_name: &str,
     delegated_task: Option<&DelegatedTaskRow>,
 ) -> String {
-    if invocation.tool_name != "task" {
-        return invocation.tool_name.clone();
+    if tool_name != "task" {
+        return tool_name.to_string();
     }
 
     match delegated_task.and_then(|delegated_task| delegated_task.agent_name.as_deref()) {
         Some(agent) => format!("task {agent}"),
-        None => invocation.tool_name.clone(),
+        None => tool_name.to_string(),
     }
 }
 
@@ -423,11 +607,12 @@ fn format_discovery_scope(scope: fluent_code_app::plugin::DiscoveryScope) -> &'s
 }
 
 fn summarize_tool(
-    invocation: &ToolInvocationRecord,
+    tool_name: &str,
+    arguments: &serde_json::Value,
     delegated_task: Option<&DelegatedTaskRow>,
 ) -> String {
-    if invocation.tool_name == "task" {
-        let display_name = delegated_task_display_name(invocation, delegated_task);
+    if tool_name == "task" {
+        let display_name = delegated_task_display_name(tool_name, delegated_task);
 
         if let Some(prompt_preview) = delegated_task.and_then(|delegated_task| {
             delegated_task
@@ -441,27 +626,82 @@ fn summarize_tool(
         return display_name;
     }
 
-    if let Some(path) = invocation
-        .arguments
+    if let Some(path) = arguments
         .get("filePath")
-        .or_else(|| invocation.arguments.get("path"))
+        .or_else(|| arguments.get("path"))
         .and_then(serde_json::Value::as_str)
         && !path.trim().is_empty()
     {
-        return format!("{} {}", invocation.tool_name, path);
+        return format!("{tool_name} {path}");
     }
 
-    if let Some(query) = invocation
-        .arguments
+    if let Some(query) = arguments
         .get("query")
-        .or_else(|| invocation.arguments.get("pattern"))
+        .or_else(|| arguments.get("pattern"))
         .and_then(serde_json::Value::as_str)
         && !query.trim().is_empty()
     {
-        return format!("{} {}", invocation.tool_name, query);
+        return format!("{tool_name} {query}");
     }
 
-    invocation.tool_name.clone()
+    tool_name.to_string()
+}
+
+fn update_pending_tool_permission(
+    pending_tools: &mut [ToolRow],
+    item: &TranscriptItemRecord,
+    content: &TranscriptPermissionContent,
+) {
+    let Some(tool_invocation_id) = item.tool_invocation_id else {
+        return;
+    };
+
+    let Some(tool_row) = pending_tools
+        .iter_mut()
+        .rev()
+        .find(|tool_row| tool_row.matches_invocation(tool_invocation_id))
+    else {
+        return;
+    };
+
+    tool_row.approval_state = match content.state {
+        TranscriptPermissionState::Pending => ToolApprovalState::Pending,
+        TranscriptPermissionState::Approved => ToolApprovalState::Approved,
+        TranscriptPermissionState::Denied => ToolApprovalState::Denied,
+    };
+}
+
+fn update_pending_tool_delegated_child(
+    session: &Session,
+    pending_tools: &mut [ToolRow],
+    item: &TranscriptItemRecord,
+    content: &TranscriptDelegatedChildContent,
+) {
+    let Some(tool_invocation_id) = item.tool_invocation_id else {
+        return;
+    };
+
+    let Some(tool_row) = pending_tools
+        .iter_mut()
+        .rev()
+        .find(|tool_row| tool_row.matches_invocation(tool_invocation_id))
+    else {
+        return;
+    };
+
+    tool_row.delegated_task = derive_transcript_delegated_task_row(
+        session,
+        content.child_run_id,
+        content.agent_name.clone(),
+        content.prompt.clone(),
+    );
+    tool_row.display_name =
+        delegated_task_display_name(&tool_row.tool_name, tool_row.delegated_task.as_ref());
+    tool_row.summary = summarize_tool(
+        &tool_row.tool_name,
+        &tool_row.arguments,
+        tool_row.delegated_task.as_ref(),
+    );
 }
 
 fn summarize_json(value: &serde_json::Value) -> String {

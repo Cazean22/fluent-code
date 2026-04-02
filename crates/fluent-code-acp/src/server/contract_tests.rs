@@ -179,6 +179,10 @@ async fn contract_session_load_replay_notifications_precede_response_after_by_va
         Some("ACP load prompt")
     );
     assert_eq!(
+        capture.response_frame(2).unwrap()["result"]["replayFidelity"],
+        "approximate"
+    );
+    assert_eq!(
         config_option_current_value(capture.response_frame(2).unwrap(), "reasoning_effort"),
         Some("low")
     );
@@ -284,6 +288,10 @@ async fn contract_session_load_preserves_permission_request_order_for_pending_to
 
     assert_eq!(tool_call_indices.len(), 2);
     assert_eq!(permission_request_indices.len(), 1);
+    assert_eq!(
+        capture.response_frame(2).unwrap()["result"]["replayFidelity"],
+        "approximate"
+    );
     assert_eq!(
         capture.notification_frames(SESSION_REQUEST_PERMISSION_METHOD)[0]["params"]["toolCall"]["toolCallId"],
         "glob-call-2"
@@ -418,6 +426,14 @@ async fn contract_interrupted_load_surfaces_terminal_state_over_jsonl_harness() 
 
     assert_eq!(interrupted_update["params"]["update"]["status"], "failed");
     assert!(capture.response_frame(2).unwrap()["result"].is_object());
+    assert_eq!(
+        capture.response_frame(2).unwrap()["result"]["_meta"]["fluentCodeLatestPromptState"],
+        "interrupted"
+    );
+    assert_eq!(
+        capture.response_frame(2).unwrap()["result"]["_meta"]["fluentCodeReplayFidelity"],
+        "approximate"
+    );
 
     cleanup(temp_dir);
 }

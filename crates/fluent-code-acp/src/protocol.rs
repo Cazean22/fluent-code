@@ -6,6 +6,7 @@ use thiserror::Error;
 
 pub const JSONRPC_VERSION: &str = "2.0";
 pub const ACP_PROTOCOL_VERSION: u16 = 1;
+pub type Meta = serde_json::Map<String, Value>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -394,6 +395,18 @@ pub struct LoadSessionResponse {
     pub config_options: Option<Vec<SessionConfigOption>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_prompt_state: Option<PromptTurnState>,
+    #[serde(default)]
+    pub replay_fidelity: ReplayFidelity,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayFidelity {
+    #[default]
+    Exact,
+    Approximate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,6 +478,8 @@ pub struct SessionInfoUpdate {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,6 +555,8 @@ pub struct ToolCall {
     pub raw_input: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -560,6 +577,8 @@ pub struct ToolCallUpdate {
     pub raw_input: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub meta: Option<Meta>,
 }
 
 impl ToolCallUpdate {
@@ -573,6 +592,7 @@ impl ToolCallUpdate {
             locations: None,
             raw_input: None,
             raw_output: None,
+            meta: None,
         }
     }
 
@@ -584,6 +604,7 @@ impl ToolCallUpdate {
             && self.locations.is_none()
             && self.raw_input.is_none()
             && self.raw_output.is_none()
+            && self.meta.is_none()
     }
 }
 
@@ -674,11 +695,11 @@ mod tests {
     use super::{
         AgentCapabilities, AuthenticateRequest, ContentBlock, InitializeResponse,
         JsonRpcNotification, JsonRpcProtocol, JsonRpcRequest, JsonRpcResponse, LoadSessionResponse,
-        Method, NewSessionResponse, PromptTurnState, ProtocolError, ProtocolState, ServerInfo,
-        SessionCancelRequest, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-        SessionConfigSelect, SessionConfigSelectOption, SessionNotification, SessionPromptRequest,
-        SessionPromptResponse, SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
-        ToolCallUpdate,
+        Meta, Method, NewSessionResponse, PromptTurnState, ProtocolError, ProtocolState,
+        ReplayFidelity, ServerInfo, SessionCancelRequest, SessionConfigKind, SessionConfigOption,
+        SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption,
+        SessionNotification, SessionPromptRequest, SessionPromptResponse, SessionUpdate,
+        StopReason, ToolCallContent, ToolCallStatus, ToolCallUpdate,
     };
 
     #[test]
@@ -1019,12 +1040,15 @@ mod tests {
         let response = LoadSessionResponse {
             config_options: None,
             latest_prompt_state: Some(PromptTurnState::Interrupted),
+            replay_fidelity: ReplayFidelity::Approximate,
+            meta: None,
         };
 
         assert_eq!(
             serde_json::to_value(response).unwrap(),
             json!({
-                "latestPromptState": "interrupted"
+                "latestPromptState": "interrupted",
+                "replayFidelity": "approximate"
             })
         );
     }
@@ -1058,5 +1082,18 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn tool_call_update_meta_only_is_not_empty() {
+        let mut update = ToolCallUpdate::new("tool-call-1");
+        let mut meta = Meta::new();
+        meta.insert(
+            "fluentCodeToolInvocation".to_string(),
+            json!({"toolCallId":"tool-call-1"}),
+        );
+        update.meta = Some(meta);
+
+        assert!(!update.is_empty());
     }
 }

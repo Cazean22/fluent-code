@@ -12,8 +12,10 @@ use crate::app::permissions::{
 use crate::app::request_builder::build_provider_request;
 use crate::app::{AppState, AppStatus, Effect, Msg};
 use crate::session::model::{
-    ForegroundPhase, Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
-    Turn,
+    ForegroundPhase, Role, RunStatus, ToolApprovalState, ToolExecutionState, ToolInvocationId,
+    ToolInvocationRecord, ToolPermissionAction, TranscriptItemContent, TranscriptItemRecord,
+    TranscriptPermissionState, TranscriptStreamState, Turn, transcript_assistant_reasoning_item_id,
+    transcript_assistant_text_item_id, transcript_permission_item_id,
 };
 
 const READ_TOOL_NAME: &str = "read";
@@ -63,8 +65,18 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 timestamp: Utc::now(),
             };
             state.session.turns.push(turn);
+            let user_turn = state
+                .session
+                .turns
+                .last()
+                .expect("user turn just pushed")
+                .clone();
+            state
+                .session
+                .upsert_transcript_item(TranscriptItemRecord::from_turn(&user_turn));
             state.session.updated_at = Utc::now();
             state.session.upsert_run(run_id, RunStatus::InProgress);
+            upsert_run_started_transcript_item(state, run_id);
             state.draft_input.clear();
             state.set_foreground(run_id, ForegroundPhase::Generating, None);
 
@@ -113,6 +125,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             let mut approved_tool_calls = Vec::new();
             let mut delegated_child_start = None;
             let mut remembered_policies = Vec::new();
+            let mut approved_invocation_ids = Vec::new();
 
             for invocation in state
                 .session
@@ -127,6 +140,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 invocation.approval_state = ToolApprovalState::Approved;
                 invocation.approved_at = Some(approved_at);
                 invocation.error = None;
+                approved_invocation_ids.push(invocation.id);
 
                 if matches!(reply, PermissionReply::Always)
                     && let Some(policy) = state.tool_registry.tool_policy(&invocation.tool_name)
@@ -166,6 +180,17 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
 
             for policy in remembered_policies {
                 remember_reply(&mut state.session, &policy, reply);
+            }
+
+            let permission_action = permission_action_for_reply(reply);
+            for invocation_id in approved_invocation_ids {
+                upsert_tool_invocation_transcript_item(state, invocation_id);
+                upsert_permission_transcript_item(
+                    state,
+                    invocation_id,
+                    TranscriptPermissionState::Approved,
+                    Some(permission_action),
+                );
             }
 
             state.set_foreground(run_id, ForegroundPhase::RunningTool, preceding_turn_id);
@@ -214,10 +239,12 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 return parent_effects;
             }
 
+            commit_open_assistant_transcript_items_for_run(state, run_id);
             state.clear_foreground();
             state.status = AppStatus::Idle;
             state.session.updated_at = Utc::now();
             state.session.upsert_run(run_id, RunStatus::Cancelled);
+            upsert_run_terminal_transcript_item(state, run_id);
 
             info!(
                 session_id = %state.session.id,
@@ -242,9 +269,19 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             let should_checkpoint = state.should_checkpoint_now();
             let chunk_bytes = delta.len();
 
-            let existing_turn = active_assistant_turn_mut(state, run_id).is_some();
-            let turn = ensure_active_assistant_turn(state, run_id);
-            turn.content.push_str(&delta);
+            let existing_turn = active_assistant_turn_id(state, run_id).is_some();
+            let (turn_id, turn_sequence_number) = {
+                let turn = ensure_active_assistant_turn(state, run_id);
+                turn.content.push_str(&delta);
+                (turn.id, turn.sequence_number)
+            };
+            upsert_assistant_text_transcript_item(
+                state,
+                run_id,
+                turn_id,
+                turn_sequence_number,
+                delta,
+            );
             state.session.updated_at = Utc::now();
             if existing_turn {
                 debug!(run_id = %run_id, chunk_bytes, checkpoint_due = should_checkpoint, "appended assistant chunk to existing turn");
@@ -272,12 +309,22 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             state.status = AppStatus::Generating;
             let should_checkpoint = state.should_checkpoint_now();
             let chunk_bytes = delta.len();
-            let existing_turn = active_assistant_turn_mut(state, run_id).is_some();
-            let had_text = active_assistant_turn_mut(state, run_id)
+            let existing_turn = active_assistant_turn_id(state, run_id).is_some();
+            let had_text = active_assistant_turn_ref(state, run_id)
                 .map(|turn| !turn.content.is_empty())
                 .unwrap_or(false);
-            let turn = ensure_active_assistant_turn(state, run_id);
-            turn.reasoning.push_str(&delta);
+            let (turn_id, turn_sequence_number) = {
+                let turn = ensure_active_assistant_turn(state, run_id);
+                turn.reasoning.push_str(&delta);
+                (turn.id, turn.sequence_number)
+            };
+            upsert_assistant_reasoning_transcript_item(
+                state,
+                run_id,
+                turn_id,
+                turn_sequence_number,
+                delta,
+            );
             state.session.updated_at = Utc::now();
 
             if existing_turn {
@@ -319,6 +366,8 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             let agent_denied = active_agent_for_run(state, run_id)
                 .is_some_and(|agent| !agent.tool_permissions.is_tool_permitted(&tool_name));
 
+            commit_open_assistant_transcript_items_for_run(state, run_id);
+
             let invocation = ToolInvocationRecord {
                 id: Uuid::new_v4(),
                 run_id,
@@ -339,6 +388,13 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             };
 
             state.session.tool_invocations.push(invocation);
+            let invocation_id = state
+                .session
+                .tool_invocations
+                .last()
+                .expect("tool invocation just pushed")
+                .id;
+            upsert_tool_invocation_transcript_item(state, invocation_id);
             state.session.updated_at = Utc::now();
             let permission_decision = if agent_denied {
                 PermissionDecision::Deny
@@ -365,6 +421,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                             invocation.preceding_turn_id,
                         )
                     };
+                    upsert_tool_invocation_transcript_item(state, invocation_id);
                     state.set_foreground(
                         run_id,
                         ForegroundPhase::RunningTool,
@@ -406,6 +463,12 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                             invocation.preceding_turn_id,
                         )
                     };
+                    upsert_permission_transcript_item(
+                        state,
+                        invocation_id,
+                        TranscriptPermissionState::Pending,
+                        None,
+                    );
                     state.set_foreground(
                         run_id,
                         ForegroundPhase::AwaitingToolApproval,
@@ -423,17 +486,22 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                     vec![Effect::PersistSession]
                 }
                 PermissionDecision::Deny => {
-                    let invocation = state
-                        .session
-                        .tool_invocations
-                        .last_mut()
-                        .expect("tool invocation just pushed");
-                    let preceding_turn_id = invocation.preceding_turn_id;
-                    invocation.approval_state = ToolApprovalState::Denied;
-                    invocation.execution_state = ToolExecutionState::Skipped;
-                    invocation.error = Some(tool_denied_by_policy_message(&invocation.tool_name));
-                    invocation.completed_at = Some(Utc::now());
+                    let (invocation_id, preceding_turn_id) = {
+                        let invocation = state
+                            .session
+                            .tool_invocations
+                            .last_mut()
+                            .expect("tool invocation just pushed");
+                        let preceding_turn_id = invocation.preceding_turn_id;
+                        invocation.approval_state = ToolApprovalState::Denied;
+                        invocation.execution_state = ToolExecutionState::Skipped;
+                        invocation.error =
+                            Some(tool_denied_by_policy_message(&invocation.tool_name));
+                        invocation.completed_at = Some(Utc::now());
+                        (invocation.id, preceding_turn_id)
+                    };
                     state.session.updated_at = Utc::now();
+                    upsert_tool_invocation_transcript_item(state, invocation_id);
 
                     match tool_batch_progress(state, run_id, preceding_turn_id) {
                         ToolBatchProgress::AwaitingApproval => {
@@ -472,10 +540,12 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                     return parent_effects;
                 }
 
+                commit_open_assistant_transcript_items_for_run(state, run_id);
                 state.clear_foreground();
                 state.status = AppStatus::Idle;
                 state.session.updated_at = Utc::now();
                 state.session.upsert_run(run_id, RunStatus::Completed);
+                upsert_run_terminal_transcript_item(state, run_id);
 
                 info!(
                     session_id = %state.session.id,
@@ -513,10 +583,12 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                     return parent_effects;
                 }
 
+                commit_open_assistant_transcript_items_for_run(state, run_id);
                 state.clear_foreground();
                 state.status = AppStatus::Error(error);
                 state.session.updated_at = Utc::now();
                 state.session.upsert_run(run_id, RunStatus::Failed);
+                upsert_run_terminal_transcript_item(state, run_id);
 
                 if let AppStatus::Error(message) = &state.status {
                     warn!(
@@ -583,57 +655,68 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                 return Vec::new();
             };
 
-            let Some(invocation) = state.session.find_tool_invocation_mut(invocation_id) else {
-                return Vec::new();
-            };
+            let mut terminal_tool_failure = None;
+            {
+                let Some(invocation) = state.session.find_tool_invocation_mut(invocation_id) else {
+                    return Vec::new();
+                };
 
-            invocation.completed_at = Some(Utc::now());
+                invocation.completed_at = Some(Utc::now());
 
-            match result {
-                Ok(output) => {
-                    invocation.execution_state = ToolExecutionState::Completed;
-                    invocation.result = Some(output);
-                    invocation.error = None;
-                    let tool_name = invocation.tool_name.clone();
-                    info!(
-                        session_id = %session_id,
-                        run_id = %run_id,
-                        invocation_id = %invocation_id,
-                        tool_name = %tool_name,
-                        "tool execution finished and assistant will resume"
-                    );
-                }
-                Err(error) => {
-                    invocation.execution_state = ToolExecutionState::Failed;
-                    invocation.error = Some(error.clone());
-                    let tool_name = invocation.tool_name.clone();
-                    if should_resume_after_tool_failure(&tool_name, &error) {
+                match result {
+                    Ok(output) => {
+                        invocation.execution_state = ToolExecutionState::Completed;
+                        invocation.result = Some(output);
+                        invocation.error = None;
+                        let tool_name = invocation.tool_name.clone();
                         info!(
                             session_id = %session_id,
                             run_id = %run_id,
                             invocation_id = %invocation_id,
                             tool_name = %tool_name,
-                            error = %error,
-                            "tool execution failed but assistant will resume"
+                            "tool execution finished and assistant will resume"
                         );
-                    } else {
-                        state.status = AppStatus::Error(error);
-                        state.session.updated_at = Utc::now();
-                        state.session.upsert_run(run_id, RunStatus::Failed);
-                        state.clear_foreground();
-                        if let AppStatus::Error(message) = &state.status {
-                            warn!(
+                    }
+                    Err(error) => {
+                        invocation.execution_state = ToolExecutionState::Failed;
+                        invocation.error = Some(error.clone());
+                        let tool_name = invocation.tool_name.clone();
+                        if should_resume_after_tool_failure(&tool_name, &error) {
+                            info!(
                                 session_id = %session_id,
                                 run_id = %run_id,
                                 invocation_id = %invocation_id,
                                 tool_name = %tool_name,
-                                error = %message,
-                                "tool execution failed and ended the run"
+                                error = %error,
+                                "tool execution failed but assistant will resume"
                             );
+                        } else {
+                            terminal_tool_failure = Some((tool_name, error));
                         }
-                        return vec![Effect::PersistSession];
                     }
                 }
+            }
+
+            upsert_tool_invocation_transcript_item(state, invocation_id);
+
+            if let Some((tool_name, error)) = terminal_tool_failure {
+                commit_open_assistant_transcript_items_for_run(state, run_id);
+                state.status = AppStatus::Error(error);
+                state.session.updated_at = Utc::now();
+                state.session.upsert_run(run_id, RunStatus::Failed);
+                upsert_run_terminal_transcript_item(state, run_id);
+                state.clear_foreground();
+                if let AppStatus::Error(message) = &state.status {
+                    warn!(
+                        session_id = %session_id,
+                        run_id = %run_id,
+                        invocation_id = %invocation_id,
+                        tool_name = %tool_name,
+                        error = %message,
+                        "tool execution failed and ended the run"
+                    );
+                }
+                return vec![Effect::PersistSession];
             }
 
             state.session.updated_at = Utc::now();
@@ -693,12 +776,44 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
     }
 }
 
-fn active_assistant_turn_mut(state: &mut AppState, run_id: Uuid) -> Option<&mut Turn> {
+#[derive(Debug, Clone, Copy)]
+enum AssistantTranscriptStream {
+    Reasoning,
+    Text,
+}
+
+fn active_assistant_turn_id(state: &AppState, run_id: Uuid) -> Option<Uuid> {
+    let turn = state
+        .session
+        .turns
+        .last()
+        .filter(|turn| matches!(turn.role, Role::Assistant) && turn.run_id == run_id)?;
+
+    if assistant_turn_has_tool_boundary(state, turn.id) {
+        None
+    } else {
+        Some(turn.id)
+    }
+}
+
+fn active_assistant_turn_ref(state: &AppState, run_id: Uuid) -> Option<&Turn> {
+    let turn_id = active_assistant_turn_id(state, run_id)?;
     state
         .session
         .turns
-        .last_mut()
-        .filter(|turn| matches!(turn.role, Role::Assistant) && turn.run_id == run_id)
+        .iter()
+        .rev()
+        .find(|turn| turn.id == turn_id)
+}
+
+fn active_assistant_turn_mut(state: &mut AppState, run_id: Uuid) -> Option<&mut Turn> {
+    let turn_id = active_assistant_turn_id(state, run_id)?;
+    state
+        .session
+        .turns
+        .iter_mut()
+        .rev()
+        .find(|turn| turn.id == turn_id)
 }
 
 fn ensure_active_assistant_turn(state: &mut AppState, run_id: Uuid) -> &mut Turn {
@@ -716,6 +831,202 @@ fn ensure_active_assistant_turn(state: &mut AppState, run_id: Uuid) -> &mut Turn
     }
 
     active_assistant_turn_mut(state, run_id).expect("assistant turn just ensured")
+}
+
+fn assistant_turn_has_tool_boundary(state: &AppState, turn_id: Uuid) -> bool {
+    state
+        .session
+        .tool_invocations
+        .iter()
+        .any(|invocation| invocation.preceding_turn_id == Some(turn_id))
+}
+
+fn assistant_turn_has_transcript_stream(state: &AppState, turn_id: Uuid) -> bool {
+    state
+        .session
+        .find_transcript_item(transcript_assistant_reasoning_item_id(turn_id))
+        .is_some()
+        || state
+            .session
+            .find_transcript_item(transcript_assistant_text_item_id(turn_id))
+            .is_some()
+}
+
+fn upsert_run_started_transcript_item(state: &mut AppState, run_id: Uuid) {
+    let Some(run) = state.session.find_run(run_id).cloned() else {
+        return;
+    };
+    state
+        .session
+        .upsert_transcript_item(TranscriptItemRecord::run_started(&run));
+}
+
+fn upsert_run_terminal_transcript_item(state: &mut AppState, run_id: Uuid) {
+    let Some(run) = state.session.find_run(run_id).cloned() else {
+        return;
+    };
+    state
+        .session
+        .upsert_transcript_item(TranscriptItemRecord::run_terminal(&run));
+}
+
+fn upsert_tool_invocation_transcript_item(state: &mut AppState, invocation_id: ToolInvocationId) {
+    let Some(invocation) = state
+        .session
+        .tool_invocations
+        .iter()
+        .find(|invocation| invocation.id == invocation_id)
+        .cloned()
+    else {
+        return;
+    };
+
+    state
+        .session
+        .upsert_transcript_item(TranscriptItemRecord::from_tool_invocation(&invocation));
+}
+
+fn upsert_permission_transcript_item(
+    state: &mut AppState,
+    invocation_id: ToolInvocationId,
+    permission_state: TranscriptPermissionState,
+    decision: Option<ToolPermissionAction>,
+) {
+    let Some(invocation) = state
+        .session
+        .tool_invocations
+        .iter()
+        .find(|invocation| invocation.id == invocation_id)
+        .cloned()
+    else {
+        return;
+    };
+
+    let item_id = transcript_permission_item_id(invocation_id);
+    let sequence_number = state
+        .session
+        .find_transcript_item(item_id)
+        .map(|item| item.sequence_number)
+        .unwrap_or_else(|| state.session.allocate_replay_sequence());
+    let item =
+        TranscriptItemRecord::permission(&invocation, sequence_number, permission_state, decision);
+    state.session.upsert_transcript_item(item);
+}
+
+fn commit_open_assistant_transcript_items_for_run(state: &mut AppState, run_id: Uuid) {
+    let Some(turn_id) = state
+        .session
+        .turns
+        .iter()
+        .rev()
+        .find(|turn| turn.run_id == run_id && matches!(turn.role, Role::Assistant))
+        .map(|turn| turn.id)
+    else {
+        return;
+    };
+
+    commit_assistant_transcript_items_for_turn(state, turn_id);
+}
+
+fn commit_assistant_transcript_items_for_turn(state: &mut AppState, turn_id: Uuid) {
+    for item_id in [
+        transcript_assistant_reasoning_item_id(turn_id),
+        transcript_assistant_text_item_id(turn_id),
+    ] {
+        if let Some(item) = state.session.find_transcript_item_mut(item_id) {
+            item.stream_state = TranscriptStreamState::Committed;
+        }
+    }
+}
+
+fn upsert_assistant_reasoning_transcript_item(
+    state: &mut AppState,
+    run_id: Uuid,
+    turn_id: Uuid,
+    turn_sequence_number: u64,
+    delta: String,
+) {
+    upsert_assistant_stream_transcript_item(
+        state,
+        run_id,
+        turn_id,
+        turn_sequence_number,
+        delta,
+        AssistantTranscriptStream::Reasoning,
+    );
+}
+
+fn upsert_assistant_text_transcript_item(
+    state: &mut AppState,
+    run_id: Uuid,
+    turn_id: Uuid,
+    turn_sequence_number: u64,
+    delta: String,
+) {
+    upsert_assistant_stream_transcript_item(
+        state,
+        run_id,
+        turn_id,
+        turn_sequence_number,
+        delta,
+        AssistantTranscriptStream::Text,
+    );
+}
+
+fn upsert_assistant_stream_transcript_item(
+    state: &mut AppState,
+    run_id: Uuid,
+    turn_id: Uuid,
+    turn_sequence_number: u64,
+    delta: String,
+    stream: AssistantTranscriptStream,
+) {
+    let item_id = match stream {
+        AssistantTranscriptStream::Reasoning => transcript_assistant_reasoning_item_id(turn_id),
+        AssistantTranscriptStream::Text => transcript_assistant_text_item_id(turn_id),
+    };
+
+    if let Some(item) = state.session.find_transcript_item_mut(item_id) {
+        if let TranscriptItemContent::Turn(content) = &mut item.content {
+            match stream {
+                AssistantTranscriptStream::Reasoning => content.reasoning.push_str(&delta),
+                AssistantTranscriptStream::Text => content.content.push_str(&delta),
+            }
+        }
+        item.stream_state = TranscriptStreamState::Open;
+        return;
+    }
+
+    let sequence_number = if assistant_turn_has_transcript_stream(state, turn_id) {
+        state.session.allocate_replay_sequence()
+    } else {
+        turn_sequence_number
+    };
+
+    let item = match stream {
+        AssistantTranscriptStream::Reasoning => TranscriptItemRecord::assistant_reasoning(
+            run_id,
+            turn_id,
+            sequence_number,
+            delta,
+            TranscriptStreamState::Open,
+        ),
+        AssistantTranscriptStream::Text => TranscriptItemRecord::assistant_text(
+            run_id,
+            turn_id,
+            sequence_number,
+            delta,
+            TranscriptStreamState::Open,
+        ),
+    };
+    state.session.upsert_transcript_item(item);
+}
+
+fn permission_action_for_reply(reply: PermissionReply) -> ToolPermissionAction {
+    match reply {
+        PermissionReply::Once | PermissionReply::Always => ToolPermissionAction::Allow,
+        PermissionReply::Deny => ToolPermissionAction::Deny,
+    }
 }
 
 fn should_resume_after_tool_failure(tool_name: &str, error: &str) -> bool {
@@ -761,6 +1072,16 @@ fn deny_pending_tool_batch(
 
     if denied_invocation_ids.is_empty() {
         return Vec::new();
+    }
+
+    for invocation_id in &denied_invocation_ids {
+        upsert_tool_invocation_transcript_item(state, *invocation_id);
+        upsert_permission_transcript_item(
+            state,
+            *invocation_id,
+            TranscriptPermissionState::Denied,
+            Some(ToolPermissionAction::Deny),
+        );
     }
 
     state.session.updated_at = Utc::now();
@@ -876,6 +1197,8 @@ mod tests {
     use crate::config::AgentConfig;
     use crate::session::model::{
         Role, RunStatus, Session, TaskDelegationStatus, ToolApprovalState, ToolExecutionState,
+        ToolPermissionAction, TranscriptItemContent, TranscriptPermissionState,
+        TranscriptRunLifecycleEvent, TranscriptStreamState,
     };
 
     #[test]
@@ -1994,10 +2317,258 @@ mod tests {
         assert!(child_request.tools.iter().all(|tool| tool.name != "task"));
     }
 
+    #[test]
+    fn reducer_emits_canonical_transcript_items_in_exact_stream_order() {
+        let mut state = AppState::new(Session::new("canonical transcript order"));
+        state.draft_input = "delegate work".to_string();
+        let effects = update(&mut state, Msg::SubmitPrompt);
+        let parent_run_id = match effects.get(1) {
+            Some(Effect::StartAssistant { run_id, .. }) => *run_id,
+            _ => panic!("expected assistant start effect"),
+        };
+
+        update(
+            &mut state,
+            Msg::AssistantReasoningChunk {
+                run_id: parent_run_id,
+                delta: "think before tool".to_string(),
+            },
+        );
+        update(
+            &mut state,
+            Msg::AssistantChunk {
+                run_id: parent_run_id,
+                delta: "delegating now".to_string(),
+            },
+        );
+        update(
+            &mut state,
+            Msg::AssistantToolCall {
+                run_id: parent_run_id,
+                tool_call: fluent_code_provider::ProviderToolCall {
+                    id: "task-call-1".to_string(),
+                    name: "task".to_string(),
+                    arguments: serde_json::json!({
+                        "agent": "explore",
+                        "prompt": "Inspect runtime"
+                    }),
+                },
+            },
+        );
+
+        let approval_effects = update(&mut state, Msg::ReplyToPendingTool(PermissionReply::Once));
+        let child_run_id = state.active_run_id.expect("child run should be active");
+        assert!(matches!(
+            approval_effects.last(),
+            Some(Effect::StartAssistant { run_id, .. }) if *run_id == child_run_id
+        ));
+
+        update(
+            &mut state,
+            Msg::AssistantChunk {
+                run_id: child_run_id,
+                delta: "Child summary".to_string(),
+            },
+        );
+        update(
+            &mut state,
+            Msg::AssistantDone {
+                run_id: child_run_id,
+            },
+        );
+        update(
+            &mut state,
+            Msg::AssistantChunk {
+                run_id: parent_run_id,
+                delta: "Parent final answer".to_string(),
+            },
+        );
+        update(
+            &mut state,
+            Msg::AssistantDone {
+                run_id: parent_run_id,
+            },
+        );
+
+        assert_eq!(
+            state
+                .session
+                .turns
+                .iter()
+                .filter(|turn| turn.run_id == parent_run_id && matches!(turn.role, Role::Assistant))
+                .count(),
+            2,
+            "parent assistant output should split across the tool boundary"
+        );
+
+        let items = ordered_transcript_items(&state.session.transcript_items);
+        assert_eq!(items.len(), 13);
+        assert!(
+            items
+                .iter()
+                .all(|item| item.stream_state == TranscriptStreamState::Committed)
+        );
+
+        assert_turn_text_item(items[0], parent_run_id, Role::User, "delegate work");
+        assert_run_started_item(items[1], parent_run_id);
+        assert_turn_reasoning_item(items[2], parent_run_id, "think before tool");
+        assert_turn_text_item(items[3], parent_run_id, Role::Assistant, "delegating now");
+        assert_task_tool_item(items[4], parent_run_id, child_run_id);
+        assert_permission_item(items[5], parent_run_id);
+        assert_run_started_item(items[6], child_run_id);
+        assert_delegated_child_item(items[7], parent_run_id, child_run_id);
+        assert_turn_text_item(items[8], child_run_id, Role::User, "Inspect runtime");
+        assert_turn_text_item(items[9], child_run_id, Role::Assistant, "Child summary");
+        assert_run_terminal_completed_item(items[10], child_run_id);
+        assert_turn_text_item(
+            items[11],
+            parent_run_id,
+            Role::Assistant,
+            "Parent final answer",
+        );
+        assert_run_terminal_completed_item(items[12], parent_run_id);
+    }
+
     fn request_contains_tool_name(
         request: &fluent_code_provider::ProviderRequest,
         name: &str,
     ) -> bool {
         request.tools.iter().any(|tool| tool.name == name)
+    }
+
+    fn ordered_transcript_items(
+        items: &[crate::session::model::TranscriptItemRecord],
+    ) -> Vec<&crate::session::model::TranscriptItemRecord> {
+        let mut ordered = items.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|item| item.sequence_number);
+        ordered
+    }
+
+    fn assert_turn_text_item(
+        item: &crate::session::model::TranscriptItemRecord,
+        expected_run_id: uuid::Uuid,
+        expected_role: Role,
+        expected_text: &str,
+    ) {
+        assert_eq!(item.run_id, expected_run_id);
+        match &item.content {
+            TranscriptItemContent::Turn(content) => {
+                assert_eq!(content.role, expected_role);
+                assert_eq!(content.content, expected_text);
+                assert!(content.reasoning.is_empty());
+            }
+            other => panic!("expected turn item, got {other:?}"),
+        }
+    }
+
+    fn assert_turn_reasoning_item(
+        item: &crate::session::model::TranscriptItemRecord,
+        expected_run_id: uuid::Uuid,
+        expected_reasoning: &str,
+    ) {
+        assert_eq!(item.run_id, expected_run_id);
+        match &item.content {
+            TranscriptItemContent::Turn(content) => {
+                assert!(matches!(content.role, Role::Assistant));
+                assert!(content.content.is_empty());
+                assert_eq!(content.reasoning, expected_reasoning);
+            }
+            other => panic!("expected reasoning turn item, got {other:?}"),
+        }
+    }
+
+    fn assert_run_started_item(
+        item: &crate::session::model::TranscriptItemRecord,
+        expected_run_id: uuid::Uuid,
+    ) {
+        assert_eq!(item.run_id, expected_run_id);
+        match &item.content {
+            TranscriptItemContent::RunLifecycle(content) => {
+                assert_eq!(content.event, TranscriptRunLifecycleEvent::Started);
+                assert!(matches!(content.status, RunStatus::InProgress));
+            }
+            other => panic!("expected run-start item, got {other:?}"),
+        }
+    }
+
+    fn assert_run_terminal_completed_item(
+        item: &crate::session::model::TranscriptItemRecord,
+        expected_run_id: uuid::Uuid,
+    ) {
+        assert_eq!(item.run_id, expected_run_id);
+        match &item.content {
+            TranscriptItemContent::RunLifecycle(content) => {
+                assert_eq!(content.event, TranscriptRunLifecycleEvent::Terminal);
+                assert!(matches!(content.status, RunStatus::Completed));
+            }
+            other => panic!("expected terminal run item, got {other:?}"),
+        }
+    }
+
+    fn assert_task_tool_item(
+        item: &crate::session::model::TranscriptItemRecord,
+        expected_run_id: uuid::Uuid,
+        child_run_id: uuid::Uuid,
+    ) {
+        assert_eq!(item.run_id, expected_run_id);
+        match &item.content {
+            TranscriptItemContent::ToolInvocation(content) => {
+                assert_eq!(content.tool_name, "task");
+                assert!(matches!(
+                    content.execution_state,
+                    ToolExecutionState::Completed
+                ));
+                assert_eq!(
+                    content.result.as_deref(),
+                    Some("Subagent finished: Child summary")
+                );
+                assert_eq!(
+                    content
+                        .delegation
+                        .as_ref()
+                        .map(|delegation| delegation.child_run_id),
+                    Some(Some(child_run_id))
+                );
+                assert_eq!(
+                    content
+                        .delegation
+                        .as_ref()
+                        .map(|delegation| delegation.status),
+                    Some(TaskDelegationStatus::Completed)
+                );
+            }
+            other => panic!("expected task tool item, got {other:?}"),
+        }
+    }
+
+    fn assert_permission_item(
+        item: &crate::session::model::TranscriptItemRecord,
+        expected_run_id: uuid::Uuid,
+    ) {
+        assert_eq!(item.run_id, expected_run_id);
+        match &item.content {
+            TranscriptItemContent::Permission(content) => {
+                assert_eq!(content.state, TranscriptPermissionState::Approved);
+                assert_eq!(content.decision, Some(ToolPermissionAction::Allow));
+            }
+            other => panic!("expected permission item, got {other:?}"),
+        }
+    }
+
+    fn assert_delegated_child_item(
+        item: &crate::session::model::TranscriptItemRecord,
+        expected_run_id: uuid::Uuid,
+        child_run_id: uuid::Uuid,
+    ) {
+        assert_eq!(item.run_id, expected_run_id);
+        match &item.content {
+            TranscriptItemContent::DelegatedChild(content) => {
+                assert_eq!(content.child_run_id, Some(child_run_id));
+                assert_eq!(content.agent_name.as_deref(), Some("explore"));
+                assert_eq!(content.prompt.as_deref(), Some("Inspect runtime"));
+                assert_eq!(content.status, TaskDelegationStatus::Completed);
+            }
+            other => panic!("expected delegated-child item, got {other:?}"),
+        }
     }
 }

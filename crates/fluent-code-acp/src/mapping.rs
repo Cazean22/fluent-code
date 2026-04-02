@@ -4,21 +4,26 @@ use fluent_code_app::app::AppState;
 use fluent_code_app::config::{AcpConfig, AcpSessionDefaultsConfig};
 use fluent_code_app::session::model::{
     ReplaySequence, Role, RunId, RunRecord, RunTerminalStopReason, Session, ToolApprovalState,
-    ToolExecutionState, ToolInvocationRecord, ToolSource,
+    ToolExecutionState, ToolInvocationRecord, ToolSource, TranscriptFidelity,
+    TranscriptItemContent, TranscriptItemRecord, TranscriptPermissionState,
+    transcript_assistant_reasoning_item_id, transcript_assistant_text_item_id,
 };
 use serde_json::json;
 
 use crate::protocol::{
     ACP_PROTOCOL_VERSION, AgentCapabilities, AgentMessageChunk, AgentThoughtChunk, AuthMethod,
-    ContentBlock, InitializeResponse, PermissionOption, PermissionOptionKind,
+    ContentBlock, InitializeResponse, Meta, PermissionOption, PermissionOptionKind,
     RequestPermissionRequest, ServerInfo, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption, SessionUpdate,
-    StopReason, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolKind, UserMessageChunk,
+    SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption, SessionInfoUpdate,
+    SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolKind, UserMessageChunk,
 };
 
+const SESSION_INFO_UPDATE_PHASE: ProjectionEventPhase = ProjectionEventPhase::SessionInfoUpdate;
 const TOOL_CALL_CREATE_PHASE: ProjectionEventPhase = ProjectionEventPhase::ToolCallCreate;
 const TOOL_CALL_PATCH_PHASE: ProjectionEventPhase = ProjectionEventPhase::ToolCallPatch;
+const ACP_META_TOOL_INVOCATION_KEY: &str = "fluentCodeToolInvocation";
+const ACP_META_TRANSCRIPT_ITEM_KEY: &str = "fluentCodeTranscriptItem";
 const SYSTEM_PROMPT_CONFIG_ID: &str = "system_prompt";
 const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 const NO_REASONING_EFFORT_VALUE: &str = "none";
@@ -86,6 +91,10 @@ impl SessionUpdateMapper {
     }
 
     pub fn project_prompt_turns(&self, state: &AppState) -> Vec<PromptTurnProjection> {
+        if uses_canonical_transcript_projection(&state.session) {
+            return self.project_canonical_prompt_turns(state);
+        }
+
         let mut runs = state
             .session
             .runs
@@ -110,12 +119,78 @@ impl SessionUpdateMapper {
         if session.root_run_id(run_id) != Some(run_id) {
             return None;
         }
+
+        if uses_canonical_transcript_projection(session) {
+            return Some(self.project_canonical_prompt_turn(state, run));
+        }
+
+        Some(self.project_legacy_prompt_turn(state, run))
+    }
+
+    fn project_canonical_prompt_turns(&self, state: &AppState) -> Vec<PromptTurnProjection> {
+        let mut root_run_ids = Vec::new();
+
+        for item in state
+            .session
+            .transcript_items
+            .iter()
+            .filter(|item| is_valid_sequence(&state.session, item.sequence_number))
+        {
+            let Some(root_run_id) = state.session.root_run_id(item.run_id) else {
+                continue;
+            };
+            if state.session.root_run_id(root_run_id) != Some(root_run_id) {
+                continue;
+            }
+            if !root_run_ids.contains(&root_run_id) {
+                root_run_ids.push(root_run_id);
+            }
+        }
+
+        root_run_ids
+            .into_iter()
+            .filter_map(|run_id| self.project_prompt_turn(state, run_id))
+            .collect()
+    }
+
+    fn project_canonical_prompt_turn(
+        &self,
+        state: &AppState,
+        run: &RunRecord,
+    ) -> PromptTurnProjection {
+        let mut events = Vec::new();
+
+        for item in state
+            .session
+            .transcript_items
+            .iter()
+            .filter(|item| state.session.root_run_id(item.run_id) == Some(run.id))
+            .filter(|item| is_valid_sequence(&state.session, item.sequence_number))
+        {
+            self.project_transcript_item(state, item, &mut events);
+        }
+
+        events.sort();
+
+        PromptTurnProjection {
+            run_id: run.id,
+            events,
+            terminal_stop: self.terminal_stop(run),
+        }
+    }
+
+    fn project_legacy_prompt_turn(
+        &self,
+        state: &AppState,
+        run: &RunRecord,
+    ) -> PromptTurnProjection {
+        let session = &state.session;
         let mut events = Vec::new();
 
         for turn in session
             .turns
             .iter()
-            .filter(|turn| session.root_run_id(turn.run_id) == Some(run_id))
+            .filter(|turn| session.root_run_id(turn.run_id) == Some(run.id))
             .filter(|turn| is_valid_sequence(session, turn.sequence_number))
         {
             match turn.role {
@@ -164,7 +239,7 @@ impl SessionUpdateMapper {
         for invocation in session
             .tool_invocations
             .iter()
-            .filter(|invocation| session.root_run_id(invocation.run_id) == Some(run_id))
+            .filter(|invocation| session.root_run_id(invocation.run_id) == Some(run.id))
             .filter(|invocation| is_valid_sequence(session, invocation.sequence_number))
         {
             events.push(OrderedPromptTurnEvent::new(
@@ -194,28 +269,161 @@ impl SessionUpdateMapper {
 
         events.sort();
 
-        Some(PromptTurnProjection {
-            run_id,
+        PromptTurnProjection {
+            run_id: run.id,
             events,
             terminal_stop: self.terminal_stop(run),
-        })
+        }
+    }
+
+    fn project_transcript_item(
+        &self,
+        state: &AppState,
+        item: &TranscriptItemRecord,
+        events: &mut Vec<OrderedPromptTurnEvent>,
+    ) {
+        match &item.content {
+            TranscriptItemContent::Turn(content) => {
+                self.project_turn_transcript_item(item, content, events);
+            }
+            TranscriptItemContent::ToolInvocation(content) => {
+                events.push(OrderedPromptTurnEvent::new(
+                    item.sequence_number,
+                    TOOL_CALL_CREATE_PHASE,
+                    PromptTurnEvent::SessionUpdate(SessionUpdate::ToolCall(
+                        self.tool_call_snapshot_from_transcript(&state.session, item, content),
+                    )),
+                ));
+
+                if let Some(tool_call_patch) =
+                    self.tool_call_patch_from_transcript(&state.session, item, content)
+                {
+                    events.push(OrderedPromptTurnEvent::new(
+                        item.sequence_number,
+                        TOOL_CALL_PATCH_PHASE,
+                        PromptTurnEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(
+                            tool_call_patch,
+                        )),
+                    ));
+                }
+            }
+            TranscriptItemContent::Permission(content) => {
+                if let Some(permission_request) = self.permission_request_from_transcript_item(
+                    state,
+                    &state.session,
+                    item,
+                    content,
+                ) {
+                    events.push(OrderedPromptTurnEvent::new(
+                        item.sequence_number,
+                        ProjectionEventPhase::PermissionRequest,
+                        PromptTurnEvent::PermissionRequest(permission_request),
+                    ));
+                }
+            }
+            TranscriptItemContent::RunLifecycle(_)
+            | TranscriptItemContent::DelegatedChild(_)
+            | TranscriptItemContent::Marker(_) => {
+                events.push(OrderedPromptTurnEvent::new(
+                    item.sequence_number,
+                    SESSION_INFO_UPDATE_PHASE,
+                    PromptTurnEvent::SessionUpdate(SessionUpdate::SessionInfoUpdate(
+                        transcript_item_session_info_update(item),
+                    )),
+                ));
+            }
+        }
+    }
+
+    fn project_turn_transcript_item(
+        &self,
+        item: &TranscriptItemRecord,
+        content: &fluent_code_app::session::model::TranscriptTurnContent,
+        events: &mut Vec<OrderedPromptTurnEvent>,
+    ) {
+        match content.role {
+            Role::User => {
+                if !content.content.is_empty() {
+                    events.push(OrderedPromptTurnEvent::new(
+                        item.sequence_number,
+                        ProjectionEventPhase::UserMessage,
+                        PromptTurnEvent::SessionUpdate(SessionUpdate::UserMessageChunk(
+                            UserMessageChunk {
+                                content: ContentBlock::text(content.content.clone()),
+                            },
+                        )),
+                    ));
+                }
+            }
+            Role::Assistant => {
+                if !content.reasoning.is_empty() {
+                    events.push(OrderedPromptTurnEvent::new(
+                        item.sequence_number,
+                        ProjectionEventPhase::AgentThought,
+                        PromptTurnEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+                            AgentThoughtChunk {
+                                content: ContentBlock::text(content.reasoning.clone()),
+                            },
+                        )),
+                    ));
+                }
+
+                if !content.content.is_empty() {
+                    events.push(OrderedPromptTurnEvent::new(
+                        item.sequence_number,
+                        ProjectionEventPhase::AgentMessage,
+                        PromptTurnEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+                            AgentMessageChunk {
+                                content: ContentBlock::text(content.content.clone()),
+                            },
+                        )),
+                    ));
+                }
+            }
+            Role::System | Role::Tool => {}
+        }
     }
 
     pub fn tool_call_snapshot(&self, invocation: &ToolInvocationRecord) -> ToolCall {
         ToolCall {
-            title: tool_title(invocation),
+            title: tool_title(&invocation.tool_name, &invocation.tool_source),
             tool_call_id: invocation.tool_call_id.clone(),
-            kind: Some(tool_kind(invocation)),
+            kind: Some(tool_kind(&invocation.tool_name)),
             status: Some(ToolCallStatus::Pending),
             content: None,
-            locations: tool_input_locations(invocation),
+            locations: tool_input_locations(&invocation.tool_name, &invocation.arguments),
             raw_input: Some(invocation.arguments.clone()),
             raw_output: None,
+            meta: tool_invocation_meta(Some(invocation)),
+        }
+    }
+
+    fn tool_call_snapshot_from_transcript(
+        &self,
+        session: &Session,
+        item: &TranscriptItemRecord,
+        content: &fluent_code_app::session::model::TranscriptToolInvocationContent,
+    ) -> ToolCall {
+        let arguments = self
+            .transcript_tool_invocation(session, item)
+            .map(|invocation| invocation.arguments.clone())
+            .unwrap_or_else(|| content.arguments.clone());
+
+        ToolCall {
+            title: tool_title(&content.tool_name, &content.tool_source),
+            tool_call_id: content.tool_call_id.clone(),
+            kind: Some(tool_kind(&content.tool_name)),
+            status: Some(ToolCallStatus::Pending),
+            content: None,
+            locations: tool_input_locations(&content.tool_name, &arguments),
+            raw_input: Some(arguments),
+            raw_output: None,
+            meta: tool_invocation_meta(self.transcript_tool_invocation(session, item)),
         }
     }
 
     pub fn tool_call_patch(&self, invocation: &ToolInvocationRecord) -> Option<ToolCallUpdate> {
-        let final_status = final_tool_status(invocation);
+        let final_status = final_tool_status(invocation.execution_state);
         if final_status == ToolCallStatus::Pending
             && invocation.result.is_none()
             && invocation.error.is_none()
@@ -231,11 +439,54 @@ impl SessionUpdateMapper {
         if let Some(result) = invocation.result.as_ref() {
             update.content = Some(vec![ToolCallContent::text(result.clone())]);
             update.raw_output = Some(json!({ "result": result }));
-            update.locations = tool_output_locations(invocation);
+            update.locations =
+                tool_output_locations(&invocation.tool_name, invocation.result.as_deref());
         } else if let Some(error) = invocation.error.as_ref() {
             update.content = Some(vec![ToolCallContent::text(error.clone())]);
             update.raw_output = Some(json!({ "error": error }));
         }
+
+        update.meta = tool_invocation_meta(Some(invocation));
+
+        (!update.is_empty()).then_some(update)
+    }
+
+    fn tool_call_patch_from_transcript(
+        &self,
+        session: &Session,
+        item: &TranscriptItemRecord,
+        content: &fluent_code_app::session::model::TranscriptToolInvocationContent,
+    ) -> Option<ToolCallUpdate> {
+        let final_status = final_tool_status(content.execution_state);
+        if final_status == ToolCallStatus::Pending
+            && content.result.is_none()
+            && content.error.is_none()
+        {
+            return None;
+        }
+
+        let mut update = ToolCallUpdate::new(content.tool_call_id.clone());
+        if final_status != ToolCallStatus::Pending {
+            update.status = Some(final_status);
+        }
+
+        if let Some(result) = content.result.as_ref() {
+            update.content = Some(vec![ToolCallContent::text(result.clone())]);
+            update.raw_output = Some(json!({ "result": result }));
+            update.locations = tool_output_locations(&content.tool_name, Some(result.as_str()));
+        } else if let Some(error) = content.error.as_ref() {
+            update.content = Some(vec![ToolCallContent::text(error.clone())]);
+            update.raw_output = Some(json!({ "error": error }));
+        }
+
+        if update.locations.is_none()
+            && let Some(invocation) = self.transcript_tool_invocation(session, item)
+            && let Some(result) = invocation.result.as_deref()
+        {
+            update.locations = tool_output_locations(&content.tool_name, Some(result));
+        }
+
+        update.meta = tool_invocation_meta(self.transcript_tool_invocation(session, item));
 
         (!update.is_empty()).then_some(update)
     }
@@ -265,10 +516,10 @@ impl SessionUpdateMapper {
             .unwrap_or(true);
 
         let mut tool_call = ToolCallUpdate::new(invocation.tool_call_id.clone());
-        tool_call.title = Some(tool_title(invocation));
-        tool_call.kind = Some(tool_kind(invocation));
+        tool_call.title = Some(tool_title(&invocation.tool_name, &invocation.tool_source));
+        tool_call.kind = Some(tool_kind(&invocation.tool_name));
         tool_call.status = Some(ToolCallStatus::Pending);
-        tool_call.locations = tool_input_locations(invocation);
+        tool_call.locations = tool_input_locations(&invocation.tool_name, &invocation.arguments);
         tool_call.raw_input = Some(invocation.arguments.clone());
 
         Some(RequestPermissionRequest {
@@ -276,6 +527,59 @@ impl SessionUpdateMapper {
             tool_call,
             options: permission_options(rememberable),
         })
+    }
+
+    fn permission_request_from_transcript_item(
+        &self,
+        state: &AppState,
+        session: &Session,
+        item: &TranscriptItemRecord,
+        content: &fluent_code_app::session::model::TranscriptPermissionContent,
+    ) -> Option<RequestPermissionRequest> {
+        if content.state != TranscriptPermissionState::Pending {
+            return None;
+        }
+
+        let invocation = self.transcript_tool_invocation(session, item)?;
+        if state
+            .session
+            .pending_tool_invocation_for_batch(invocation.run_id, invocation.preceding_turn_id)
+            .map(|pending| pending.id)
+            != Some(invocation.id)
+        {
+            return None;
+        }
+
+        let rememberable = state
+            .tool_registry
+            .tool_policy(&content.tool_name)
+            .map(|policy| policy.rememberable)
+            .unwrap_or(true);
+
+        let mut tool_call = ToolCallUpdate::new(invocation.tool_call_id.clone());
+        tool_call.title = Some(tool_title(&content.tool_name, &content.tool_source));
+        tool_call.kind = Some(tool_kind(&content.tool_name));
+        tool_call.status = Some(ToolCallStatus::Pending);
+        tool_call.locations = tool_input_locations(&content.tool_name, &invocation.arguments);
+        tool_call.raw_input = Some(invocation.arguments.clone());
+
+        Some(RequestPermissionRequest {
+            session_id: state.session.id.to_string(),
+            tool_call,
+            options: permission_options(rememberable),
+        })
+    }
+
+    fn transcript_tool_invocation<'a>(
+        &self,
+        session: &'a Session,
+        item: &TranscriptItemRecord,
+    ) -> Option<&'a ToolInvocationRecord> {
+        let invocation_id = item.tool_invocation_id?;
+        session
+            .tool_invocations
+            .iter()
+            .find(|invocation| invocation.id == invocation_id)
     }
 
     pub fn terminal_stop(&self, run: &RunRecord) -> Option<TerminalStopProjection> {
@@ -297,6 +601,30 @@ impl SessionUpdateMapper {
                 TerminalStopProjection::SessionState(RunTerminalStopReason::Interrupted)
             }
         })
+    }
+}
+
+fn tool_invocation_meta(invocation: Option<&ToolInvocationRecord>) -> Option<Meta> {
+    let invocation = invocation?;
+    let mut meta = Meta::new();
+    meta.insert(
+        ACP_META_TOOL_INVOCATION_KEY.to_string(),
+        serde_json::to_value(invocation).ok()?,
+    );
+    Some(meta)
+}
+
+fn transcript_item_session_info_update(item: &TranscriptItemRecord) -> SessionInfoUpdate {
+    let mut meta = Meta::new();
+    meta.insert(
+        ACP_META_TRANSCRIPT_ITEM_KEY.to_string(),
+        serde_json::to_value(item).expect("transcript item metadata should serialize"),
+    );
+
+    SessionInfoUpdate {
+        title: None,
+        updated_at: None,
+        meta: Some(meta),
     }
 }
 
@@ -347,6 +675,7 @@ pub enum ProjectionEventPhase {
     UserMessage,
     AgentThought,
     AgentMessage,
+    SessionInfoUpdate,
     ToolCallCreate,
     ToolCallPatch,
     PermissionRequest,
@@ -362,8 +691,43 @@ fn is_valid_sequence(session: &Session, sequence: ReplaySequence) -> bool {
     sequence > 0 && sequence < session.next_replay_sequence
 }
 
-fn final_tool_status(invocation: &ToolInvocationRecord) -> ToolCallStatus {
-    match invocation.execution_state {
+fn uses_canonical_transcript_projection(session: &Session) -> bool {
+    session.transcript_fidelity == TranscriptFidelity::Exact
+        && !session.transcript_items.is_empty()
+        && session
+            .turns
+            .iter()
+            .all(|turn| turn_has_canonical_transcript_item(session, turn))
+        && session
+            .tool_invocations
+            .iter()
+            .all(|invocation| session.find_transcript_item(invocation.id).is_some())
+}
+
+fn turn_has_canonical_transcript_item(
+    session: &Session,
+    turn: &fluent_code_app::session::model::Turn,
+) -> bool {
+    match turn.role {
+        Role::Assistant => {
+            let has_reasoning_item = turn.reasoning.is_empty()
+                || session
+                    .find_transcript_item(transcript_assistant_reasoning_item_id(turn.id))
+                    .is_some();
+            let has_text_item = turn.content.is_empty()
+                || session
+                    .find_transcript_item(transcript_assistant_text_item_id(turn.id))
+                    .is_some()
+                || session.find_transcript_item(turn.id).is_some();
+
+            has_reasoning_item && has_text_item
+        }
+        Role::User | Role::System | Role::Tool => session.find_transcript_item(turn.id).is_some(),
+    }
+}
+
+fn final_tool_status(execution_state: ToolExecutionState) -> ToolCallStatus {
+    match execution_state {
         ToolExecutionState::NotStarted => ToolCallStatus::Pending,
         ToolExecutionState::Running => ToolCallStatus::InProgress,
         ToolExecutionState::Completed => ToolCallStatus::Completed,
@@ -404,22 +768,22 @@ fn permission_options(rememberable: bool) -> Vec<PermissionOption> {
     options
 }
 
-fn tool_input_locations(invocation: &ToolInvocationRecord) -> Option<Vec<ToolCallLocation>> {
-    let line = invocation
-        .arguments
+fn tool_input_locations(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Option<Vec<ToolCallLocation>> {
+    let line = arguments
         .get("offset")
         .and_then(|value| value.as_u64())
         .filter(|line| *line > 0);
 
-    match invocation.tool_name.as_str() {
-        "read" => invocation
-            .arguments
+    match tool_name {
+        "read" => arguments
             .get("path")
             .and_then(|value| value.as_str())
             .and_then(|path| absolute_tool_location(path, line))
             .map(|location| vec![location]),
-        "glob" | "grep" => invocation
-            .arguments
+        "glob" | "grep" => arguments
             .get("path")
             .and_then(|value| value.as_str())
             .and_then(|path| absolute_tool_location(path, None))
@@ -428,9 +792,9 @@ fn tool_input_locations(invocation: &ToolInvocationRecord) -> Option<Vec<ToolCal
     }
 }
 
-fn tool_output_locations(invocation: &ToolInvocationRecord) -> Option<Vec<ToolCallLocation>> {
-    let result = invocation.result.as_deref()?;
-    let mut locations = match invocation.tool_name.as_str() {
+fn tool_output_locations(tool_name: &str, result: Option<&str>) -> Option<Vec<ToolCallLocation>> {
+    let result = result?;
+    let mut locations = match tool_name {
         "read" => parse_read_output_locations(result),
         "glob" => parse_path_listing_locations(result),
         "grep" => parse_grep_output_locations(result),
@@ -505,16 +869,16 @@ fn absolute_tool_location(path: &str, line: Option<u64>) -> Option<ToolCallLocat
     })
 }
 
-fn tool_title(invocation: &ToolInvocationRecord) -> String {
-    let base_title = invocation.tool_name.replace('_', " ");
-    match &invocation.tool_source {
+fn tool_title(tool_name: &str, tool_source: &ToolSource) -> String {
+    let base_title = tool_name.replace('_', " ");
+    match tool_source {
         ToolSource::BuiltIn => base_title,
         ToolSource::Plugin { plugin_name, .. } => format!("{base_title} ({plugin_name})"),
     }
 }
 
-fn tool_kind(invocation: &ToolInvocationRecord) -> ToolKind {
-    let normalized_name = invocation.tool_name.to_ascii_lowercase();
+fn tool_kind(tool_name: &str) -> ToolKind {
+    let normalized_name = tool_name.to_ascii_lowercase();
 
     match normalized_name.as_str() {
         "read" => ToolKind::Read,
@@ -606,15 +970,16 @@ mod tests {
     use chrono::Utc;
     use fluent_code_app::app::AppState;
     use fluent_code_app::session::model::{
-        Role, RunRecord, RunStatus, Session, ToolApprovalState, ToolExecutionState,
-        ToolInvocationRecord, ToolSource, Turn,
+        Role, RunRecord, RunStatus, RunTerminalStopReason, Session, TaskDelegationRecord,
+        TaskDelegationStatus, ToolApprovalState, ToolExecutionState, ToolInvocationRecord,
+        ToolSource, TranscriptItemRecord, TranscriptPermissionState, Turn,
     };
     use serde_json::json;
     use uuid::Uuid;
 
     use super::{
-        OrderedPromptTurnEvent, ProjectionEventPhase, PromptTurnEvent, SessionUpdateMapper,
-        TerminalStopProjection,
+        ACP_META_TOOL_INVOCATION_KEY, ACP_META_TRANSCRIPT_ITEM_KEY, OrderedPromptTurnEvent,
+        ProjectionEventPhase, PromptTurnEvent, SessionUpdateMapper, TerminalStopProjection,
     };
     use crate::protocol::{
         ContentBlock, PermissionOptionKind, SessionConfigKind, SessionUpdate, StopReason,
@@ -1019,6 +1384,362 @@ mod tests {
     }
 
     #[test]
+    fn replay_projects_canonical_transcript_items_in_exact_order() {
+        let mapper = SessionUpdateMapper::new();
+        let root_run_id = Uuid::new_v4();
+        let child_run_id = Uuid::new_v4();
+        let root_assistant_turn_id = Uuid::new_v4();
+        let child_user_turn = user_turn(child_run_id, 43, "inspect child state");
+        let child_assistant_turn = assistant_turn(child_run_id, 44, "Child summary", "");
+        let now = Utc::now();
+
+        let root_user_turn = user_turn(root_run_id, 41, "inspect and delegate");
+        let root_assistant_turn =
+            assistant_turn(root_run_id, 42, "I will inspect the repo.", "plan first");
+
+        let mut pending_invocation = tool_invocation(
+            Uuid::new_v4(),
+            root_run_id,
+            ("glob-call-1", "glob"),
+            60,
+            ToolApprovalState::Pending,
+            ToolExecutionState::NotStarted,
+            (None, None),
+        );
+        pending_invocation.preceding_turn_id = Some(root_assistant_turn_id);
+        pending_invocation.arguments = json!({"pattern":"**/*.rs","path":"/tmp/project"});
+
+        let mut child_invocation = tool_invocation(
+            Uuid::new_v4(),
+            child_run_id,
+            ("read-call-2", "read"),
+            61,
+            ToolApprovalState::Approved,
+            ToolExecutionState::Completed,
+            (Some("<path>/tmp/child.txt</path>\n1: child output"), None),
+        );
+        child_invocation.preceding_turn_id = Some(child_assistant_turn.id);
+        child_invocation.arguments = json!({"path":"/tmp/child.txt"});
+
+        let mut session = Session::new("exact canonical projection");
+        session.runs = vec![
+            RunRecord {
+                id: root_run_id,
+                status: RunStatus::InProgress,
+                parent_run_id: None,
+                parent_tool_invocation_id: None,
+                created_sequence: 80,
+                terminal_sequence: None,
+                terminal_stop_reason: None,
+                created_at: now,
+                updated_at: now,
+            },
+            RunRecord {
+                id: child_run_id,
+                status: RunStatus::InProgress,
+                parent_run_id: Some(root_run_id),
+                parent_tool_invocation_id: Some(pending_invocation.id),
+                created_sequence: 90,
+                terminal_sequence: None,
+                terminal_stop_reason: None,
+                created_at: now,
+                updated_at: now,
+            },
+        ];
+        session.turns = vec![
+            root_user_turn.clone(),
+            Turn {
+                id: root_assistant_turn_id,
+                ..root_assistant_turn.clone()
+            },
+            child_user_turn.clone(),
+            child_assistant_turn.clone(),
+        ];
+        session.tool_invocations = vec![pending_invocation.clone(), child_invocation.clone()];
+        session.transcript_items = vec![
+            TranscriptItemRecord::from_turn(&Turn {
+                sequence_number: 1,
+                ..root_user_turn.clone()
+            }),
+            TranscriptItemRecord::assistant_reasoning(
+                root_run_id,
+                root_assistant_turn_id,
+                2,
+                "plan first",
+                fluent_code_app::session::model::TranscriptStreamState::Committed,
+            ),
+            TranscriptItemRecord::assistant_text(
+                root_run_id,
+                root_assistant_turn_id,
+                3,
+                "I will inspect the repo.",
+                fluent_code_app::session::model::TranscriptStreamState::Committed,
+            ),
+            TranscriptItemRecord::from_tool_invocation(&ToolInvocationRecord {
+                sequence_number: 4,
+                ..pending_invocation.clone()
+            }),
+            TranscriptItemRecord::permission(
+                &pending_invocation,
+                5,
+                TranscriptPermissionState::Pending,
+                None,
+            ),
+            TranscriptItemRecord::from_turn(&Turn {
+                sequence_number: 6,
+                ..child_user_turn.clone()
+            }),
+            TranscriptItemRecord::from_turn(&Turn {
+                sequence_number: 7,
+                ..child_assistant_turn.clone()
+            }),
+            TranscriptItemRecord::from_tool_invocation(&ToolInvocationRecord {
+                sequence_number: 8,
+                ..child_invocation.clone()
+            }),
+        ];
+        session.next_replay_sequence = 100;
+        session.rebuild_run_indexes();
+
+        let state = AppState::new(session);
+        let projection = mapper.project_prompt_turn(&state, root_run_id).unwrap();
+
+        assert_eq!(
+            projection
+                .events
+                .iter()
+                .map(event_signature)
+                .collect::<Vec<_>>(),
+            vec![
+                (1, ProjectionEventPhase::UserMessage, "session_update"),
+                (2, ProjectionEventPhase::AgentThought, "session_update"),
+                (3, ProjectionEventPhase::AgentMessage, "session_update"),
+                (4, ProjectionEventPhase::ToolCallCreate, "session_update"),
+                (
+                    5,
+                    ProjectionEventPhase::PermissionRequest,
+                    "permission_request"
+                ),
+                (6, ProjectionEventPhase::UserMessage, "session_update"),
+                (7, ProjectionEventPhase::AgentMessage, "session_update"),
+                (8, ProjectionEventPhase::ToolCallCreate, "session_update"),
+                (8, ProjectionEventPhase::ToolCallPatch, "session_update"),
+            ]
+        );
+
+        match &projection.events[4].event {
+            PromptTurnEvent::PermissionRequest(request) => {
+                assert_eq!(request.tool_call.tool_call_id, "glob-call-1");
+                assert_eq!(
+                    request.tool_call.locations.as_ref().unwrap()[0].path,
+                    "/tmp/project"
+                );
+            }
+            other => panic!("expected permission request, got {other:?}"),
+        }
+
+        match &projection.events[8].event {
+            PromptTurnEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(update)) => {
+                assert_eq!(update.tool_call_id, "read-call-2");
+                assert_eq!(update.status, Some(ToolCallStatus::Completed));
+                assert_eq!(update.locations.as_ref().unwrap()[0].path, "/tmp/child.txt");
+            }
+            other => panic!("expected child tool patch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonical_replay_contract_orders_thought_text_tool_permission_events() {
+        let mapper = SessionUpdateMapper::new();
+        let root_run_id = Uuid::new_v4();
+        let child_run_id = Uuid::new_v4();
+        let root_assistant_turn_id = Uuid::new_v4();
+        let child_assistant_turn_id = Uuid::new_v4();
+        let task_invocation_id = Uuid::new_v4();
+        let now = Utc::now();
+        let mut session = Session::new("canonical replay contract");
+
+        session.runs = vec![
+            RunRecord {
+                id: root_run_id,
+                status: RunStatus::InProgress,
+                parent_run_id: None,
+                parent_tool_invocation_id: None,
+                created_sequence: 2,
+                terminal_sequence: None,
+                terminal_stop_reason: None,
+                created_at: now,
+                updated_at: now,
+            },
+            RunRecord {
+                id: child_run_id,
+                status: RunStatus::InProgress,
+                parent_run_id: Some(root_run_id),
+                parent_tool_invocation_id: Some(task_invocation_id),
+                created_sequence: 6,
+                terminal_sequence: None,
+                terminal_stop_reason: None,
+                created_at: now,
+                updated_at: now,
+            },
+        ];
+        session.turns = vec![
+            user_turn(root_run_id, 1, "delegate and inspect"),
+            Turn {
+                id: root_assistant_turn_id,
+                run_id: root_run_id,
+                role: Role::Assistant,
+                content: "I will inspect the repo and delegate follow-up work.".to_string(),
+                reasoning: "first think".to_string(),
+                sequence_number: 3,
+                timestamp: now,
+            },
+            user_turn(child_run_id, 6, "Inspect delegated child state"),
+            Turn {
+                id: child_assistant_turn_id,
+                run_id: child_run_id,
+                role: Role::Assistant,
+                content: "Delegated child summary".to_string(),
+                reasoning: "child thinks".to_string(),
+                sequence_number: 7,
+                timestamp: now,
+            },
+            Turn {
+                id: Uuid::new_v4(),
+                run_id: root_run_id,
+                role: Role::Assistant,
+                content: "Final answer after permission".to_string(),
+                reasoning: String::new(),
+                sequence_number: 10,
+                timestamp: now,
+            },
+        ];
+
+        let mut completed_read = tool_invocation(
+            Uuid::new_v4(),
+            root_run_id,
+            ("read-call-1", "read"),
+            4,
+            ToolApprovalState::Approved,
+            ToolExecutionState::Completed,
+            (Some("root output"), None),
+        );
+        completed_read.preceding_turn_id = Some(root_assistant_turn_id);
+        completed_read.arguments = json!({"path":"/tmp/root.txt"});
+
+        let mut delegated_task = tool_invocation(
+            task_invocation_id,
+            root_run_id,
+            ("task-call-1", "task"),
+            5,
+            ToolApprovalState::Approved,
+            ToolExecutionState::Running,
+            (None, None),
+        );
+        delegated_task.preceding_turn_id = Some(root_assistant_turn_id);
+        delegated_task.arguments =
+            json!({"agent":"explore","prompt":"Inspect delegated child state"});
+        delegated_task.delegation = Some(TaskDelegationRecord {
+            child_run_id: Some(child_run_id),
+            agent_name: Some("explore".to_string()),
+            prompt: Some("Inspect delegated child state".to_string()),
+            status: TaskDelegationStatus::Running,
+        });
+
+        let mut child_read = tool_invocation(
+            Uuid::new_v4(),
+            child_run_id,
+            ("read-call-2", "read"),
+            8,
+            ToolApprovalState::Approved,
+            ToolExecutionState::Completed,
+            (Some("child output"), None),
+        );
+        child_read.preceding_turn_id = Some(child_assistant_turn_id);
+        child_read.arguments = json!({"path":"/tmp/child.txt"});
+
+        let mut pending_permission = tool_invocation(
+            Uuid::new_v4(),
+            root_run_id,
+            ("glob-call-3", "glob"),
+            9,
+            ToolApprovalState::Pending,
+            ToolExecutionState::NotStarted,
+            (None, None),
+        );
+        pending_permission.preceding_turn_id = Some(root_assistant_turn_id);
+        pending_permission.arguments = json!({"pattern":"**/*.rs","path":"/tmp/project"});
+
+        session.tool_invocations = vec![
+            completed_read,
+            delegated_task,
+            child_read,
+            pending_permission,
+        ];
+        session.next_replay_sequence = 11;
+        session.rebuild_run_indexes();
+
+        let state = AppState::new(session);
+        let projection = mapper.project_prompt_turn(&state, root_run_id).unwrap();
+
+        assert!(mapper.project_prompt_turn(&state, child_run_id).is_none());
+        assert_eq!(
+            projection
+                .events
+                .iter()
+                .map(event_signature)
+                .collect::<Vec<_>>(),
+            vec![
+                (1, ProjectionEventPhase::UserMessage, "session_update"),
+                (3, ProjectionEventPhase::AgentThought, "session_update"),
+                (3, ProjectionEventPhase::AgentMessage, "session_update"),
+                (4, ProjectionEventPhase::ToolCallCreate, "session_update"),
+                (4, ProjectionEventPhase::ToolCallPatch, "session_update"),
+                (5, ProjectionEventPhase::ToolCallCreate, "session_update"),
+                (5, ProjectionEventPhase::ToolCallPatch, "session_update"),
+                (6, ProjectionEventPhase::UserMessage, "session_update"),
+                (7, ProjectionEventPhase::AgentThought, "session_update"),
+                (7, ProjectionEventPhase::AgentMessage, "session_update"),
+                (8, ProjectionEventPhase::ToolCallCreate, "session_update"),
+                (8, ProjectionEventPhase::ToolCallPatch, "session_update"),
+                (9, ProjectionEventPhase::ToolCallCreate, "session_update"),
+                (
+                    9,
+                    ProjectionEventPhase::PermissionRequest,
+                    "permission_request"
+                ),
+                (10, ProjectionEventPhase::AgentMessage, "session_update"),
+            ]
+        );
+
+        match &projection.events[6].event {
+            PromptTurnEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(update)) => {
+                assert_eq!(update.tool_call_id, "task-call-1");
+                assert_eq!(update.status, Some(ToolCallStatus::InProgress));
+            }
+            other => panic!("expected delegated task patch, got {other:?}"),
+        }
+
+        match &projection.events[13].event {
+            PromptTurnEvent::PermissionRequest(request) => {
+                assert_eq!(request.tool_call.tool_call_id, "glob-call-3");
+                assert_eq!(request.tool_call.kind, Some(ToolKind::Search));
+            }
+            other => panic!("expected permission request, got {other:?}"),
+        }
+
+        match &projection.events[14].event {
+            PromptTurnEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(chunk)) => {
+                assert_eq!(
+                    chunk.content,
+                    ContentBlock::text("Final answer after permission")
+                );
+            }
+            other => panic!("expected final assistant message, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn project_prompt_turns_orders_root_runs_by_durable_run_sequence() {
         let mapper = SessionUpdateMapper::new();
         let first_run_id = Uuid::new_v4();
@@ -1383,6 +2104,126 @@ mod tests {
         );
         assert!(mapper.project_prompt_turn(&state, cycle_a_run_id).is_none());
         assert!(mapper.project_prompt_turn(&state, cycle_b_run_id).is_none());
+    }
+
+    #[test]
+    fn canonical_projection_preserves_tool_and_marker_metadata_extensions() {
+        let mapper = SessionUpdateMapper::new();
+        let root_run_id = Uuid::new_v4();
+        let child_run_id = Uuid::new_v4();
+        let task_invocation_id = Uuid::new_v4();
+        let now = Utc::now();
+        let mut session = Session::new("canonical metadata projection");
+        let mut task_invocation = tool_invocation(
+            task_invocation_id,
+            root_run_id,
+            ("task-call-1", "task"),
+            1,
+            ToolApprovalState::Approved,
+            ToolExecutionState::Running,
+            (None, None),
+        );
+        task_invocation.arguments =
+            json!({"agent":"explore","prompt":"Inspect delegated child state"});
+        task_invocation.delegation = Some(TaskDelegationRecord {
+            child_run_id: Some(child_run_id),
+            agent_name: Some("explore".to_string()),
+            prompt: Some("Inspect delegated child state".to_string()),
+            status: TaskDelegationStatus::Running,
+        });
+
+        let root_run = RunRecord {
+            id: root_run_id,
+            status: RunStatus::Failed,
+            parent_run_id: None,
+            parent_tool_invocation_id: None,
+            created_sequence: 1,
+            terminal_sequence: Some(3),
+            terminal_stop_reason: Some(RunTerminalStopReason::Interrupted),
+            created_at: now,
+            updated_at: now,
+        };
+
+        session.runs = vec![
+            root_run.clone(),
+            RunRecord {
+                id: child_run_id,
+                status: RunStatus::InProgress,
+                parent_run_id: Some(root_run_id),
+                parent_tool_invocation_id: Some(task_invocation_id),
+                created_sequence: 2,
+                terminal_sequence: None,
+                terminal_stop_reason: None,
+                created_at: now,
+                updated_at: now,
+            },
+        ];
+        session.tool_invocations = vec![task_invocation.clone()];
+        session.transcript_items = vec![
+            TranscriptItemRecord::from_tool_invocation(&task_invocation),
+            TranscriptItemRecord::delegated_child(&task_invocation, 2),
+            TranscriptItemRecord::run_terminal(&root_run),
+            TranscriptItemRecord::marker(
+                root_run_id,
+                4,
+                "interrupted",
+                Some("startup recovery failed closed".to_string()),
+                None,
+                None,
+            ),
+        ];
+        session.next_replay_sequence = 5;
+        session.rebuild_run_indexes();
+
+        let state = AppState::new(session);
+        let projection = mapper.project_prompt_turn(&state, root_run_id).unwrap();
+
+        match &projection.events[0].event {
+            PromptTurnEvent::SessionUpdate(SessionUpdate::ToolCall(tool_call)) => {
+                assert_eq!(tool_call.tool_call_id, "task-call-1");
+                assert_eq!(
+                    tool_call
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get(ACP_META_TOOL_INVOCATION_KEY))
+                        .and_then(|value| value.get("delegation"))
+                        .and_then(|value| value.get("agent_name"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("explore")
+                );
+            }
+            other => panic!("expected tool call metadata, got {other:?}"),
+        }
+
+        assert_eq!(
+            projection
+                .events
+                .iter()
+                .skip(1)
+                .map(event_signature)
+                .collect::<Vec<_>>(),
+            vec![
+                (1, ProjectionEventPhase::ToolCallPatch, "session_update"),
+                (2, ProjectionEventPhase::SessionInfoUpdate, "session_update"),
+                (3, ProjectionEventPhase::SessionInfoUpdate, "session_update"),
+                (4, ProjectionEventPhase::SessionInfoUpdate, "session_update"),
+            ]
+        );
+
+        match &projection.events[2].event {
+            PromptTurnEvent::SessionUpdate(SessionUpdate::SessionInfoUpdate(update)) => {
+                assert_eq!(
+                    update
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get(ACP_META_TRANSCRIPT_ITEM_KEY))
+                        .and_then(|value| value.get("kind"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("delegated_child")
+                );
+            }
+            other => panic!("expected delegated child metadata update, got {other:?}"),
+        }
     }
 
     fn event_signature(

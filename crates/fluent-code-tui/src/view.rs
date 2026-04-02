@@ -8,8 +8,8 @@ use ratatui::{
 };
 
 use crate::conversation::{
-    ConversationRow, ReasoningRow, RunMarkerKind, RunMarkerRow, ToolGroupKind, ToolGroupRow,
-    ToolRow, TurnRow, derive_conversation_rows,
+    ConversationRow, DerivedHistoryCells, ReasoningRow, RunMarkerKind, RunMarkerRow, ToolGroupKind,
+    ToolGroupRow, ToolRow, TurnRow, derive_history_cells,
 };
 use crate::markdown_render::{render_markdown_lines, render_streaming_markdown_lines};
 use crate::theme::TUI_THEME;
@@ -30,11 +30,12 @@ const RUN_MARKER_PREFIX: &str = "  ● ";
 
 pub fn render(frame: &mut Frame, state: &AppState, ui_state: &UiState) {
     let (status_area, transcript_area, input_area, footer_area) = shell_areas(frame.area());
+    let history_cells = derive_history_cells(state);
 
     render_status_bar(frame, status_area, state);
-    render_transcript(frame, transcript_area, state, ui_state);
+    render_transcript(frame, transcript_area, &history_cells, ui_state);
     render_input(frame, input_area, state);
-    render_footer(frame, footer_area, state, ui_state);
+    render_footer(frame, footer_area, state, &history_cells, ui_state);
 
     if ui_state.show_help_overlay {
         render_help_overlay(frame, frame.area());
@@ -120,8 +121,13 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 // Conversation transcript (full-width, no sidebar)
 // ---------------------------------------------------------------------------
 
-fn render_transcript(frame: &mut Frame, area: Rect, state: &AppState, ui_state: &UiState) {
-    let lines = conversation_lines(state, ui_state.show_tool_details);
+fn render_transcript(
+    frame: &mut Frame,
+    area: Rect,
+    history_cells: &DerivedHistoryCells,
+    ui_state: &UiState,
+) {
+    let lines = conversation_lines_from_cells(history_cells, ui_state.show_tool_details);
     let transcript_scroll = resolve_transcript_scroll(
         &lines,
         area.width,
@@ -164,8 +170,15 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState) {
 // Footer
 // ---------------------------------------------------------------------------
 
-fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, ui_state: &UiState) {
-    let footer = Paragraph::new(footer_text(state, ui_state)).style(TUI_THEME.text_muted);
+fn render_footer(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    history_cells: &DerivedHistoryCells,
+    ui_state: &UiState,
+) {
+    let footer =
+        Paragraph::new(footer_text(state, history_cells, ui_state)).style(TUI_THEME.text_muted);
     frame.render_widget(footer, area);
 }
 
@@ -205,8 +218,17 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
 // Conversation line generation
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub(crate) fn conversation_lines(state: &AppState, show_tool_details: bool) -> Vec<Line<'static>> {
-    let rows = derive_conversation_rows(state);
+    let history_cells = derive_history_cells(state);
+    conversation_lines_from_cells(&history_cells, show_tool_details)
+}
+
+pub(crate) fn conversation_lines_from_cells(
+    history_cells: &DerivedHistoryCells,
+    show_tool_details: bool,
+) -> Vec<Line<'static>> {
+    let rows = history_cells.iter_rows().collect::<Vec<_>>();
 
     if rows.is_empty() {
         return vec![
@@ -219,7 +241,7 @@ pub(crate) fn conversation_lines(state: &AppState, show_tool_details: bool) -> V
     }
 
     let mut lines = Vec::new();
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in rows.into_iter().enumerate() {
         if i > 0 {
             lines.push(Line::default());
         }
@@ -521,7 +543,7 @@ struct ActiveRunContext {
     task_label: Option<String>,
 }
 
-fn active_run_context(state: &AppState) -> ActiveRunContext {
+fn active_run_context(state: &AppState, history_cells: &DerivedHistoryCells) -> ActiveRunContext {
     let Some(active_run_id) = state.active_run_id else {
         return ActiveRunContext {
             focus_label: "main session".to_string(),
@@ -532,20 +554,10 @@ fn active_run_context(state: &AppState) -> ActiveRunContext {
         };
     };
 
-    let delegated_task = state
-        .session
-        .tool_invocations
-        .iter()
-        .find(|invocation| {
-            invocation.tool_name == "task" && invocation.child_run_id() == Some(active_run_id)
-        })
-        .and_then(|invocation| {
-            crate::conversation::derive_tool_row(&state.session, invocation).delegated_task
-        });
-
-    if let Some(delegated_task) = delegated_task {
+    if let Some(delegated_task) = history_cells.delegated_task_for_child(active_run_id) {
         let agent_name = delegated_task
             .agent_name
+            .clone()
             .unwrap_or_else(|| "subagent".to_string());
         return ActiveRunContext {
             focus_label: format!("child subagent · {agent_name}"),
@@ -631,8 +643,12 @@ fn status_style(status: &AppStatus) -> ratatui::style::Style {
 // Footer text
 // ---------------------------------------------------------------------------
 
-fn footer_text_with_ui(state: &AppState, show_tool_details: bool) -> String {
-    let active_context = active_run_context(state);
+fn footer_text_with_ui(
+    state: &AppState,
+    history_cells: &DerivedHistoryCells,
+    show_tool_details: bool,
+) -> String {
+    let active_context = active_run_context(state, history_cells);
     let run_hint = if active_context.focus_label == "main session" {
         None
     } else {
@@ -689,8 +705,12 @@ fn footer_text_with_ui(state: &AppState, show_tool_details: bool) -> String {
     }
 }
 
-fn footer_text(state: &AppState, ui_state: &UiState) -> String {
-    footer_text_with_ui(state, ui_state.show_tool_details)
+fn footer_text(
+    state: &AppState,
+    history_cells: &DerivedHistoryCells,
+    ui_state: &UiState,
+) -> String {
+    footer_text_with_ui(state, history_cells, ui_state.show_tool_details)
 }
 
 // ---------------------------------------------------------------------------
@@ -967,7 +987,7 @@ pub(crate) fn transcript_max_scroll(lines: &[Line<'_>], area_width: u16, area_he
     wrapped_line_count.saturating_sub(visible_height) as u16
 }
 
-fn resolve_transcript_scroll(
+pub(crate) fn resolve_transcript_scroll(
     lines: &[Line<'_>],
     area_width: u16,
     area_height: u16,
@@ -1019,6 +1039,7 @@ mod tests {
         active_run_context, conversation_lines, footer_text_with_ui, resolve_transcript_scroll,
         shell_areas, summarize_text, transcript_area, transcript_max_scroll,
     };
+    use crate::conversation::derive_history_cells;
     use fluent_code_app::app::AppState;
     use fluent_code_app::plugin::{DiscoveryScope, LoadedPluginMetadata, PluginLoadSnapshot};
     use fluent_code_app::session::model::{
@@ -1095,9 +1116,10 @@ mod tests {
     #[test]
     fn footer_text_reports_tool_detail_mode() {
         let state = AppState::new(Session::new("ui state test"));
+        let history_cells = derive_history_cells(&state);
 
-        assert!(footer_text_with_ui(&state, false).contains("compact"));
-        assert!(footer_text_with_ui(&state, true).contains("expanded"));
+        assert!(footer_text_with_ui(&state, &history_cells, false).contains("compact"));
+        assert!(footer_text_with_ui(&state, &history_cells, true).contains("expanded"));
     }
 
     #[test]
@@ -1105,8 +1127,9 @@ mod tests {
         let (mut state, _parent_run_id, child_run_id) = delegated_child_state();
         state.active_run_id = Some(child_run_id);
         state.status = fluent_code_app::app::AppStatus::Generating;
+        let history_cells = derive_history_cells(&state);
 
-        let text = footer_text_with_ui(&state, false);
+        let text = footer_text_with_ui(&state, &history_cells, false);
 
         assert!(text.contains("Generating"));
         assert!(text.contains("child subagent · explore"));
@@ -2052,8 +2075,9 @@ mod tests {
         let (mut state, _parent_run_id, child_run_id) = delegated_child_state();
         state.active_run_id = Some(child_run_id);
         state.status = fluent_code_app::app::AppStatus::Generating;
+        let history_cells = derive_history_cells(&state);
 
-        let context = active_run_context(&state);
+        let context = active_run_context(&state, &history_cells);
         let expected_active_label = format!("child {}", summarize_text(&child_run_id.to_string()));
 
         assert_eq!(context.focus_label, "child subagent · explore");

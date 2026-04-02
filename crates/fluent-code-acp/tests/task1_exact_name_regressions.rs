@@ -3,22 +3,15 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
-fn replay_projects_canonical_transcript_items_in_exact_order() {
+fn canonical_replay_contract_orders_thought_text_tool_permission_events() {
     run_exact_acp_libtest(
-        "mapping::tests::replay_projects_canonical_transcript_items_in_exact_order",
-    );
-}
-
-#[test]
-fn replay_preserves_permission_and_tool_boundaries_from_canonical_items() {
-    run_exact_acp_libtest(
-        "server::tests::replay_preserves_permission_and_tool_boundaries_from_canonical_items",
+        "mapping::tests::canonical_replay_contract_orders_thought_text_tool_permission_events",
     );
 }
 
 fn run_exact_acp_libtest(module_qualified_test_name: &str) {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let isolated_target_dir = unique_temp_dir("fluent-code-acp-task4-exact-wrapper");
+    let isolated_target_dir = unique_temp_dir("fluent-code-acp-task1-exact-wrapper");
     let output = Command::new(cargo)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("CARGO_TARGET_DIR", &isolated_target_dir)

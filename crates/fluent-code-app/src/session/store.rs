@@ -2,14 +2,19 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::error::{FluentCodeError, Result};
 use crate::logging::path_for_log;
 use crate::session::model::{
-    ForegroundOwnerRecord, RunRecord, Session, SessionId, ToolInvocationRecord, Turn,
+    ForegroundOwnerRecord, RunRecord, Session, SessionId, ToolInvocationRecord, TranscriptFidelity,
+    TranscriptItemRecord, Turn,
 };
+
+const LEGACY_SESSION_FORMAT_VERSION: u32 = 1;
+const CANONICAL_TRANSCRIPT_SESSION_FORMAT_VERSION: u32 = 2;
 
 pub trait SessionStore {
     fn create(&self, session: &Session) -> Result<()>;
@@ -103,6 +108,10 @@ impl FsSessionStore {
         self.session_dir(id).join("turns.jsonl")
     }
 
+    fn transcript_items_path(&self, id: &SessionId) -> PathBuf {
+        self.session_dir(id).join("transcript_items.jsonl")
+    }
+
     fn write_latest_session_id(&self, id: &SessionId) -> Result<()> {
         fs::write(self.latest_session_path(), id.to_string())?;
         debug!(
@@ -131,14 +140,17 @@ impl FsSessionStore {
         Ok(Some(id))
     }
 
-    fn read_turns(&self, path: &Path) -> Result<Vec<Turn>> {
+    fn read_jsonl<T>(&self, path: &Path) -> Result<Vec<T>>
+    where
+        T: DeserializeOwned,
+    {
         if !path.exists() {
             return Ok(Vec::new());
         }
 
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        let mut turns = Vec::new();
+        let mut rows = Vec::new();
 
         for line in reader.lines() {
             let line = line?;
@@ -146,10 +158,30 @@ impl FsSessionStore {
                 continue;
             }
 
-            turns.push(serde_json::from_str(&line)?);
+            rows.push(serde_json::from_str(&line)?);
         }
 
-        Ok(turns)
+        Ok(rows)
+    }
+
+    fn read_turns(&self, path: &Path) -> Result<Vec<Turn>> {
+        self.read_jsonl(path)
+    }
+
+    fn read_transcript_items(&self, path: &Path) -> Result<Vec<TranscriptItemRecord>> {
+        self.read_jsonl(path)
+    }
+
+    fn write_jsonl<T>(&self, path: &Path, items: &[T]) -> Result<()>
+    where
+        T: Serialize,
+    {
+        let mut file = File::create(path)?;
+        for item in items {
+            writeln!(file, "{}", serde_json::to_string(item)?)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -176,6 +208,15 @@ impl SessionStore for FsSessionStore {
 
         let metadata: SessionMetadata = serde_json::from_str(&fs::read_to_string(meta_path)?)?;
         let turns = self.read_turns(&self.turns_path(id))?;
+        let transcript_items_path = self.transcript_items_path(id);
+        let has_exact_transcript_items = metadata.session_format_version
+            >= CANONICAL_TRANSCRIPT_SESSION_FORMAT_VERSION
+            && transcript_items_path.exists();
+        let transcript_items = if has_exact_transcript_items {
+            self.read_transcript_items(&transcript_items_path)?
+        } else {
+            Vec::new()
+        };
 
         let mut session = Session::new(metadata.title);
         session.id = metadata.id;
@@ -183,15 +224,27 @@ impl SessionStore for FsSessionStore {
         session.updated_at = metadata.updated_at;
         session.next_replay_sequence = metadata.next_replay_sequence;
         session.permissions = metadata.permissions;
+        session.transcript_fidelity = if has_exact_transcript_items {
+            metadata.transcript_fidelity
+        } else {
+            TranscriptFidelity::Approximate
+        };
+        session.transcript_items = transcript_items;
         session.runs = metadata.runs;
         session.turns = turns;
         session.tool_invocations = metadata.tool_invocations;
         session.foreground_owner = metadata.foreground_owner;
         session.normalize_persistence();
+        if !has_exact_transcript_items || session.requires_approximate_transcript_synthesis() {
+            session.synthesize_approximate_transcript_items();
+            session.normalize_persistence();
+        }
 
         info!(
             session_id = %session.id,
             session_title = %session.title,
+            transcript_fidelity = ?session.transcript_fidelity,
+            transcript_item_count = session.transcript_items.len(),
             turn_count = session.turns.len(),
             run_count = session.runs.len(),
             tool_invocation_count = session.tool_invocations.len(),
@@ -205,27 +258,40 @@ impl SessionStore for FsSessionStore {
         self.ensure_root()?;
         fs::create_dir_all(self.session_dir(&session.id))?;
 
-        let metadata = SessionMetadata::from(session);
+        let mut persisted_session = session.clone();
+        persisted_session.normalize_persistence();
+        if persisted_session.requires_approximate_transcript_synthesis() {
+            persisted_session.synthesize_approximate_transcript_items();
+            persisted_session.normalize_persistence();
+        }
+
+        let metadata = SessionMetadata::from(&persisted_session);
         fs::write(
-            self.session_meta_path(&session.id),
+            self.session_meta_path(&persisted_session.id),
             serde_json::to_vec_pretty(&metadata)?,
         )?;
 
-        let mut turns_file = File::create(self.turns_path(&session.id))?;
-        for turn in &session.turns {
-            writeln!(turns_file, "{}", serde_json::to_string(turn)?)?;
-        }
+        self.write_jsonl(
+            &self.turns_path(&persisted_session.id),
+            &persisted_session.turns,
+        )?;
+        self.write_jsonl(
+            &self.transcript_items_path(&persisted_session.id),
+            &persisted_session.transcript_items,
+        )?;
 
         info!(
-            session_id = %session.id,
-            session_title = %session.title,
-            turn_count = session.turns.len(),
-            run_count = session.runs.len(),
-            tool_invocation_count = session.tool_invocations.len(),
+            session_id = %persisted_session.id,
+            session_title = %persisted_session.title,
+            transcript_fidelity = ?persisted_session.transcript_fidelity,
+            transcript_item_count = persisted_session.transcript_items.len(),
+            turn_count = persisted_session.turns.len(),
+            run_count = persisted_session.runs.len(),
+            tool_invocation_count = persisted_session.tool_invocations.len(),
             "saved session snapshot"
         );
 
-        self.write_latest_session_id(&session.id)
+        self.write_latest_session_id(&persisted_session.id)
     }
 
     fn append_turn(&self, session_id: &SessionId, turn: &Turn) -> Result<()> {
@@ -254,10 +320,14 @@ struct SessionMetadata {
     title: String,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default = "default_session_format_version")]
+    session_format_version: u32,
     #[serde(default)]
     next_replay_sequence: crate::session::model::ReplaySequence,
     #[serde(default)]
     permissions: crate::session::model::SessionPermissionState,
+    #[serde(default)]
+    transcript_fidelity: TranscriptFidelity,
     #[serde(default)]
     runs: Vec<RunRecord>,
     #[serde(default)]
@@ -273,13 +343,19 @@ impl From<&Session> for SessionMetadata {
             title: session.title.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
+            session_format_version: CANONICAL_TRANSCRIPT_SESSION_FORMAT_VERSION,
             next_replay_sequence: session.next_replay_sequence,
             permissions: session.permissions.clone(),
+            transcript_fidelity: session.transcript_fidelity,
             runs: session.runs.clone(),
             tool_invocations: session.tool_invocations.clone(),
             foreground_owner: session.foreground_owner.clone(),
         }
     }
+}
+
+const fn default_session_format_version() -> u32 {
+    LEGACY_SESSION_FORMAT_VERSION
 }
 
 #[cfg(test)]
@@ -295,7 +371,9 @@ mod tests {
     use crate::session::model::{
         ForegroundOwnerRecord, ForegroundPhase, Role, RunStatus, RunTerminalStopReason, Session,
         TaskDelegationRecord, TaskDelegationStatus, ToolApprovalState, ToolExecutionState,
-        ToolInvocationRecord, ToolSource, Turn,
+        ToolInvocationRecord, ToolSource, TranscriptFidelity, TranscriptItemContent,
+        TranscriptItemKind, TranscriptItemRecord, TranscriptRunLifecycleContent,
+        TranscriptRunLifecycleEvent, TranscriptStreamState, TranscriptTurnContent, Turn,
     };
 
     #[test]
@@ -427,6 +505,8 @@ mod tests {
         assert!(loaded.runs.is_empty());
         assert!(loaded.turns.is_empty());
         assert!(loaded.tool_invocations.is_empty());
+        assert_eq!(loaded.transcript_fidelity, TranscriptFidelity::Approximate);
+        assert!(loaded.transcript_items.is_empty());
 
         cleanup(root);
     }
@@ -581,6 +661,288 @@ mod tests {
         assert_eq!(delegation.agent_name.as_deref(), Some("explore"));
         assert_eq!(delegation.prompt.as_deref(), Some("Inspect state"));
         assert_eq!(delegation.status, TaskDelegationStatus::Running);
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn legacy_session_synthesis_marks_approximate_fidelity() {
+        assert_legacy_transcript_items_are_approximate();
+    }
+
+    #[test]
+    fn transcript_items_synthesize_legacy_sessions_as_approximate() {
+        assert_legacy_transcript_items_are_approximate();
+    }
+
+    fn assert_legacy_transcript_items_are_approximate() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+        let session = Session::new("legacy synthesized replay");
+        let session_dir = root.join("sessions").join(session.id.to_string());
+        let run_id = Uuid::new_v4();
+        let assistant_turn_id = Uuid::new_v4();
+
+        std::fs::create_dir_all(&session_dir).expect("create legacy synthesized session dir");
+        std::fs::write(
+            session_dir.join("session.json"),
+            serde_json::json!({
+                "id": session.id,
+                "title": session.title,
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:04Z",
+                "permissions": { "rules": [] },
+                "runs": [
+                    {
+                        "id": run_id,
+                        "status": "Completed",
+                        "created_at": "2024-01-01T00:00:00Z",
+                        "updated_at": "2024-01-01T00:00:04Z"
+                    }
+                ],
+                "tool_invocations": [
+                    {
+                        "id": Uuid::new_v4(),
+                        "run_id": run_id,
+                        "tool_call_id": "read-call-1",
+                        "tool_name": "read",
+                        "tool_source": "built_in",
+                        "arguments": { "path": "/tmp/legacy.txt" },
+                        "preceding_turn_id": assistant_turn_id,
+                        "approval_state": "approved",
+                        "execution_state": "completed",
+                        "result": "legacy read output",
+                        "error": null,
+                        "requested_at": "2024-01-01T00:00:02Z",
+                        "approved_at": "2024-01-01T00:00:02Z",
+                        "completed_at": "2024-01-01T00:00:03Z"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write legacy synthesized metadata");
+        std::fs::write(
+            session_dir.join("turns.jsonl"),
+            format!(
+                concat!(
+                    "{{",
+                    "\"id\":\"{}\",",
+                    "\"run_id\":\"{}\",",
+                    "\"role\":\"User\",",
+                    "\"content\":\"legacy prompt\",",
+                    "\"timestamp\":\"2024-01-01T00:00:01Z\"",
+                    "}}\n",
+                    "{{",
+                    "\"id\":\"{}\",",
+                    "\"run_id\":\"{}\",",
+                    "\"role\":\"Assistant\",",
+                    "\"content\":\"legacy answer\",",
+                    "\"timestamp\":\"2024-01-01T00:00:03Z\"",
+                    "}}\n"
+                ),
+                Uuid::new_v4(),
+                run_id,
+                assistant_turn_id,
+                run_id,
+            ),
+        )
+        .expect("write legacy synthesized turns");
+
+        let loaded = store
+            .load(&session.id)
+            .expect("load legacy synthesized session");
+        let ordered_items = characterize_transcript_items(&loaded.transcript_items);
+
+        assert_eq!(loaded.transcript_fidelity, TranscriptFidelity::Approximate);
+        assert_eq!(
+            ordered_items,
+            vec![
+                (1, "run:created".to_string()),
+                (2, "turn:user:legacy prompt".to_string()),
+                (3, "tool:read:completed".to_string()),
+                (4, "turn:assistant:legacy answer".to_string()),
+                (5, "run:terminal:completed".to_string()),
+            ]
+        );
+        assert_eq!(loaded.next_replay_sequence, 6);
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn transcript_items_round_trip_exact_sessions() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+
+        let mut session = Session::new("exact transcript items");
+        let run_id = Uuid::new_v4();
+        let user_turn_id = Uuid::new_v4();
+        let tool_invocation_id = Uuid::new_v4();
+
+        session.upsert_run(run_id, RunStatus::InProgress);
+        session.transcript_items = vec![
+            TranscriptItemRecord {
+                item_id: Uuid::new_v4(),
+                sequence_number: 1,
+                run_id,
+                kind: TranscriptItemKind::RunLifecycle,
+                stream_state: TranscriptStreamState::Committed,
+                turn_id: None,
+                tool_invocation_id: None,
+                parent_item_id: None,
+                parent_tool_invocation_id: None,
+                child_run_id: None,
+                content: TranscriptItemContent::RunLifecycle(TranscriptRunLifecycleContent {
+                    event: TranscriptRunLifecycleEvent::Started,
+                    status: RunStatus::InProgress,
+                    stop_reason: None,
+                }),
+            },
+            TranscriptItemRecord {
+                item_id: user_turn_id,
+                sequence_number: 2,
+                run_id,
+                kind: TranscriptItemKind::Turn,
+                stream_state: TranscriptStreamState::Committed,
+                turn_id: Some(user_turn_id),
+                tool_invocation_id: None,
+                parent_item_id: None,
+                parent_tool_invocation_id: None,
+                child_run_id: None,
+                content: TranscriptItemContent::Turn(TranscriptTurnContent {
+                    role: Role::User,
+                    content: "hello".to_string(),
+                    reasoning: String::new(),
+                }),
+            },
+            TranscriptItemRecord {
+                item_id: tool_invocation_id,
+                sequence_number: 3,
+                run_id,
+                kind: TranscriptItemKind::ToolInvocation,
+                stream_state: TranscriptStreamState::Open,
+                turn_id: Some(user_turn_id),
+                tool_invocation_id: Some(tool_invocation_id),
+                parent_item_id: Some(user_turn_id),
+                parent_tool_invocation_id: None,
+                child_run_id: None,
+                content: TranscriptItemContent::ToolInvocation(
+                    crate::session::model::TranscriptToolInvocationContent {
+                        tool_call_id: "call-1".to_string(),
+                        tool_name: "read".to_string(),
+                        tool_source: ToolSource::BuiltIn,
+                        arguments: serde_json::json!({ "path": "src/main.rs" }),
+                        preceding_turn_id: Some(user_turn_id),
+                        approval_state: ToolApprovalState::Approved,
+                        execution_state: ToolExecutionState::Running,
+                        result: None,
+                        error: None,
+                        delegation: None,
+                    },
+                ),
+            },
+        ];
+        session.next_replay_sequence = 4;
+
+        store
+            .create(&session)
+            .expect("create exact transcript session");
+        let loaded = store
+            .load(&session.id)
+            .expect("load exact transcript session");
+        let transcript_items_path = root
+            .join("sessions")
+            .join(session.id.to_string())
+            .join("transcript_items.jsonl");
+        let metadata = std::fs::read_to_string(
+            root.join("sessions")
+                .join(session.id.to_string())
+                .join("session.json"),
+        )
+        .expect("read saved session metadata");
+
+        assert!(transcript_items_path.exists());
+        assert!(metadata.contains("\"session_format_version\": 2"));
+        assert!(metadata.contains("\"transcript_fidelity\": \"exact\""));
+        assert_eq!(loaded.transcript_fidelity, TranscriptFidelity::Exact);
+        assert_eq!(loaded.transcript_items, session.transcript_items);
+        assert_eq!(loaded.next_replay_sequence, 4);
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn saving_legacy_visible_sessions_without_transcript_items_degrades_to_approximate() {
+        let root = unique_test_dir();
+        let store = FsSessionStore::new(root.clone());
+
+        let mut session = Session::new("transitional legacy-visible session");
+        let run_id = Uuid::new_v4();
+        let user_turn_id = Uuid::new_v4();
+        let shared_timestamp = Utc::now();
+
+        session.upsert_run(run_id, RunStatus::InProgress);
+        let user_turn_sequence = session.allocate_replay_sequence();
+        session.turns.push(Turn {
+            id: user_turn_id,
+            run_id,
+            role: Role::User,
+            content: "hello from legacy path".to_string(),
+            reasoning: String::new(),
+            sequence_number: user_turn_sequence,
+            timestamp: shared_timestamp,
+        });
+        let invocation_sequence = session.allocate_replay_sequence();
+        session.tool_invocations.push(ToolInvocationRecord {
+            id: Uuid::new_v4(),
+            run_id,
+            tool_call_id: "call-legacy-1".to_string(),
+            tool_name: "read".to_string(),
+            tool_source: ToolSource::BuiltIn,
+            arguments: serde_json::json!({ "path": "README.md" }),
+            preceding_turn_id: Some(user_turn_id),
+            approval_state: ToolApprovalState::Approved,
+            execution_state: ToolExecutionState::Completed,
+            result: Some("ok".to_string()),
+            error: None,
+            delegation: None,
+            sequence_number: invocation_sequence,
+            requested_at: shared_timestamp,
+            approved_at: Some(shared_timestamp),
+            completed_at: Some(shared_timestamp),
+        });
+        session.upsert_run_with_stop_reason(run_id, RunStatus::Completed, None);
+
+        assert!(session.transcript_items.is_empty());
+        assert_eq!(session.transcript_fidelity, TranscriptFidelity::Exact);
+
+        store
+            .create(&session)
+            .expect("create transitional legacy-visible session");
+
+        let metadata = std::fs::read_to_string(
+            root.join("sessions")
+                .join(session.id.to_string())
+                .join("session.json"),
+        )
+        .expect("read persisted transitional session metadata");
+        let loaded = store
+            .load(&session.id)
+            .expect("load transitional legacy-visible session");
+
+        assert!(metadata.contains("\"transcript_fidelity\": \"approximate\""));
+        assert_eq!(loaded.transcript_fidelity, TranscriptFidelity::Approximate);
+        assert!(!loaded.transcript_items.is_empty());
+        assert_eq!(
+            characterize_transcript_items(&loaded.transcript_items),
+            vec![
+                (1, "run:created".to_string()),
+                (2, "turn:user:hello from legacy path".to_string()),
+                (3, "tool:read:completed".to_string()),
+                (4, "run:terminal:completed".to_string()),
+            ]
+        );
 
         cleanup(root);
     }
@@ -820,5 +1182,67 @@ mod tests {
 
     fn cleanup(path: PathBuf) {
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    fn characterize_transcript_items(
+        transcript_items: &[TranscriptItemRecord],
+    ) -> Vec<(u64, String)> {
+        let mut items = transcript_items
+            .iter()
+            .map(|item| {
+                let label = match &item.content {
+                    TranscriptItemContent::RunLifecycle(content) => format!(
+                        "run:{}{}",
+                        match content.event {
+                            TranscriptRunLifecycleEvent::Started => "created",
+                            TranscriptRunLifecycleEvent::Terminal => "terminal",
+                        },
+                        match content.event {
+                            TranscriptRunLifecycleEvent::Started => String::new(),
+                            TranscriptRunLifecycleEvent::Terminal => format!(
+                                ":{}",
+                                match content.stop_reason {
+                                    Some(RunTerminalStopReason::Completed) => "completed",
+                                    Some(RunTerminalStopReason::Failed) => "failed",
+                                    Some(RunTerminalStopReason::Cancelled) => "cancelled",
+                                    Some(RunTerminalStopReason::Interrupted) => "interrupted",
+                                    None => "unknown",
+                                }
+                            ),
+                        }
+                    ),
+                    TranscriptItemContent::Turn(content) => format!(
+                        "turn:{}:{}",
+                        match content.role {
+                            Role::User => "user",
+                            Role::Assistant => "assistant",
+                            Role::System => "system",
+                            Role::Tool => "tool",
+                        },
+                        content.content,
+                    ),
+                    TranscriptItemContent::ToolInvocation(content) => format!(
+                        "tool:{}:{}",
+                        content.tool_name,
+                        match content.execution_state {
+                            ToolExecutionState::NotStarted => "pending",
+                            ToolExecutionState::Running => "running",
+                            ToolExecutionState::Completed => "completed",
+                            ToolExecutionState::Failed => "failed",
+                            ToolExecutionState::Skipped => "skipped",
+                        }
+                    ),
+                    TranscriptItemContent::Permission(_) => "permission".to_string(),
+                    TranscriptItemContent::DelegatedChild(_) => "delegated_child".to_string(),
+                    TranscriptItemContent::Marker(content) => {
+                        format!("marker:{}", content.label)
+                    }
+                };
+
+                (item.sequence_number, label)
+            })
+            .collect::<Vec<_>>();
+        items.sort_by_key(|(sequence_number, _)| *sequence_number);
+        items
     }
 }
