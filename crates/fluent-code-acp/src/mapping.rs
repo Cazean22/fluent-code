@@ -1181,10 +1181,7 @@ mod tests {
         assert_eq!(json["agentCapabilities"]["closeSession"], true);
         assert_eq!(json["agentCapabilities"]["mcpCapabilities"]["http"], true);
         assert_eq!(json["agentCapabilities"]["mcpCapabilities"]["sse"], true);
-        assert!(
-            json["agentCapabilities"]["sessionCapabilities"]["list"]
-                .is_object()
-        );
+        assert!(json["agentCapabilities"]["sessionCapabilities"]["list"].is_object());
         assert!(
             json["agentCapabilities"]
                 .get("promptCapabilities")

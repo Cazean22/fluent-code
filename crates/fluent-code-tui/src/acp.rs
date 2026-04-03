@@ -508,13 +508,10 @@ impl TuiProjectionState {
             self.find_tool_invocation_index(&request.tool_call.tool_call_id.to_string())
         {
             let session = self.session_mut();
-            session.tool_invocations[index].approval_state =
-                ToolApprovalState::Pending;
-            let transcript_item = TranscriptItemRecord::from_tool_invocation(
-                &session.tool_invocations[index],
-            );
-            session
-                .upsert_transcript_item(transcript_item);
+            session.tool_invocations[index].approval_state = ToolApprovalState::Pending;
+            let transcript_item =
+                TranscriptItemRecord::from_tool_invocation(&session.tool_invocations[index]);
+            session.upsert_transcript_item(transcript_item);
         }
         self.set_prompt_status(Some(PromptStatusProjection::AwaitingToolApproval));
         self.active_run_id = Some(self.transcript_run_id);
@@ -532,17 +529,14 @@ impl TuiProjectionState {
 
         if let Some(index) = self.find_tool_invocation_index(&tool_call_id) {
             let session = self.session_mut();
-            session.tool_invocations[index].approval_state =
-                if option_id.starts_with("allow") {
-                    ToolApprovalState::Approved
-                } else {
-                    ToolApprovalState::Denied
-                };
-            let transcript_item = TranscriptItemRecord::from_tool_invocation(
-                &session.tool_invocations[index],
-            );
-            session
-                .upsert_transcript_item(transcript_item);
+            session.tool_invocations[index].approval_state = if option_id.starts_with("allow") {
+                ToolApprovalState::Approved
+            } else {
+                ToolApprovalState::Denied
+            };
+            let transcript_item =
+                TranscriptItemRecord::from_tool_invocation(&session.tool_invocations[index]);
+            session.upsert_transcript_item(transcript_item);
         }
 
         self.pending_permission = None;
@@ -571,8 +565,7 @@ impl TuiProjectionState {
         {
             turn.content.push_str(&content);
             let transcript_item = TranscriptItemRecord::from_turn(turn);
-            self.session_mut()
-                .upsert_transcript_item(transcript_item);
+            self.session_mut().upsert_transcript_item(transcript_item);
             self.refresh_conversation_cache();
             return;
         }
@@ -669,8 +662,7 @@ impl TuiProjectionState {
             TranscriptSource::Thought => self.current_reasoning_turn_id = Some(new_turn_id),
             TranscriptSource::User => return,
         }
-        self.session_mut()
-            .upsert_transcript_item(transcript_item);
+        self.session_mut().upsert_transcript_item(transcript_item);
         self.refresh_conversation_cache();
     }
 
@@ -844,10 +836,7 @@ impl TuiProjectionState {
 
         match invocation_index {
             Some(index) => self.session_mut().tool_invocations[index] = invocation.clone(),
-            None => self
-                .session_mut()
-                .tool_invocations
-                .push(invocation.clone()),
+            None => self.session_mut().tool_invocations.push(invocation.clone()),
         }
 
         self.session_mut()
