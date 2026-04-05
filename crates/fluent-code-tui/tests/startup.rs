@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -228,6 +229,71 @@ fn session_browser_uses_backend_order_and_loading_session_preserves_projection_o
                         .shutdown()
                         .await
                         .expect("shutdown ACP subprocess after session browser test");
+                })
+                .await;
+        }
+
+        cleanup(root);
+    });
+}
+
+#[test]
+fn startup_load_tolerates_legacy_session_browser_responses_missing_cwd() {
+    let runtime = tokio::runtime::Runtime::new().expect("test tokio runtime");
+    runtime.block_on(async {
+        let _guard = startup_subprocess_test_lock().lock().await;
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).expect("create legacy session browser root");
+        write_acp_subprocess_test_config(&root);
+
+        let store = FsSessionStore::new(root.join(".fluent-code"));
+        let existing = store
+            .create_new_session()
+            .expect("create latest session for legacy browser compatibility");
+        let legacy_acp_binary = write_legacy_session_list_acp_binary(&root, &existing.id.to_string());
+
+        {
+            let _cwd_guard = CurrentDirGuard::set(&root);
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let runtime = bootstrap_client_for_tests(AcpLaunchOptions::new(
+                        &legacy_acp_binary,
+                        &root,
+                    ))
+                    .await
+                    .expect("bootstrap legacy ACP client subprocess for startup load");
+
+                    initialize_default_session_for_tests(&runtime, &root)
+                        .await
+                        .expect("initialize default ACP startup session despite legacy browser response");
+
+                    let startup_snapshot = runtime.projection_snapshot().await;
+                    assert_eq!(
+                        startup_snapshot.session.session_id.as_deref(),
+                        Some(existing.id.to_string().as_str())
+                    );
+                    assert!(startup_snapshot.startup_error.is_none());
+                    assert!(
+                        startup_snapshot.sessions.is_empty(),
+                        "expected the legacy session/list decode failure to leave the browser unchanged, got: {startup_snapshot:?}"
+                    );
+
+                    runtime
+                        .load_session(existing.id.to_string(), &root)
+                        .await
+                        .expect("reload ACP session despite legacy browser response");
+
+                    let reload_snapshot = runtime.projection_snapshot().await;
+                    assert_eq!(
+                        reload_snapshot.session.session_id.as_deref(),
+                        Some(existing.id.to_string().as_str())
+                    );
+                    assert!(reload_snapshot.startup_error.is_none());
+
+                    runtime
+                        .shutdown()
+                        .await
+                        .expect("shutdown legacy ACP subprocess after compatibility test");
                 })
                 .await;
         }
@@ -1487,6 +1553,84 @@ fn cargo_target_dir() -> PathBuf {
 
 fn write_acp_subprocess_test_config(root: &Path) {
     write_acp_subprocess_test_config_with_chunk_delay(root, None);
+}
+
+fn write_legacy_session_list_acp_binary(root: &Path, session_id: &str) -> PathBuf {
+    let binary_path = root.join("legacy-session-list-acp.py");
+    fs::write(
+        &binary_path,
+        format!(
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+session_id = {session_id:?}
+
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message.get("id")
+    method = message.get("method")
+
+    if method == "initialize":
+        response = {{
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {{
+                "protocolVersion": "1",
+                "agentCapabilities": {{
+                    "loadSession": True,
+                    "sessionCapabilities": {{"list": {{}}}}
+                }},
+                "agentInfo": {{
+                    "name": "legacy-session-list-acp",
+                    "version": "0.0.0"
+                }}
+            }}
+        }}
+    elif method == "session/load":
+        params = message.get("params") or {{}}
+        session_id = params.get("sessionId", session_id)
+        response = {{
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {{}}
+        }}
+    elif method == "session/list":
+        response = {{
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {{
+                "sessions": [{{
+                    "sessionId": session_id,
+                    "title": "Legacy browser session",
+                    "updatedAt": "2026-04-05T00:00:00Z"
+                }}]
+            }}
+        }}
+    else:
+        response = {{
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {{
+                "code": -32601,
+                "message": "Method not found"
+            }}
+        }}
+
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#,
+            session_id = session_id,
+        ),
+    )
+    .expect("write legacy ACP session/list test binary");
+    let mut permissions = fs::metadata(&binary_path)
+        .expect("read legacy ACP session/list test binary metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&binary_path, permissions)
+        .expect("make legacy ACP session/list test binary executable");
+    binary_path
 }
 
 fn write_acp_subprocess_test_config_with_chunk_delay(root: &Path, chunk_delay_ms: Option<u64>) {

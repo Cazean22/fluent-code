@@ -42,7 +42,7 @@ use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::conversation::{ConversationRow, DerivedHistoryCells, derive_history_cells_for_session};
@@ -2381,8 +2381,28 @@ impl AcpClientRuntime {
         self.inner
             .apply_loaded_session_projection(loaded_metadata)
             .await;
-        self.refresh_session_browser(cwd).await?;
+        self.refresh_session_browser_after_session_change(cwd)
+            .await?;
         Ok(response)
+    }
+
+    async fn refresh_session_browser_after_session_change(
+        &self,
+        cwd: impl Into<PathBuf>,
+    ) -> acp::Result<()> {
+        let cwd = cwd.into();
+        match self.refresh_session_browser(cwd.clone()).await {
+            Ok(_) => Ok(()),
+            Err(error) if session_browser_refresh_is_legacy_decode_error(&error) => {
+                warn!(
+                    cwd = %cwd.display(),
+                    error = %error,
+                    "ignoring legacy ACP session browser refresh failure"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn refresh_session_browser(
@@ -3159,6 +3179,36 @@ fn session_browser_entries_from_response(
         .collect()
 }
 
+fn session_browser_refresh_is_legacy_decode_error(error: &acp::Error) -> bool {
+    error.code == acp::ErrorCode::InternalError
+        && (session_browser_refresh_error_contains_legacy_decode_hint(&error.message)
+            || error
+                .data
+                .as_ref()
+                .is_some_and(session_browser_refresh_error_data_contains_legacy_decode_hint))
+}
+
+fn session_browser_refresh_error_data_contains_legacy_decode_hint(data: &Value) -> bool {
+    match data {
+        Value::String(message) => {
+            session_browser_refresh_error_contains_legacy_decode_hint(message)
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(session_browser_refresh_error_data_contains_legacy_decode_hint),
+        Value::Object(fields) => fields
+            .values()
+            .any(session_browser_refresh_error_data_contains_legacy_decode_hint),
+        _ => false,
+    }
+}
+
+fn session_browser_refresh_error_contains_legacy_decode_hint(message: &str) -> bool {
+    message.contains("failed to deserialize response")
+        || message.contains("missing field `cwd`")
+        || message.contains("missing field cwd")
+}
+
 fn abbreviated_session_id(session_id: &str) -> &str {
     session_id.split('-').next().unwrap_or(session_id)
 }
@@ -3875,7 +3925,7 @@ impl ProjectionController {
 
         if let Some(runtime) = self.runtime.as_ref() {
             runtime
-                .refresh_session_browser(self.cwd.clone())
+                .refresh_session_browser_after_session_change(self.cwd.clone())
                 .await
                 .map_err(|error| {
                     FluentCodeError::Provider(format!(
@@ -5806,6 +5856,24 @@ mod tests {
             Some(PromptStatusProjection::Interrupted)
         );
         assert!(!projection.prompt_in_flight);
+    }
+
+    #[test]
+    fn session_browser_refresh_legacy_decode_errors_are_non_fatal() {
+        assert!(session_browser_refresh_is_legacy_decode_error(
+            &acp::Error::internal_error().data("failed to deserialize response")
+        ));
+        assert!(session_browser_refresh_is_legacy_decode_error(
+            &acp::Error::internal_error().data(json!({
+                "message": "missing field `cwd`"
+            }))
+        ));
+        assert!(!session_browser_refresh_is_legacy_decode_error(
+            &acp::Error::internal_error().data("connection closed")
+        ));
+        assert!(!session_browser_refresh_is_legacy_decode_error(
+            &acp::Error::resource_not_found(None)
+        ));
     }
 
     #[test]
