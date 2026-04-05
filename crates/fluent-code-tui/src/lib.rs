@@ -12,8 +12,10 @@ use fluent_code_app::error::Result;
 #[doc(hidden)]
 pub use acp::{
     AcpClientRuntime, AcpFilesystemService, AcpLaunchOptions, AcpTerminalService,
-    PendingPermissionProjection, PermissionOptionProjection, ProjectionActivitySnapshot,
-    SubprocessStatus, TerminalCommandProbeResponse, TranscriptSource, TuiProjectionState,
+    ConversationEntryKind, ConversationEntryProjection, ConversationReasoningEntryProjection,
+    ConversationTurnEntryProjection, PendingPermissionProjection, PermissionOptionProjection,
+    ProjectionActivitySnapshot, RunMarkerProjection, SubprocessStatus,
+    TerminalCommandProbeResponse, ToolGroupEntryProjection, TranscriptSource, TuiProjectionState,
     bootstrap_client_for_tests, expected_projection_frame_text_for_tests,
     initialize_default_session_for_tests, render_projection_frame_text_for_tests,
 };

@@ -45,10 +45,12 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::conversation::{ConversationRow, DerivedHistoryCells, derive_history_cells_for_session};
+use crate::conversation::{
+    ConversationRow, DerivedHistoryCells, ToolRow, derive_history_cells_for_session,
+};
 use crate::terminal;
 use crate::theme::TUI_THEME;
-use crate::view::{conversation_lines_from_cells, resolve_transcript_scroll};
+use crate::view::{conversation_lines_from_rows, resolve_transcript_scroll};
 
 const ACP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -89,6 +91,7 @@ pub struct TuiProjectionState {
 struct ProjectionConversationCache {
     #[cfg(test)]
     history_cells: DerivedHistoryCells,
+    conversation_entries: Vec<ConversationEntryProjection>,
     transcript_rows: Vec<TranscriptRowProjection>,
     tool_statuses: Vec<ToolStatusProjection>,
     transcript_lines: Vec<Line<'static>>,
@@ -97,12 +100,14 @@ struct ProjectionConversationCache {
 impl ProjectionConversationCache {
     fn build(session: &Session, status: &AppStatus, active_run_id: Option<Uuid>) -> Self {
         let history_cells = derive_history_cells_for_session(session, status, active_run_id);
+        let conversation_entries = conversation_entries_from_history_cells(&history_cells);
         Self {
             #[cfg(test)]
             history_cells: history_cells.clone(),
-            transcript_rows: transcript_rows_from_history_cells(&history_cells),
-            tool_statuses: tool_statuses_from_history_cells(&history_cells),
-            transcript_lines: conversation_lines_from_cells(&history_cells, false),
+            transcript_rows: transcript_rows_from_entries(&conversation_entries),
+            tool_statuses: tool_statuses_from_entries(&conversation_entries),
+            transcript_lines: transcript_lines_from_entries(&conversation_entries),
+            conversation_entries,
         }
     }
 }
@@ -141,8 +146,7 @@ impl PartialEq for TuiProjectionState {
     fn eq(&self, other: &Self) -> bool {
         self.sessions == other.sessions
             && self.session == other.session
-            && self.transcript_rows_ref() == other.transcript_rows_ref()
-            && self.tool_statuses_ref() == other.tool_statuses_ref()
+            && self.conversation_entries_ref() == other.conversation_entries_ref()
             && self.pending_permission == other.pending_permission
             && self.subprocess == other.subprocess
             && self.draft_input == other.draft_input
@@ -208,6 +212,94 @@ pub struct ToolStatusProjection {
     pub tool_call_id: String,
     pub title: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConversationEntryProjection {
+    row: ConversationRow,
+    pub kind: ConversationEntryKind,
+}
+
+impl ConversationEntryProjection {
+    fn from_row(row: &ConversationRow) -> Self {
+        let kind = match row {
+            ConversationRow::Turn(turn) => {
+                ConversationEntryKind::Turn(ConversationTurnEntryProjection {
+                    role: turn.role,
+                    content: turn.content.clone(),
+                    is_streaming: turn.is_streaming,
+                })
+            }
+            ConversationRow::Reasoning(reasoning) => {
+                ConversationEntryKind::Reasoning(ConversationReasoningEntryProjection {
+                    content: reasoning.content.clone(),
+                    is_streaming: reasoning.is_streaming,
+                })
+            }
+            ConversationRow::Tool(tool) => {
+                ConversationEntryKind::Tool(tool_status_projection(tool.as_ref()))
+            }
+            ConversationRow::ToolGroup(group) => {
+                ConversationEntryKind::ToolGroup(ToolGroupEntryProjection {
+                    items: group.items.iter().map(tool_status_projection).collect(),
+                })
+            }
+            ConversationRow::RunMarker(marker) => {
+                ConversationEntryKind::RunMarker(RunMarkerProjection {
+                    label: marker.label.clone(),
+                })
+            }
+        };
+
+        Self {
+            row: row.clone(),
+            kind,
+        }
+    }
+
+    fn row(&self) -> &ConversationRow {
+        &self.row
+    }
+}
+
+impl PartialEq for ConversationEntryProjection {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
+impl Eq for ConversationEntryProjection {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationEntryKind {
+    Turn(ConversationTurnEntryProjection),
+    Reasoning(ConversationReasoningEntryProjection),
+    Tool(ToolStatusProjection),
+    ToolGroup(ToolGroupEntryProjection),
+    RunMarker(RunMarkerProjection),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationTurnEntryProjection {
+    pub role: Role,
+    pub content: String,
+    pub is_streaming: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationReasoningEntryProjection {
+    pub content: String,
+    pub is_streaming: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolGroupEntryProjection {
+    pub items: Vec<ToolStatusProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunMarkerProjection {
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1016,6 +1108,14 @@ impl TuiProjectionState {
 
     fn transcript_rows_ref(&self) -> &[TranscriptRowProjection] {
         &self.conversation_cache.transcript_rows
+    }
+
+    fn conversation_entries_ref(&self) -> &[ConversationEntryProjection] {
+        &self.conversation_cache.conversation_entries
+    }
+
+    pub fn conversation_entries(&self) -> Vec<ConversationEntryProjection> {
+        self.conversation_entries_ref().to_vec()
     }
 
     pub fn transcript_rows(&self) -> Vec<TranscriptRowProjection> {
@@ -3228,66 +3328,29 @@ fn truncate_projection_text(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn conversation_entries_from_history_cells(
+    history_cells: &DerivedHistoryCells,
+) -> Vec<ConversationEntryProjection> {
+    history_cells
+        .iter_rows()
+        .map(ConversationEntryProjection::from_row)
+        .collect()
+}
+
+#[cfg(test)]
 fn transcript_rows_from_history_cells(
     history_cells: &DerivedHistoryCells,
 ) -> Vec<TranscriptRowProjection> {
-    let mut transcript_rows = Vec::new();
-
-    for row in history_cells.iter_rows() {
-        match row {
-            ConversationRow::Turn(turn) if turn.role == Role::User && !turn.content.is_empty() => {
-                transcript_rows.push(TranscriptRowProjection {
-                    source: TranscriptSource::User,
-                    content: turn.content.clone(),
-                });
-            }
-            ConversationRow::Reasoning(reasoning) if !reasoning.content.is_empty() => {
-                transcript_rows.push(TranscriptRowProjection {
-                    source: TranscriptSource::Thought,
-                    content: reasoning.content.clone(),
-                });
-            }
-            ConversationRow::Turn(turn)
-                if turn.role == Role::Assistant && !turn.content.is_empty() =>
-            {
-                transcript_rows.push(TranscriptRowProjection {
-                    source: TranscriptSource::Agent,
-                    content: turn.content.clone(),
-                });
-            }
-            _ => {}
-        }
-    }
-
-    transcript_rows
+    let conversation_entries = conversation_entries_from_history_cells(history_cells);
+    transcript_rows_from_entries(&conversation_entries)
 }
 
+#[cfg(test)]
 fn tool_statuses_from_history_cells(
     history_cells: &DerivedHistoryCells,
 ) -> Vec<ToolStatusProjection> {
-    let mut tool_statuses = Vec::new();
-
-    for row in history_cells.iter_rows() {
-        match row {
-            ConversationRow::Tool(tool) => {
-                tool_statuses.push(ToolStatusProjection {
-                    tool_call_id: tool.tool_call_id.clone(),
-                    title: tool.display_name.clone(),
-                    status: tool_execution_label(tool.execution_state, tool.approval_state),
-                });
-            }
-            ConversationRow::ToolGroup(group) => {
-                tool_statuses.extend(group.items.iter().map(|tool| ToolStatusProjection {
-                    tool_call_id: tool.tool_call_id.clone(),
-                    title: tool.display_name.clone(),
-                    status: tool_execution_label(tool.execution_state, tool.approval_state),
-                }));
-            }
-            _ => {}
-        }
-    }
-
-    tool_statuses
+    let conversation_entries = conversation_entries_from_history_cells(history_cells);
+    tool_statuses_from_entries(&conversation_entries)
 }
 
 #[cfg(test)]
@@ -3297,6 +3360,13 @@ fn uncached_history_cells(projection: &TuiProjectionState) -> DerivedHistoryCell
         &projection.app_status(),
         projection.active_run_id,
     )
+}
+
+#[cfg(test)]
+fn uncached_conversation_entries(
+    projection: &TuiProjectionState,
+) -> Vec<ConversationEntryProjection> {
+    conversation_entries_from_history_cells(&uncached_history_cells(projection))
 }
 
 #[cfg(test)]
@@ -3376,7 +3446,7 @@ fn uncached_projection_lines(projection: &TuiProjectionState) -> Vec<Line<'stati
     }
 
     let transcript_lines =
-        conversation_lines_from_cells(&uncached_history_cells(projection), false);
+        transcript_lines_from_entries(&uncached_conversation_entries(projection));
     if !transcript_lines.is_empty() {
         lines.push(Line::default());
         lines.extend(transcript_lines);
@@ -4303,6 +4373,79 @@ fn tool_execution_label(
         ToolExecutionState::Completed => "completed".to_string(),
         ToolExecutionState::Failed => "failed".to_string(),
         ToolExecutionState::Skipped => "skipped".to_string(),
+    }
+}
+
+fn transcript_rows_from_entries(
+    conversation_entries: &[ConversationEntryProjection],
+) -> Vec<TranscriptRowProjection> {
+    let mut transcript_rows = Vec::new();
+
+    for entry in conversation_entries {
+        match &entry.kind {
+            ConversationEntryKind::Turn(turn)
+                if turn.role == Role::User && !turn.content.is_empty() =>
+            {
+                transcript_rows.push(TranscriptRowProjection {
+                    source: TranscriptSource::User,
+                    content: turn.content.clone(),
+                });
+            }
+            ConversationEntryKind::Reasoning(reasoning) if !reasoning.content.is_empty() => {
+                transcript_rows.push(TranscriptRowProjection {
+                    source: TranscriptSource::Thought,
+                    content: reasoning.content.clone(),
+                });
+            }
+            ConversationEntryKind::Turn(turn)
+                if turn.role == Role::Assistant && !turn.content.is_empty() =>
+            {
+                transcript_rows.push(TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: turn.content.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    transcript_rows
+}
+
+fn tool_statuses_from_entries(
+    conversation_entries: &[ConversationEntryProjection],
+) -> Vec<ToolStatusProjection> {
+    let mut tool_statuses = Vec::new();
+
+    for entry in conversation_entries {
+        match &entry.kind {
+            ConversationEntryKind::Tool(tool) => tool_statuses.push(tool.clone()),
+            ConversationEntryKind::ToolGroup(group) => {
+                tool_statuses.extend(group.items.iter().cloned())
+            }
+            _ => {}
+        }
+    }
+
+    tool_statuses
+}
+
+fn transcript_lines_from_entries(
+    conversation_entries: &[ConversationEntryProjection],
+) -> Vec<Line<'static>> {
+    conversation_lines_from_rows(
+        conversation_entries
+            .iter()
+            .map(ConversationEntryProjection::row),
+        false,
+    )
+}
+
+fn tool_status_projection(tool: &ToolRow) -> ToolStatusProjection {
+    ToolStatusProjection {
+        tool_call_id: tool.tool_call_id.clone(),
+        title: tool.display_name.clone(),
+        status: tool_execution_label(tool.execution_state, tool.approval_state),
     }
 }
 
@@ -5459,6 +5602,10 @@ pub(crate) fn assert_conversation_projection_cache_preserves_history_output() {
     );
 
     assert_eq!(
+        projection.conversation_entries(),
+        uncached_conversation_entries(&projection)
+    );
+    assert_eq!(
         projection.transcript_rows(),
         uncached_transcript_rows(&projection)
     );
@@ -5489,6 +5636,10 @@ pub(crate) fn assert_conversation_projection_cache_invalidates_on_transcript_cha
     let after_first_chunk_cache = Arc::clone(&projection.conversation_cache);
 
     assert!(!Arc::ptr_eq(&initial_cache, &after_first_chunk_cache));
+    assert_eq!(
+        projection.conversation_entries(),
+        uncached_conversation_entries(&projection)
+    );
     assert_eq!(
         projection.transcript_rows(),
         uncached_transcript_rows(&projection)
@@ -5556,6 +5707,10 @@ pub(crate) fn assert_startup_restore_with_projection_cache_matches_uncached_outp
     projection.apply_loaded_session_metadata(&session);
 
     projection.ensure_conversation_cache_fresh();
+    assert_eq!(
+        projection.conversation_entries(),
+        uncached_conversation_entries(&projection)
+    );
     assert_eq!(
         projection.replay_fidelity,
         ReplayFidelityProjection::Approximate
@@ -5942,6 +6097,220 @@ mod tests {
                 ConversationRow::RunMarker(marker) if marker.label == "interrupted"
             )
         }));
+        assert!(projection.conversation_entries().iter().any(|entry| {
+            matches!(
+                &entry.kind,
+                ConversationEntryKind::RunMarker(RunMarkerProjection { label }) if label == "interrupted"
+            )
+        }));
+    }
+
+    #[test]
+    fn conversation_entries_preserve_interleaved_history_row_order() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("interleaved conversation");
+        let user_turn = make_turn(run_id, Role::User, "first prompt", 1);
+        let assistant_turn = make_turn(run_id, Role::Assistant, "answer after tool", 3);
+        let mut read_tool = make_tool_invocation(
+            run_id,
+            Some(user_turn.id),
+            "read",
+            json!({"path": "src/main.rs"}),
+            2,
+        );
+        read_tool.tool_call_id = "tool-1".to_string();
+        let mut write_tool = make_tool_invocation(
+            run_id,
+            Some(assistant_turn.id),
+            "write",
+            json!({"path": "src/lib.rs"}),
+            4,
+        );
+        write_tool.tool_call_id = "tool-2".to_string();
+
+        session
+            .turns
+            .extend([user_turn.clone(), assistant_turn.clone()]);
+        session
+            .tool_invocations
+            .extend([read_tool.clone(), write_tool.clone()]);
+        session.transcript_items = vec![
+            TranscriptItemRecord::from_turn(&user_turn),
+            TranscriptItemRecord::from_tool_invocation(&read_tool),
+            TranscriptItemRecord::from_turn(&assistant_turn),
+            TranscriptItemRecord::from_tool_invocation(&write_tool),
+            TranscriptItemRecord::assistant_reasoning(
+                run_id,
+                Uuid::new_v4(),
+                5,
+                "wrap up",
+                TranscriptStreamState::Committed,
+            ),
+            TranscriptItemRecord::run_terminal(&fluent_code_app::session::model::RunRecord {
+                id: run_id,
+                status: fluent_code_app::session::model::RunStatus::Completed,
+                parent_run_id: None,
+                parent_tool_invocation_id: None,
+                created_sequence: 1,
+                terminal_sequence: Some(6),
+                terminal_stop_reason: Some(
+                    fluent_code_app::session::model::RunTerminalStopReason::Completed,
+                ),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }),
+        ];
+        session.upsert_run(
+            run_id,
+            fluent_code_app::session::model::RunStatus::Completed,
+        );
+
+        let projection = projection_with_session("session-interleaved", session, None, None, None);
+        let entries = projection.conversation_entries();
+
+        assert_eq!(entries.len(), 6);
+        assert!(matches!(
+            &entries[0].kind,
+            ConversationEntryKind::Turn(ConversationTurnEntryProjection {
+                role: Role::User,
+                content,
+                is_streaming: false,
+            }) if content == "first prompt"
+        ));
+        assert!(matches!(
+            &entries[1].kind,
+            ConversationEntryKind::Tool(ToolStatusProjection {
+                tool_call_id,
+                title,
+                status,
+            }) if tool_call_id == "tool-1" && title == "read" && status == "completed"
+        ));
+        assert!(matches!(
+            &entries[2].kind,
+            ConversationEntryKind::Turn(ConversationTurnEntryProjection {
+                role: Role::Assistant,
+                content,
+                is_streaming: false,
+            }) if content == "answer after tool"
+        ));
+        assert!(matches!(
+            &entries[3].kind,
+            ConversationEntryKind::Tool(ToolStatusProjection {
+                tool_call_id,
+                title,
+                status,
+            }) if tool_call_id == "tool-2" && title == "write" && status == "completed"
+        ));
+        assert!(matches!(
+            &entries[4].kind,
+            ConversationEntryKind::Reasoning(ConversationReasoningEntryProjection {
+                content,
+                is_streaming: false,
+            }) if content == "wrap up"
+        ));
+        assert!(matches!(
+            &entries[5].kind,
+            ConversationEntryKind::RunMarker(RunMarkerProjection { label }) if label == "completed"
+        ));
+
+        assert_eq!(
+            projection.transcript_rows(),
+            vec![
+                TranscriptRowProjection {
+                    source: TranscriptSource::User,
+                    content: "first prompt".to_string(),
+                },
+                TranscriptRowProjection {
+                    source: TranscriptSource::Agent,
+                    content: "answer after tool".to_string(),
+                },
+                TranscriptRowProjection {
+                    source: TranscriptSource::Thought,
+                    content: "wrap up".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            projection.tool_statuses(),
+            vec![
+                ToolStatusProjection {
+                    tool_call_id: "tool-1".to_string(),
+                    title: "read".to_string(),
+                    status: "completed".to_string(),
+                },
+                ToolStatusProjection {
+                    tool_call_id: "tool-2".to_string(),
+                    title: "write".to_string(),
+                    status: "completed".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn conversation_entries_preserve_existing_grouped_tool_batches() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("grouped tools");
+        let user_turn = make_turn(run_id, Role::User, "inspect files", 1);
+        let mut read_a = make_tool_invocation(
+            run_id,
+            Some(user_turn.id),
+            "read",
+            json!({"path": "src/main.rs"}),
+            2,
+        );
+        read_a.tool_call_id = "tool-1".to_string();
+        let mut read_b = make_tool_invocation(
+            run_id,
+            Some(user_turn.id),
+            "read",
+            json!({"path": "src/lib.rs"}),
+            3,
+        );
+        read_b.tool_call_id = "tool-2".to_string();
+
+        session.turns.push(user_turn.clone());
+        session
+            .tool_invocations
+            .extend([read_a.clone(), read_b.clone()]);
+        session.transcript_items = vec![
+            TranscriptItemRecord::from_turn(&user_turn),
+            TranscriptItemRecord::from_tool_invocation(&read_a),
+            TranscriptItemRecord::from_tool_invocation(&read_b),
+        ];
+
+        let projection = projection_with_session("session-grouped", session, None, None, None);
+        let entries = projection.conversation_entries();
+
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            &entries[0].kind,
+            ConversationEntryKind::Turn(ConversationTurnEntryProjection {
+                role: Role::User,
+                ..
+            })
+        ));
+        assert!(matches!(
+            &entries[1].kind,
+            ConversationEntryKind::ToolGroup(ToolGroupEntryProjection { items })
+                if items.iter().map(|item| item.tool_call_id.as_str()).collect::<Vec<_>>()
+                    == vec!["tool-1", "tool-2"]
+        ));
+        assert_eq!(
+            projection.tool_statuses(),
+            vec![
+                ToolStatusProjection {
+                    tool_call_id: "tool-1".to_string(),
+                    title: "read".to_string(),
+                    status: "completed".to_string(),
+                },
+                ToolStatusProjection {
+                    tool_call_id: "tool-2".to_string(),
+                    title: "read".to_string(),
+                    status: "completed".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
