@@ -59,9 +59,11 @@ const ACP_META_LATEST_PROMPT_STATE_KEY: &str = "fluentCodeLatestPromptState";
 const ACP_META_REPLAY_FIDELITY_KEY: &str = "fluentCodeReplayFidelity";
 const ACP_META_TOOL_INVOCATION_KEY: &str = "fluentCodeToolInvocation";
 const ACP_META_TRANSCRIPT_ITEM_KEY: &str = "fluentCodeTranscriptItem";
+const SESSION_BROWSER_WIDTH: u16 = 36;
 
 #[derive(Debug, Clone)]
 pub struct TuiProjectionState {
+    pub sessions: Vec<SessionBrowserEntryProjection>,
     pub session: SessionProjection,
     pub pending_permission: Option<PendingPermissionProjection>,
     pub subprocess: SubprocessProjection,
@@ -109,6 +111,7 @@ impl Default for TuiProjectionState {
     fn default() -> Self {
         let transcript_run_id = Uuid::new_v4();
         let mut projection = Self {
+            sessions: Vec::new(),
             session: SessionProjection::default(),
             pending_permission: None,
             subprocess: SubprocessProjection::default(),
@@ -136,7 +139,8 @@ impl Default for TuiProjectionState {
 
 impl PartialEq for TuiProjectionState {
     fn eq(&self, other: &Self) -> bool {
-        self.session == other.session
+        self.sessions == other.sessions
+            && self.session == other.session
             && self.transcript_rows_ref() == other.transcript_rows_ref()
             && self.tool_statuses_ref() == other.tool_statuses_ref()
             && self.pending_permission == other.pending_permission
@@ -153,6 +157,13 @@ impl PartialEq for TuiProjectionState {
 }
 
 impl Eq for TuiProjectionState {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBrowserEntryProjection {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub updated_at: Option<String>,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionProjection {
@@ -301,6 +312,51 @@ impl TuiProjectionState {
         Arc::make_mut(&mut self.transcript_session)
     }
 
+    fn apply_session_list(&mut self, sessions: Vec<SessionBrowserEntryProjection>) {
+        self.sessions = sessions;
+    }
+
+    fn update_session_browser_entry(
+        &mut self,
+        session_id: &str,
+        title: Option<&str>,
+        updated_at: Option<&str>,
+    ) {
+        let Some(entry) = self
+            .sessions
+            .iter_mut()
+            .find(|entry| entry.session_id == session_id)
+        else {
+            return;
+        };
+
+        if let Some(title) = title {
+            entry.title = Some(title.to_string());
+        }
+        if let Some(updated_at) = updated_at {
+            entry.updated_at = Some(updated_at.to_string());
+        }
+    }
+
+    fn adjacent_session_id(&self, direction: SessionBrowserDirection) -> Option<String> {
+        let current_session_id = self.session.session_id.as_deref()?;
+        let current_index = self
+            .sessions
+            .iter()
+            .position(|session| session.session_id == current_session_id)?;
+
+        match direction {
+            SessionBrowserDirection::Previous => current_index
+                .checked_sub(1)
+                .and_then(|index| self.sessions.get(index))
+                .map(|session| session.session_id.clone()),
+            SessionBrowserDirection::Next => self
+                .sessions
+                .get(current_index.saturating_add(1))
+                .map(|session| session.session_id.clone()),
+        }
+    }
+
     fn reset_session_projection(&mut self, session_id: Option<String>) {
         self.session = SessionProjection {
             session_id,
@@ -434,7 +490,7 @@ impl TuiProjectionState {
             return;
         }
 
-        self.session.session_id = Some(session_id);
+        self.session.session_id = Some(session_id.clone());
 
         match notification.update {
             acp::SessionUpdate::UserMessageChunk(chunk) => {
@@ -458,9 +514,17 @@ impl TuiProjectionState {
                 if let Some(title) = update.title.take() {
                     self.session_mut().title = title.clone();
                     self.session.title = Some(title);
+                    let current_title = self.session.title.clone();
+                    self.update_session_browser_entry(&session_id, current_title.as_deref(), None);
                 }
                 if let Some(updated_at) = update.updated_at.take() {
                     self.session.updated_at = Some(updated_at);
+                    let current_updated_at = self.session.updated_at.clone();
+                    self.update_session_browser_entry(
+                        &session_id,
+                        None,
+                        current_updated_at.as_deref(),
+                    );
                 }
                 if let Some(item) = transcript_item_from_meta(update.meta.as_ref()) {
                     self.apply_transcript_metadata_item(item);
@@ -1179,6 +1243,11 @@ impl ProjectionSharedState {
     fn mark_activity(&mut self) {
         self.activity_sequence = self.activity_sequence.wrapping_add(1);
         self.wake_signal.wake();
+    }
+
+    fn apply_session_list(&mut self, sessions: Vec<SessionBrowserEntryProjection>) {
+        self.projection.apply_session_list(sessions);
+        self.mark_activity();
     }
 
     fn clear_pending_permission_request(&mut self) {
@@ -2048,6 +2117,10 @@ impl AcpClientRuntimeInner {
             .apply_loaded_session_projection(metadata);
     }
 
+    async fn apply_session_list(&self, sessions: Vec<SessionBrowserEntryProjection>) {
+        self.projection.lock().await.apply_session_list(sessions);
+    }
+
     async fn select_permission_option(&self, option_id: &str) -> Result<()> {
         resolve_pending_permission_selection(self.projection(), option_id).await
     }
@@ -2297,7 +2370,7 @@ impl AcpClientRuntime {
             ))
             .await?;
         self.inner
-            .register_session_cwd(session_id.clone(), cwd)
+            .register_session_cwd(session_id.clone(), cwd.clone())
             .await?;
         let mut loaded_metadata = loaded_session_metadata_from_response(&response);
         if !loaded_metadata.is_complete()
@@ -2308,7 +2381,20 @@ impl AcpClientRuntime {
         self.inner
             .apply_loaded_session_projection(loaded_metadata)
             .await;
+        self.refresh_session_browser(cwd).await?;
         Ok(response)
+    }
+
+    pub async fn refresh_session_browser(
+        &self,
+        cwd: impl Into<PathBuf>,
+    ) -> acp::Result<Vec<SessionBrowserEntryProjection>> {
+        let cwd = cwd.into();
+        let request = acp::ListSessionsRequest::new().cwd(cwd);
+        let response = self.connection.list_sessions(request).await?;
+        let sessions = session_browser_entries_from_response(response);
+        self.inner.apply_session_list(sessions.clone()).await;
+        Ok(sessions)
     }
 
     #[doc(hidden)]
@@ -2742,6 +2828,18 @@ async fn apply_projection_action(
             controller.create_new_session().await?;
             Ok(false)
         }
+        ProjectionAction::PreviousSession => {
+            controller
+                .switch_session(SessionBrowserDirection::Previous)
+                .await?;
+            Ok(false)
+        }
+        ProjectionAction::NextSession => {
+            controller
+                .switch_session(SessionBrowserDirection::Next)
+                .await?;
+            Ok(false)
+        }
         ProjectionAction::ScrollUp => {
             controller.scroll_transcript_up(1).await;
             Ok(false)
@@ -2811,18 +2909,37 @@ fn render_projection(frame: &mut Frame, projection: &TuiProjectionState) {
     ]));
     frame.render_widget(status, layout[0]);
 
+    let body_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(SESSION_BROWSER_WIDTH),
+            Constraint::Min(10),
+        ])
+        .split(layout[1]);
+
+    let session_browser = Paragraph::new(Text::from(session_browser_lines(projection)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(TUI_THEME.panel_border)
+                .title(Span::styled(" sessions ", TUI_THEME.title)),
+        )
+        .scroll((session_browser_scroll(projection, body_layout[0]), 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(session_browser, body_layout[0]);
+
     let body_lines = projection_lines(projection);
-    let body_scroll = projection_body_scroll(projection, &body_lines, layout[1]);
+    let body_scroll = projection_body_scroll(projection, &body_lines, body_layout[1]);
     let body = Paragraph::new(Text::from(body_lines))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(TUI_THEME.panel_border)
-                .title(Span::styled(" acp client ", TUI_THEME.title)),
+                .title(Span::styled(" conversation ", TUI_THEME.title)),
         )
         .scroll((body_scroll, 0))
         .wrap(Wrap { trim: false });
-    frame.render_widget(body, layout[1]);
+    frame.render_widget(body, body_layout[1]);
 
     let input = Paragraph::new(projection.draft_input.as_str())
         .style(TUI_THEME.text)
@@ -2852,8 +2969,50 @@ fn footer_label(projection: &TuiProjectionState) -> &'static str {
     } else if projection.prompt_in_flight {
         "Prompt running through ACP. Esc/Ctrl-C cancels the active turn."
     } else {
-        "Type a prompt and press Enter. Ctrl-N starts a new ACP session. q/Esc/Ctrl-C exits."
+        "Type a prompt and press Enter. Ctrl-J/K switch sessions. Ctrl-N starts a new ACP session. q/Esc/Ctrl-C exits."
     }
+}
+
+fn session_browser_lines(projection: &TuiProjectionState) -> Vec<Line<'static>> {
+    if projection.sessions.is_empty() {
+        return vec![
+            Line::default(),
+            Line::styled("  No sessions yet.", TUI_THEME.text_muted),
+        ];
+    }
+
+    projection
+        .sessions
+        .iter()
+        .map(|session| {
+            let is_current = projection.session.session_id.as_deref() == Some(&session.session_id);
+            let prefix_style = if is_current {
+                TUI_THEME.assistant_accent
+            } else {
+                TUI_THEME.text_muted
+            };
+            let label_style = if is_current {
+                TUI_THEME.text
+            } else {
+                TUI_THEME.text_muted
+            };
+            let title = session
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .unwrap_or(&session.session_id);
+            let label = truncate_projection_text(
+                &format!("{title} · {}", abbreviated_session_id(&session.session_id)),
+                SESSION_BROWSER_WIDTH.saturating_sub(4) as usize,
+            );
+
+            Line::from(vec![
+                Span::styled(if is_current { "› " } else { "  " }, prefix_style),
+                Span::styled(label, label_style),
+            ])
+        })
+        .collect()
 }
 
 fn projection_lines(projection: &TuiProjectionState) -> Vec<Line<'static>> {
@@ -2939,6 +3098,32 @@ fn projection_body_scroll(projection: &TuiProjectionState, lines: &[Line<'_>], a
     )
 }
 
+fn session_browser_scroll(projection: &TuiProjectionState, area: Rect) -> u16 {
+    let inner_height = area.height.saturating_sub(2) as usize;
+    if inner_height == 0 {
+        return 0;
+    }
+
+    let Some(current_index) = projection
+        .session
+        .session_id
+        .as_deref()
+        .and_then(|session_id| {
+            projection
+                .sessions
+                .iter()
+                .position(|session| session.session_id == session_id)
+        })
+    else {
+        return 0;
+    };
+
+    current_index
+        .saturating_add(1)
+        .saturating_sub(inner_height)
+        .min(u16::MAX as usize) as u16
+}
+
 fn line_from_status(status: &SubprocessStatus) -> Line<'static> {
     match status {
         SubprocessStatus::NotStarted => Line::from("ACP subprocess: not started"),
@@ -2957,6 +3142,39 @@ fn line_from_status(status: &SubprocessStatus) -> Line<'static> {
         SubprocessStatus::Failed { message } => {
             Line::from(format!("ACP subprocess: failed ({message})"))
         }
+    }
+}
+
+fn session_browser_entries_from_response(
+    response: acp::ListSessionsResponse,
+) -> Vec<SessionBrowserEntryProjection> {
+    response
+        .sessions
+        .into_iter()
+        .map(|session| SessionBrowserEntryProjection {
+            session_id: session.session_id.to_string(),
+            title: session.title,
+            updated_at: session.updated_at,
+        })
+        .collect()
+}
+
+fn abbreviated_session_id(session_id: &str) -> &str {
+    session_id.split('-').next().unwrap_or(session_id)
+}
+
+fn truncate_projection_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() && max_chars > 0 {
+        let mut shortened = truncated
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        shortened.push('…');
+        shortened
+    } else {
+        truncated
     }
 }
 
@@ -3278,6 +3496,8 @@ enum ProjectionAction {
     None,
     Quit,
     NewSession,
+    PreviousSession,
+    NextSession,
     ScrollUp,
     ScrollDown,
     PageUp,
@@ -3338,6 +3558,14 @@ fn projection_key_action(
         && !snapshot.prompt_in_flight
     {
         return ProjectionAction::NewSession;
+    }
+
+    if snapshot.can_edit_draft() && modifiers == KeyModifiers::CONTROL {
+        return match code {
+            KeyCode::Char('k') => ProjectionAction::PreviousSession,
+            KeyCode::Char('j') => ProjectionAction::NextSession,
+            _ => ProjectionAction::None,
+        };
     }
 
     if snapshot.can_edit_draft() {
@@ -3434,6 +3662,12 @@ struct ProjectionController {
     active_prompt: Option<ActivePromptRequest>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionBrowserDirection {
+    Previous,
+    Next,
+}
+
 struct ActivePromptRequest {
     session_id: acp::SessionId,
     task: JoinHandle<acp::Result<acp::PromptResponse>>,
@@ -3515,6 +3749,34 @@ impl ProjectionController {
             .map_err(|error| {
                 FluentCodeError::Provider(format!(
                     "failed to load newly created ACP session in `{}`: {error}",
+                    self.cwd.display()
+                ))
+            })
+    }
+
+    async fn switch_session(&mut self, direction: SessionBrowserDirection) -> Result<()> {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Ok(());
+        };
+
+        let next_session_id = {
+            let state = self.projection.lock().await;
+            state.projection.adjacent_session_id(direction)
+        };
+        let Some(next_session_id) = next_session_id else {
+            return Ok(());
+        };
+
+        runtime
+            .load_session(
+                acp::SessionId::new(next_session_id.clone()),
+                self.cwd.clone(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                FluentCodeError::Provider(format!(
+                    "failed to load ACP session `{next_session_id}` in `{}`: {error}",
                     self.cwd.display()
                 ))
             })
@@ -3609,6 +3871,18 @@ impl ProjectionController {
                     active_prompt.session_id
                 ));
             }
+        }
+
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime
+                .refresh_session_browser(self.cwd.clone())
+                .await
+                .map_err(|error| {
+                    FluentCodeError::Provider(format!(
+                        "failed to refresh ACP session browser in `{}`: {error}",
+                        self.cwd.display()
+                    ))
+                })?;
         }
 
         Ok(())
@@ -4581,19 +4855,32 @@ fn expected_projection_panel_lines(
 #[doc(hidden)]
 pub fn expected_projection_frame_text_for_tests(
     status_line: &str,
-    body_lines: &[&str],
+    session_lines: &[&str],
+    conversation_lines: &[&str],
     draft_input: &str,
     footer_line: &str,
 ) -> String {
     let body_height = TEST_FRAME_HEIGHT - 1 - 3 - 1;
     let mut lines = Vec::new();
     lines.push(status_line.to_string());
-    lines.extend(expected_projection_panel_lines(
-        " acp client ",
-        TEST_FRAME_WIDTH,
+    let session_panel_lines = expected_projection_panel_lines(
+        " sessions ",
+        SESSION_BROWSER_WIDTH,
         body_height,
-        body_lines,
-    ));
+        session_lines,
+    );
+    let conversation_panel_lines = expected_projection_panel_lines(
+        " conversation ",
+        TEST_FRAME_WIDTH.saturating_sub(SESSION_BROWSER_WIDTH),
+        body_height,
+        conversation_lines,
+    );
+    lines.extend(
+        session_panel_lines
+            .into_iter()
+            .zip(conversation_panel_lines)
+            .map(|(session_line, conversation_line)| format!("{session_line}{conversation_line}")),
+    );
     lines.extend(expected_projection_panel_lines(
         " > ",
         TEST_FRAME_WIDTH,
@@ -4624,6 +4911,11 @@ fn projection_with_session(
 ) -> TuiProjectionState {
     let mut projection = TuiProjectionState::default();
     projection.session.session_id = Some(session_id.to_string());
+    projection.sessions = vec![SessionBrowserEntryProjection {
+        session_id: session_id.to_string(),
+        title: Some(session.title.clone()),
+        updated_at: Some(session.updated_at.to_rfc3339()),
+    }];
     projection.replay_fidelity = match session.transcript_fidelity {
         TranscriptFidelity::Approximate => ReplayFidelityProjection::Approximate,
         TranscriptFidelity::Exact => ReplayFidelityProjection::Exact,
@@ -4849,6 +5141,7 @@ pub(crate) fn assert_session_render_regression_completed_and_streaming() {
         render_projection_frame_text_for_tests(&completed_projection_for_regression());
     let expected_completed = expected_projection_frame_text_for_tests(
         " fluent-code │ bootstrapping",
+        &["› completed transcript · session"],
         &[
             "ACP subprocess: not started",
             "Session: session-completed",
@@ -4863,7 +5156,7 @@ pub(crate) fn assert_session_render_regression_completed_and_streaming() {
             "first answer",
         ],
         "",
-        "Type a prompt and press Enter. Ctrl-N starts a new ACP session. q/Esc/Ctrl-C exits.",
+        "Type a prompt and press Enter. Ctrl-J/K switch sessions. Ctrl-N starts a new ACP session. q/Esc/Ctrl-C exits.",
     );
     assert_eq!(completed_frame, expected_completed);
 
@@ -4871,6 +5164,7 @@ pub(crate) fn assert_session_render_regression_completed_and_streaming() {
         render_projection_frame_text_for_tests(&streaming_projection_for_regression());
     let expected_streaming = expected_projection_frame_text_for_tests(
         " fluent-code │ bootstrapping",
+        &["› streaming transcript · session"],
         &[
             "ACP subprocess: not started",
             "Session: session-streaming",
@@ -4900,6 +5194,7 @@ pub(crate) fn assert_session_render_regression_permission_delegation_and_legacy(
         render_projection_frame_text_for_tests(&permission_projection_for_regression());
     let expected_permission = expected_projection_frame_text_for_tests(
         " fluent-code │ bootstrapping",
+        &["› permission transcript · session"],
         &[
             "ACP subprocess: not started",
             "Session: session-permission",
@@ -4929,6 +5224,7 @@ pub(crate) fn assert_session_render_regression_permission_delegation_and_legacy(
         render_projection_frame_text_for_tests(&delegation_projection_for_regression());
     let expected_delegation = expected_projection_frame_text_for_tests(
         " fluent-code │ bootstrapping",
+        &["› delegation transcript · session"],
         &[
             "ACP subprocess: not started",
             "Session: session-delegation",
@@ -4945,7 +5241,7 @@ pub(crate) fn assert_session_render_regression_permission_delegation_and_legacy(
             "Child output remains visible after replay.",
         ],
         "",
-        "Type a prompt and press Enter. Ctrl-N starts a new ACP session. q/Esc/Ctrl-C exits.",
+        "Type a prompt and press Enter. Ctrl-J/K switch sessions. Ctrl-N starts a new ACP session. q/Esc/Ctrl-C exits.",
     );
     assert_eq!(delegation_frame, expected_delegation);
 
@@ -4953,6 +5249,7 @@ pub(crate) fn assert_session_render_regression_permission_delegation_and_legacy(
         render_projection_frame_text_for_tests(&legacy_approximate_projection_for_regression());
     let expected_legacy = expected_projection_frame_text_for_tests(
         " fluent-code │ bootstrapping",
+        &["› legacy transcript · session"],
         &[
             "ACP subprocess: not started",
             "Session: session-legacy",
@@ -4966,7 +5263,7 @@ pub(crate) fn assert_session_render_regression_permission_delegation_and_legacy(
             "legacy answer",
         ],
         "",
-        "Type a prompt and press Enter. Ctrl-N starts a new ACP session. q/Esc/Ctrl-C exits.",
+        "Type a prompt and press Enter. Ctrl-J/K switch sessions. Ctrl-N starts a new ACP session. q/Esc/Ctrl-C exits.",
     );
     assert_eq!(legacy_frame, expected_legacy);
 }
@@ -5040,6 +5337,7 @@ pub(crate) fn assert_acp_default_render_preserves_markdown_scroll_and_fidelity_s
     ));
     projection.transcript_follow_tail = false;
     projection.transcript_scroll_top = 1;
+    projection.ensure_conversation_cache_fresh();
 
     let lines = projection_lines(&projection);
     let rendered = lines
@@ -5048,7 +5346,7 @@ pub(crate) fn assert_acp_default_render_preserves_markdown_scroll_and_fidelity_s
         .map(tests::line_to_string)
         .collect::<Vec<_>>()
         .join("\n");
-    let manual_scroll = projection_body_scroll(&projection, &lines, Rect::new(0, 0, 40, 6));
+    let manual_scroll = projection_body_scroll(&projection, &lines, Rect::new(0, 0, 20, 6));
 
     assert_eq!(
         projection.replay_fidelity,
@@ -5056,7 +5354,7 @@ pub(crate) fn assert_acp_default_render_preserves_markdown_scroll_and_fidelity_s
     );
     assert_eq!(manual_scroll, 1);
     assert!(rendered.contains("Replay fidelity: approximate"));
-    assert!(rendered.contains("# Heading"));
+    assert!(rendered.contains("Heading"));
     assert!(rendered.contains("docs (https://example.com)"));
     assert!(rendered.contains("Committed line Use [docs](https://exam"));
 }
@@ -5688,6 +5986,57 @@ mod tests {
     #[test]
     fn startup_restore_with_projection_cache_matches_uncached_output() {
         super::assert_startup_restore_with_projection_cache_matches_uncached_output();
+    }
+
+    #[test]
+    fn session_browser_lines_preserve_backend_order_and_mark_current_session() {
+        let mut projection = TuiProjectionState::default();
+        projection.session.session_id = Some("session-current".to_string());
+        projection.apply_session_list(vec![
+            SessionBrowserEntryProjection {
+                session_id: "session-current".to_string(),
+                title: Some("Newest session".to_string()),
+                updated_at: Some("2026-04-05T12:00:00Z".to_string()),
+            },
+            SessionBrowserEntryProjection {
+                session_id: "session-middle".to_string(),
+                title: Some("Middle session".to_string()),
+                updated_at: Some("2026-04-05T11:00:00Z".to_string()),
+            },
+            SessionBrowserEntryProjection {
+                session_id: "session-oldest".to_string(),
+                title: Some("Oldest session".to_string()),
+                updated_at: Some("2026-04-05T10:00:00Z".to_string()),
+            },
+        ]);
+
+        let rendered = session_browser_lines(&projection)
+            .into_iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "› Newest session · session".to_string(),
+                "  Middle session · session".to_string(),
+                "  Oldest session · session".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn projection_key_action_maps_ctrl_j_and_ctrl_k_to_session_switching() {
+        let projection = TuiProjectionState::default();
+
+        assert_eq!(
+            projection_key_action(&projection, KeyCode::Char('k'), KeyModifiers::CONTROL),
+            ProjectionAction::PreviousSession
+        );
+        assert_eq!(
+            projection_key_action(&projection, KeyCode::Char('j'), KeyModifiers::CONTROL),
+            ProjectionAction::NextSession
+        );
     }
 
     pub(super) fn agent_message_chunk(text: &str) -> acp::SessionNotification {

@@ -6,12 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol as acp;
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use fluent_code_app::app::RESTART_INTERRUPTED_TASK_RESULT;
 use fluent_code_app::error::FluentCodeError;
 use fluent_code_app::session::model::{
     Role, RunRecord, RunStatus, Session, TaskDelegationRecord, TaskDelegationStatus,
-    ToolApprovalState, ToolExecutionState, ToolInvocationRecord, ToolSource, Turn,
+    ToolApprovalState, ToolExecutionState, ToolInvocationRecord, ToolSource, TranscriptItemRecord,
+    Turn,
 };
 use fluent_code_app::session::store::{FsSessionStore, SessionStore};
 use fluent_code_tui::{
@@ -20,6 +21,7 @@ use fluent_code_tui::{
     initialize_default_session_for_tests, run_with_terminal_hooks_for_tests,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
+use serde_json::json;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
@@ -86,6 +88,146 @@ fn startup_uses_latest_session_by_default() {
                         .shutdown()
                         .await
                         .expect("shutdown ACP subprocess after loading latest session");
+                })
+                .await;
+        }
+
+        cleanup(root);
+    });
+}
+
+#[test]
+fn session_browser_uses_backend_order_and_loading_session_preserves_projection_order() {
+    let runtime = tokio::runtime::Runtime::new().expect("test tokio runtime");
+    runtime.block_on(async {
+        let _guard = startup_subprocess_test_lock().lock().await;
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).expect("create session browser root");
+        write_acp_subprocess_test_config(&root);
+
+        let store = FsSessionStore::new(root.join(".fluent-code"));
+        let older_session = ordered_session_fixture(
+            "Older session",
+            Utc::now() - ChronoDuration::hours(1),
+            "inspect repo",
+            "PersistSession",
+            "README.md",
+            "older answer",
+        );
+        let newest_session = ordered_session_fixture(
+            "Newest session",
+            Utc::now(),
+            "latest prompt",
+            "ProjectionController",
+            "src/lib.rs",
+            "latest answer",
+        );
+        store.create(&older_session).expect("persist older session fixture");
+        store
+            .create(&newest_session)
+            .expect("persist newest session fixture");
+
+        let acp_binary = build_acp_binary();
+        {
+            let _cwd_guard = CurrentDirGuard::set(&root);
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let runtime =
+                        bootstrap_client_for_tests(AcpLaunchOptions::new(&acp_binary, &root))
+                            .await
+                            .expect("bootstrap ACP client subprocess for session browser test");
+                    initialize_default_session_for_tests(&runtime, &root)
+                        .await
+                        .expect("initialize default ACP session for session browser test");
+
+                    let initial_snapshot = wait_for_projection_match(
+                        &runtime,
+                        "the default ACP session browser snapshot",
+                        |snapshot| {
+                            snapshot.session.session_id.as_deref()
+                                == Some(newest_session.id.to_string().as_str())
+                                && snapshot.sessions.len() == 2
+                        },
+                    )
+                    .await;
+                    assert_eq!(
+                        initial_snapshot
+                            .sessions
+                            .iter()
+                            .map(|session| session.title.as_deref())
+                            .collect::<Vec<_>>(),
+                        vec![Some("Newest session"), Some("Older session")]
+                    );
+
+                    let initial_render =
+                        fluent_code_tui::render_projection_frame_text_for_tests(&initial_snapshot);
+                    assert!(
+                        initial_render.contains(&format!(
+                            "› Newest session · {}",
+                            abbreviated_session_id(&newest_session.id.to_string())
+                        )),
+                        "expected the session browser to mark the default ACP session as current, got:\n{initial_render}"
+                    );
+
+                    runtime
+                        .load_session(older_session.id.to_string(), &root)
+                        .await
+                        .expect("load older ACP session through the session browser path");
+                    let older_snapshot = wait_for_projected_session(&runtime, &older_session.id.to_string()).await;
+                    assert_eq!(
+                        older_snapshot
+                            .sessions
+                            .iter()
+                            .map(|session| session.title.as_deref())
+                            .collect::<Vec<_>>(),
+                        vec![Some("Newest session"), Some("Older session")]
+                    );
+
+                    let older_render =
+                        fluent_code_tui::render_projection_frame_text_for_tests(&older_snapshot);
+                    let newest_browser_line = format!(
+                        "  Newest session · {}",
+                        abbreviated_session_id(&newest_session.id.to_string())
+                    );
+                    let older_browser_line = format!(
+                        "› Older session · {}",
+                        abbreviated_session_id(&older_session.id.to_string())
+                    );
+                    assert!(
+                        older_render.contains(&newest_browser_line)
+                            && older_render.contains(&older_browser_line),
+                        "expected the session browser to keep backend newest-first order while marking the loaded session, got:\n{older_render}"
+                    );
+
+                    let prompt_index = older_render
+                        .find("inspect repo")
+                        .expect("loaded session should render the older user turn");
+                    let search_index = older_render
+                        .find(&format!(
+                            "tool_search-{} PersistSession",
+                            abbreviated_session_id(&older_session.id.to_string())
+                        ))
+                        .expect("loaded session should render the older search tool in place");
+                    let read_index = older_render
+                        .find(&format!(
+                            "tool_read-{} README.md",
+                            abbreviated_session_id(&older_session.id.to_string())
+                        ))
+                        .expect("loaded session should render the older read tool in place");
+                    let answer_index = older_render
+                        .find("older answer")
+                        .expect("loaded session should render the older assistant turn");
+                    assert!(
+                        prompt_index < search_index
+                            && search_index < read_index
+                            && read_index < answer_index,
+                        "expected the loaded ACP session transcript/tool chronology to stay in replay order, got:\n{older_render}"
+                    );
+
+                    runtime
+                        .shutdown()
+                        .await
+                        .expect("shutdown ACP subprocess after session browser test");
                 })
                 .await;
         }
@@ -750,8 +892,17 @@ fn session_render_regression_completed_streaming_and_recovery() {
                     ];
                     let recovery_body_refs =
                         recovery_body.iter().map(String::as_str).collect::<Vec<_>>();
+                    let recovery_session_browser = [format!(
+                        "› startup recovery · {}",
+                        abbreviated_session_id(&fixture.session.id.to_string())
+                    )];
+                    let recovery_session_browser_refs = recovery_session_browser
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>();
                     let expected = fluent_code_tui::expected_projection_frame_text_for_tests(
                         " fluent-code │ acp connected",
+                        &recovery_session_browser_refs,
                         &recovery_body_refs,
                         "",
                         "Prompt running through ACP. Esc/Ctrl-C cancels the active turn.",
@@ -1378,6 +1529,89 @@ fn unique_test_dir() -> PathBuf {
 
 fn cleanup(path: PathBuf) {
     let _ = std::fs::remove_dir_all(path);
+}
+
+fn abbreviated_session_id(session_id: &str) -> &str {
+    session_id.split('-').next().unwrap_or(session_id)
+}
+
+fn ordered_session_fixture(
+    title: &str,
+    updated_at: chrono::DateTime<Utc>,
+    user_prompt: &str,
+    search_query: &str,
+    read_path: &str,
+    assistant_answer: &str,
+) -> Session {
+    let run_id = uuid::Uuid::new_v4();
+    let mut session = Session::new(title);
+    session.updated_at = updated_at;
+
+    let user_turn = Turn {
+        id: uuid::Uuid::new_v4(),
+        run_id,
+        role: Role::User,
+        content: user_prompt.to_string(),
+        reasoning: String::new(),
+        sequence_number: 1,
+        timestamp: updated_at + ChronoDuration::minutes(10),
+    };
+    let assistant_turn = Turn {
+        id: uuid::Uuid::new_v4(),
+        run_id,
+        role: Role::Assistant,
+        content: assistant_answer.to_string(),
+        reasoning: String::new(),
+        sequence_number: 4,
+        timestamp: updated_at - ChronoDuration::minutes(5),
+    };
+    let search_tool = ToolInvocationRecord {
+        id: uuid::Uuid::new_v4(),
+        run_id,
+        tool_call_id: format!("search-{}", abbreviated_session_id(&session.id.to_string())),
+        tool_name: "search".to_string(),
+        tool_source: ToolSource::BuiltIn,
+        arguments: json!({"query": search_query}),
+        preceding_turn_id: Some(user_turn.id),
+        approval_state: ToolApprovalState::Approved,
+        execution_state: ToolExecutionState::Completed,
+        result: Some("search result".to_string()),
+        error: None,
+        delegation: None,
+        sequence_number: 2,
+        requested_at: updated_at - ChronoDuration::minutes(20),
+        approved_at: Some(updated_at - ChronoDuration::minutes(19)),
+        completed_at: Some(updated_at - ChronoDuration::minutes(18)),
+    };
+    let read_tool = ToolInvocationRecord {
+        id: uuid::Uuid::new_v4(),
+        run_id,
+        tool_call_id: format!("read-{}", abbreviated_session_id(&session.id.to_string())),
+        tool_name: "read".to_string(),
+        tool_source: ToolSource::BuiltIn,
+        arguments: json!({"path": read_path}),
+        preceding_turn_id: Some(user_turn.id),
+        approval_state: ToolApprovalState::Approved,
+        execution_state: ToolExecutionState::Completed,
+        result: Some("read result".to_string()),
+        error: None,
+        delegation: None,
+        sequence_number: 3,
+        requested_at: updated_at - ChronoDuration::minutes(30),
+        approved_at: Some(updated_at - ChronoDuration::minutes(29)),
+        completed_at: Some(updated_at - ChronoDuration::minutes(28)),
+    };
+
+    session.turns = vec![user_turn.clone(), assistant_turn.clone()];
+    session.tool_invocations = vec![read_tool.clone(), search_tool.clone()];
+    session.transcript_items = vec![
+        TranscriptItemRecord::from_turn(&user_turn),
+        TranscriptItemRecord::from_tool_invocation(&search_tool),
+        TranscriptItemRecord::from_tool_invocation(&read_tool),
+        TranscriptItemRecord::from_turn(&assistant_turn),
+    ];
+    session.upsert_run(run_id, RunStatus::Completed);
+    session
 }
 
 struct CurrentDirGuard {
