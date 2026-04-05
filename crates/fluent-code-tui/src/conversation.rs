@@ -176,7 +176,7 @@ fn derive_history_cells_from_parts(
 
         match &item.content {
             TranscriptItemContent::Turn(content) => {
-                flush_pending_tool_cells(
+                flush_pending_tool_cells_at_boundary(
                     &mut history,
                     &mut active_rows,
                     &mut pending_history_tools,
@@ -217,7 +217,15 @@ fn derive_history_cells_from_parts(
                     content,
                 );
             }
-            TranscriptItemContent::RunLifecycle(_) | TranscriptItemContent::Marker(_) => {}
+            TranscriptItemContent::RunLifecycle(_) | TranscriptItemContent::Marker(_) => {
+                flush_pending_tool_cells_at_boundary(
+                    &mut history,
+                    &mut active_rows,
+                    &mut pending_history_tools,
+                    &mut pending_active_tools,
+                    target,
+                );
+            }
         }
     };
 
@@ -341,6 +349,46 @@ fn flush_pending_tool_cells(
 
     let rows = group_tool_rows(std::mem::take(pending));
     push_rows_into_target(history, active_rows, rows, target);
+}
+
+fn flush_pending_tool_cells_at_boundary(
+    history: &mut Vec<SessionCell>,
+    active_rows: &mut Vec<ConversationRow>,
+    pending_history_tools: &mut Vec<ToolRow>,
+    pending_active_tools: &mut Vec<ToolRow>,
+    target: CellTarget,
+) {
+    flush_pending_tool_cells(
+        history,
+        active_rows,
+        pending_history_tools,
+        pending_active_tools,
+        CellTarget::History,
+    );
+
+    match target {
+        CellTarget::History => flush_pending_tool_rows_into_history(history, pending_active_tools),
+        CellTarget::Active => flush_pending_tool_cells(
+            history,
+            active_rows,
+            pending_history_tools,
+            pending_active_tools,
+            CellTarget::Active,
+        ),
+    }
+}
+
+fn flush_pending_tool_rows_into_history(
+    history: &mut Vec<SessionCell>,
+    pending_tools: &mut Vec<ToolRow>,
+) {
+    if pending_tools.is_empty() {
+        return;
+    }
+
+    history.push(SessionCell {
+        rows: group_tool_rows(std::mem::take(pending_tools)),
+    });
 }
 
 fn derive_active_run_marker(
@@ -747,7 +795,7 @@ mod tests {
     use fluent_code_app::app::{AppState, AppStatus};
     use fluent_code_app::session::model::{
         Role, RunStatus, RunTerminalStopReason, Session, TaskDelegationRecord, ToolApprovalState,
-        ToolExecutionState, ToolInvocationRecord, ToolSource, Turn,
+        ToolExecutionState, ToolInvocationRecord, ToolSource, TranscriptItemRecord, Turn,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -1084,6 +1132,125 @@ mod tests {
             Some(ConversationRow::RunMarker(marker))
                 if marker.kind == RunMarkerKind::Interrupted && marker.label == "interrupted"
         ));
+    }
+
+    #[test]
+    fn derive_conversation_rows_flushes_open_tools_before_terminal_boundary_marker() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("terminal boundary flush");
+        let mut turn = make_turn(run_id, Role::Assistant, "checking files");
+        turn.sequence_number = 1;
+
+        let mut invocation = make_tool_invocation(
+            run_id,
+            Some(turn.id),
+            "read",
+            json!({"path": "src/main.rs"}),
+            Utc::now(),
+        );
+        invocation.sequence_number = 2;
+        invocation.approval_state = ToolApprovalState::Approved;
+        invocation.execution_state = ToolExecutionState::Running;
+
+        session.turns.push(turn.clone());
+        session.tool_invocations.push(invocation.clone());
+        session.upsert_run(run_id, RunStatus::Completed);
+
+        let mut terminal = TranscriptItemRecord::run_terminal(
+            session
+                .find_run(run_id)
+                .expect("terminal run record to exist"),
+        );
+        terminal.sequence_number = 3;
+
+        session.transcript_items = vec![
+            TranscriptItemRecord::from_turn(&turn),
+            TranscriptItemRecord::from_tool_invocation(&invocation),
+            terminal,
+        ];
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(
+            &rows[0],
+            ConversationRow::Turn(row) if row.content == "checking files"
+        ));
+        assert!(matches!(
+            &rows[1],
+            ConversationRow::Tool(tool) if tool.summary == "read src/main.rs"
+        ));
+        assert!(matches!(
+            &rows[2],
+            ConversationRow::RunMarker(marker)
+                if marker.kind == RunMarkerKind::Completed && marker.label == "completed"
+        ));
+    }
+
+    #[test]
+    fn derive_conversation_rows_flushes_pending_tools_at_marker_boundaries() {
+        let run_id = Uuid::new_v4();
+        let mut session = Session::new("marker boundary flush");
+        let mut first_turn = make_turn(run_id, Role::Assistant, "first batch");
+        first_turn.sequence_number = 1;
+        let mut second_turn = make_turn(run_id, Role::Assistant, "after marker");
+        second_turn.sequence_number = 5;
+
+        let mut first_invocation = make_tool_invocation(
+            run_id,
+            Some(first_turn.id),
+            "read",
+            json!({"path": "src/main.rs"}),
+            Utc::now(),
+        );
+        first_invocation.sequence_number = 2;
+        first_invocation.approval_state = ToolApprovalState::Approved;
+        first_invocation.execution_state = ToolExecutionState::Completed;
+
+        let mut second_invocation = make_tool_invocation(
+            run_id,
+            Some(first_turn.id),
+            "read",
+            json!({"path": "src/lib.rs"}),
+            Utc::now() + Duration::seconds(1),
+        );
+        second_invocation.sequence_number = 4;
+        second_invocation.approval_state = ToolApprovalState::Approved;
+        second_invocation.execution_state = ToolExecutionState::Completed;
+
+        session.turns = vec![first_turn.clone(), second_turn.clone()];
+        session.tool_invocations = vec![first_invocation.clone(), second_invocation.clone()];
+        session.transcript_items = vec![
+            TranscriptItemRecord::from_turn(&first_turn),
+            TranscriptItemRecord::from_tool_invocation(&first_invocation),
+            TranscriptItemRecord::marker(run_id, 3, "boundary", None, None, None),
+            TranscriptItemRecord::from_tool_invocation(&second_invocation),
+            TranscriptItemRecord::from_turn(&second_turn),
+        ];
+
+        let state = AppState::new(session);
+        let rows = derive_conversation_rows(&state);
+
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(&rows[0], ConversationRow::Turn(row) if row.content == "first batch"));
+        assert!(matches!(
+            &rows[1],
+            ConversationRow::Tool(tool) if tool.summary == "read src/main.rs"
+        ));
+        assert!(matches!(
+            &rows[2],
+            ConversationRow::Tool(tool) if tool.summary == "read src/lib.rs"
+        ));
+        assert!(matches!(
+            &rows[3],
+            ConversationRow::Turn(row) if row.content == "after marker"
+        ));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row, ConversationRow::ToolGroup(_)))
+        );
     }
 
     #[test]
