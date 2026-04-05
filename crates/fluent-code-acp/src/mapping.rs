@@ -712,17 +712,17 @@ fn tool_invocation_meta(invocation: Option<&ToolInvocationRecord>) -> Option<Met
         serde_json::Value::String(invocation.tool_name.clone()),
     );
 
-    if let Some(delegation) = &invocation.delegation {
-        if let Some(child_run_id) = delegation.child_run_id {
-            let subagent_info = json!({
-                "session_id": child_run_id.to_string(),
-                "message_start_index": 0,
-            });
-            meta.insert(
-                ACP_META_SUBAGENT_SESSION_INFO_KEY.to_string(),
-                subagent_info,
-            );
-        }
+    if let Some(delegation) = &invocation.delegation
+        && let Some(child_run_id) = delegation.child_run_id
+    {
+        let subagent_info = json!({
+            "session_id": child_run_id.to_string(),
+            "message_start_index": 0,
+        });
+        meta.insert(
+            ACP_META_SUBAGENT_SESSION_INFO_KEY.to_string(),
+            subagent_info,
+        );
     }
 
     if is_terminal_tool(&invocation.tool_name) {
