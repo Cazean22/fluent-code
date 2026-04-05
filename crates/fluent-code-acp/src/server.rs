@@ -1975,7 +1975,7 @@ impl AcpServer {
         connection.sessions.insert(
             host.state().session.id,
             Arc::new(Mutex::new(ManagedSession {
-                cwd: cwd,
+                cwd,
                 mcp_servers: parse_mcp_servers(&load_session_request.mcp_servers),
                 host,
                 live_prompt_turn,
@@ -2011,7 +2011,7 @@ impl AcpServer {
         connection.sessions.insert(
             host.state().session.id,
             Arc::new(Mutex::new(ManagedSession {
-                cwd: cwd,
+                cwd,
                 mcp_servers: parse_mcp_servers(&resume_request.mcp_servers),
                 host,
                 live_prompt_turn,
@@ -2058,7 +2058,12 @@ impl AcpServer {
     ) -> std::result::Result<Vec<OutboundFrame>, RpcResponseError> {
         self.ensure_authenticated(connection)?;
 
-        let _list_request = decode_params::<ListSessionsRequest>(request.params)?;
+        let list_request = decode_params::<ListSessionsRequest>(request.params)?;
+        let session_cwd = list_request.cwd.unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|cwd| cwd.display().to_string())
+                .unwrap_or_default()
+        });
 
         let summaries = self
             .dependencies
@@ -2070,6 +2075,7 @@ impl AcpServer {
             .into_iter()
             .map(|summary| SessionInfoEntry {
                 session_id: summary.session_id,
+                cwd: session_cwd.clone(),
                 title: summary.title,
                 updated_at: summary.updated_at,
             })

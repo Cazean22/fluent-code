@@ -437,6 +437,7 @@ pub struct ListSessionsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfoEntry {
     pub session_id: String,
+    pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
