@@ -1,6 +1,7 @@
-use fluent_code::{Result, run_default_entrypoint};
+// use fluent_code::{Result, run_default_entrypoint};
+use client::{Result, run};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    run_default_entrypoint().await
+    run().await
 }

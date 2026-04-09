@@ -1,0 +1,68 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch fluent-code TUI (build TUI + ACP)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "-p",
+          "fluent-code",
+          "--bin",
+          "fluent-code",
+          "--bin",
+          "fluent-code-acp"
+        ],
+        "filter": {
+          "name": "fluent-code",
+          "kind": "bin"
+        }
+      },
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated",
+      "env": {
+        "RUST_LOG": "debug"
+      },
+      "sourceLanguages": [
+        "rust"
+      ]
+    },
+    {
+      "name": "Attach to fluent-code-acp subprocess",
+      "type": "lldb",
+      "request": "attach",
+      "pid": "${command:pickProcess}",
+      "sourceLanguages": [
+        "rust"
+      ]
+    },
+    {
+      "name": "Debug fluent-code-acp directly",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "-p",
+          "fluent-code",
+          "--bin",
+          "fluent-code-acp"
+        ],
+        "filter": {
+          "name": "fluent-code-acp",
+          "kind": "bin"
+        }
+      },
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated",
+      "env": {
+        "RUST_LOG": "debug"
+      },
+      "sourceLanguages": [
+        "rust"
+      ]
+    }
+  ]
+}
