@@ -1,11 +1,15 @@
-use std::{io::Stdout, time::Duration};
+use std::io::Stdout;
 
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use fc_core::Runtime;
+use futures::StreamExt;
 use ratatui::{Terminal, prelude::CrosstermBackend};
 
 use tokio::sync::mpsc::unbounded_channel;
@@ -24,22 +28,29 @@ pub async fn run() -> Result<()> {
     {
         let tx_input = tx_input.clone();
         tokio::spawn(async move {
-            loop {
-                let _ = tx_input.send("Hi".to_string());
+            let send_result = tx_input.send("Hi".to_string());
+            if let Err(err) = send_result {
+                eprintln!("Error sending input: {}", err);
             }
         });
     }
-    let _= tokio::spawn(async move {
-        let start = std::time::Instant::now();
-        let end = start + Duration::from_secs(10);
-        println!("herer");
-        while let Some(event) = rx_event.recv().await {
-            println!("{:?}", event);
-            if std::time::Instant::now() >= end {
-                break;
+    let mut events = EventStream::new();
+    loop {
+        tokio::select! {
+            Some(event) = rx_event.recv() => {
+                println!("{:?}", event);
+            }
+            maybe_terminal_event = events.next() => {
+                match maybe_terminal_event {
+                    Some(Ok(event)) if is_terminate_shortcut(&event) => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => return Err(err.into()),
+                    None => break,
+                }
             }
         }
-    }).await;
+    }
+
     restore(&mut terminal)
 }
 
@@ -62,4 +73,46 @@ fn restore(terminal: &mut AppTerminal) -> Result<()> {
     )?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+fn is_terminate_shortcut(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers,
+            kind: KeyEventKind::Press,
+            ..
+        }) if modifiers.contains(KeyModifiers::CONTROL)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_terminate_shortcut;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    #[test]
+    fn ctrl_c_terminates() {
+        let event = Event::Key(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+
+        assert!(is_terminate_shortcut(&event));
+    }
+
+    #[test]
+    fn plain_c_does_not_terminate() {
+        let event = Event::Key(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+
+        assert!(!is_terminate_shortcut(&event));
+    }
 }
