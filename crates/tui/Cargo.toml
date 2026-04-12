@@ -1,5 +1,5 @@
 [package]
-name = "fc-core"
+name = "fc-tui"
 version.workspace = true
 edition.workspace = true
 
@@ -8,6 +8,7 @@ agent-client-protocol.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 crossterm = { workspace = true, features = ["event-stream"] }
+fc-core = { path = "../core"}
 futures.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true
@@ -20,4 +21,4 @@ tokio-util = { version = "0.7", features = ["compat"] }
 toml.workspace = true
 tracing.workspace = true
 utils = { path = "../utils" }
-uuid = { workspace = true, features = ["serde", "v7"] }
+uuid.workspace = true

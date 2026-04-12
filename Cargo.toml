@@ -5,7 +5,9 @@ members = [
     "crates/fluent-code-app",
     "crates/fluent-code-provider",
     "crates/fluent-code-tui",
-    "crates/client"
+    "crates/core",
+    "crates/tui",
+    "crates/utils"
 ]
 resolver = "2"
 
@@ -47,5 +49,5 @@ default-run = "fluent-code"
 [dependencies]
 fluent-code-acp = { path = "crates/fluent-code-acp" }
 fluent-code-tui = { path = "crates/fluent-code-tui" }
-client = { path = "crates/client" }
+fc-tui = { path = "crates/tui" }
 tokio.workspace = true
